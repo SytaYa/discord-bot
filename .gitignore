@@ -1,0 +1,7 @@
+.env
+remote_console.py
+bot_data.json
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

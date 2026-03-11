@@ -1,0 +1,1554 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+  BOT AGENT — hébergé sur Render
+  Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
+"""
+import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib
+from datetime import datetime, timezone
+from collections import defaultdict
+from aiohttp import web
+from dotenv import load_dotenv
+
+load_dotenv()
+TOKEN          = os.getenv("DISCORD_TOKEN", "")
+REMOTE_SECRET  = os.getenv("BOT_REMOTE_SECRET", "changeme")
+REMOTE_ENABLED = os.getenv("BOT_REMOTE_ENABLED", "true").lower() == "true"
+PORT           = int(os.getenv("PORT", 8080))
+DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
+
+# ── État global ────────────────────────────────────────────────────
+maintenance_mode = False
+menu_locked      = False
+activity_tracker = defaultdict(dict)
+ticket_config    = {}
+ticket_sessions  = {}
+pending_channels = {}
+
+# ── Persistance ────────────────────────────────────────────────────
+def save_data():
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "ticket_config": {str(k): v for k, v in ticket_config.items()},
+                "ticket_sessions": {
+                    str(k): {x: y for x, y in v.items() if x not in ("staff_msg_id","staff_chan_id")}
+                    for k, v in ticket_sessions.items()
+                },
+                "maintenance_mode": maintenance_mode,
+                "menu_locked": menu_locked,
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[SAVE]", e)
+
+def load_data():
+    global ticket_config, ticket_sessions, maintenance_mode, menu_locked
+    if not os.path.exists(DATA_FILE): return
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        for k, v in d.get("ticket_config", {}).items():
+            ticket_config[int(k)] = v
+        for k, v in d.get("ticket_sessions", {}).items():
+            ticket_sessions[int(k)] = v
+        maintenance_mode = d.get("maintenance_mode", False)
+        menu_locked      = d.get("menu_locked", False)
+        print("[DATA]", len(ticket_config), "guild(s),", len(ticket_sessions), "ticket(s)",
+              "| maintenance=" + str(maintenance_mode))
+    except Exception as e:
+        print("[LOAD]", e)
+
+def tconf(gid):
+    if gid not in ticket_config:
+        ticket_config[gid] = {"category_id": None, "staff_channel_id": None,
+                               "staff_role_id": None, "counter": 0, "types": {}}
+    return ticket_config[gid]
+
+# ── Palette de couleurs (utilisée partout) ────────────────────────
+C_ORANGE  = 0xF0A500
+C_AMBER   = 0xE67E22
+C_GREEN   = 0x57F287
+C_RED     = 0xED4245
+C_BLUE    = 0x3498DB
+C_PURPLE  = 0x9B59B6
+C_TEAL    = 0x1ABC9C
+C_DARK    = 0x2B2D31
+C_BLURPLE = 0x5865F2
+C_GREY    = 0x36393F
+
+# ── Client Discord ─────────────────────────────────────────────────
+intents = discord.Intents.all()
+client  = discord.Client(intents=intents)
+
+# ── Helpers ────────────────────────────────────────────────────────
+def find_member(arg, guild):
+    humans = [m for m in guild.members if not m.bot]
+    try:
+        idx = int(arg)
+        if 1 <= idx <= len(humans): return humans[idx - 1]
+        m = guild.get_member(idx)
+        if m: return m
+    except ValueError:
+        pass
+    hits = [m for m in humans if arg.lower() in m.display_name.lower() or arg.lower() in m.name.lower()]
+    return hits[0] if len(hits) == 1 else None
+
+def find_channel(arg, guild):
+    chs = [c for c in guild.channels if isinstance(c, discord.TextChannel)]
+    try:
+        idx = int(arg.lstrip("#"))
+        if 1 <= idx <= len(chs): return chs[idx - 1]
+        c = guild.get_channel(idx)
+        if c: return c
+    except ValueError:
+        pass
+    for c in chs:
+        if arg.lstrip("#").lower() in c.name.lower(): return c
+    return None
+
+def is_staff(member, guild_id):
+    if member.guild_permissions.administrator: return True
+    cfg = ticket_config.get(guild_id, {})
+    if cfg.get("staff_role_id"):
+        r = member.guild.get_role(cfg["staff_role_id"])
+        if r and r in member.roles: return True
+    return False
+
+# ── Tickets ────────────────────────────────────────────────────────
+async def open_ticket(guild, member, type_key):
+    if maintenance_mode:
+        return None, "Bot en maintenance — les tickets sont temporairement désactivés."
+    cfg = tconf(guild.id)
+    if type_key not in cfg["types"]:   return None, "Type inconnu"
+    if not cfg.get("category_id"):     return None, "Catégorie non configurée"
+    cat = guild.get_channel(cfg["category_id"])
+    if not cat:                        return None, "Catégorie introuvable"
+    tt = cfg["types"][type_key]
+    cfg["counter"] += 1
+    n = cfg["counter"]
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    if cfg.get("staff_role_id"):
+        sr = guild.get_role(cfg["staff_role_id"])
+        if sr: ow[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, read_message_history=True)
+    try:
+        ch = await guild.create_text_channel(
+            "ticket-" + str(n).zfill(4) + "-" + member.display_name[:12].lower().replace(" ", "-"),
+            category=cat, overwrites=ow,
+            topic="Ticket #" + str(n) + " | " + type_key + " | " + member.display_name)
+    except discord.Forbidden:
+        cfg["counter"] -= 1
+        return None, "Permission refusée"
+    s = {"guild_id": guild.id, "user_id": member.id, "type": type_key, "status": "open", "answers": {},
+         "opened_at": datetime.now().strftime("%d/%m/%Y %H:%M"), "number": n, "channel_id": ch.id}
+    ticket_sessions[ch.id] = s
+    save_data()
+    await ch.send("👋 " + member.mention + " — Ticket **#" + str(n).zfill(4) + "** " + tt["emoji"] + " " + tt["label"] + "\n" + "━" * 40)
+    await _notify_embed(guild, cfg, s, tt)
+    return ch, None
+
+async def run_questions(guild, cfg, channel, member, type_key, existing_session=None):
+    """
+    Lance les questions dans le salon.
+    existing_session : session déjà créée par open_ticket → réutilisée sans incrémenter le compteur.
+    """
+    if maintenance_mode:
+        await channel.send("🔧 Bot en maintenance — les questions sont temporairement suspendues.")
+        return None, "maintenance"
+    tt = cfg["types"][type_key]
+    qs = tt.get("questions", [])
+    if existing_session:
+        s = existing_session
+        s["status"] = "pending"
+        n = s["number"]
+    else:
+        cfg["counter"] += 1
+        n = cfg["counter"]
+        s = {"guild_id": guild.id, "user_id": member.id, "type": type_key, "status": "pending", "answers": {},
+             "opened_at": datetime.now().strftime("%d/%m/%Y %H:%M"), "number": n, "channel_id": channel.id}
+        ticket_sessions[channel.id] = s
+    save_data()
+    pending_channels.pop(channel.id, None)
+    try:
+        await channel.set_permissions(guild.me, view_channel=True, send_messages=True,
+                                      read_message_history=True, reason="Bot tickets")
+    except Exception as e:
+        return None, str(e)
+    await channel.send("👋 " + member.mention + " — Questions en cours.\n" + "━" * 40)
+    for q in qs:
+        await channel.send("❓ **" + q + "**")
+        r = await client.wait_for("message",
+            check=lambda m, mb=member, ch=channel: m.author == mb and m.channel == ch)
+        s["answers"][q] = r.content
+    lines = ["━" * 40, "🎫 **#" + str(n).zfill(4) + "** " + tt["emoji"] + " " + tt["label"], "👤 " + member.mention]
+    for q, a in s["answers"].items():
+        lines += ["❓ **" + q + "**", "💬 " + a]
+    lines.append("━" * 40)
+    await channel.send("\n".join(lines))
+    await _notify_reactions(guild, cfg, s, tt)
+    save_data()
+    return s, None
+
+async def _notify_embed(guild, cfg, s, tt):
+    if not cfg.get("staff_channel_id"): return
+    sc = guild.get_channel(cfg["staff_channel_id"])
+    if not sc: return
+    rm = "<@&" + str(cfg["staff_role_id"]) + "> " if cfg.get("staff_role_id") else ""
+    e = discord.Embed(color=0xF0A500, timestamp=datetime.now(timezone.utc))
+    e.set_author(name="🎫 Nouveau ticket #" + str(s["number"]).zfill(4))
+    e.add_field(name="Type",      value=tt["emoji"] + " " + tt["label"], inline=True)
+    e.add_field(name="Demandeur", value="<@" + str(s["user_id"]) + ">",  inline=True)
+    e.add_field(name="Salon",     value="<#" + str(s["channel_id"]) + ">", inline=True)
+    await sc.send(content=rm, embed=e, view=TicketActionView(guild, s))
+
+async def _notify_reactions(guild, cfg, s, tt):
+    if not cfg.get("staff_channel_id"): return
+    sc = guild.get_channel(cfg["staff_channel_id"])
+    if not sc: return
+    rm  = "<@&" + str(cfg["staff_role_id"]) + "> " if cfg.get("staff_role_id") else ""
+    ans = "\n".join("❓ " + q + "\n💬 " + a for q, a in s["answers"].items()) or "*(aucune)*"
+    e = discord.Embed(color=0xE67E22, timestamp=datetime.now(timezone.utc))
+    e.set_author(name="🎫 Ticket #" + str(s["number"]).zfill(4) + " — Réponses")
+    e.add_field(name="Type",      value=tt["emoji"] + " " + tt["label"], inline=True)
+    e.add_field(name="Demandeur", value="<@" + str(s["user_id"]) + ">",  inline=True)
+    e.add_field(name="Salon",     value="<#" + str(s["channel_id"]) + ">", inline=True)
+    e.add_field(name="Réponses",  value=ans[:1024], inline=False)
+    msg = await sc.send(content=rm, embed=e, view=TicketActionView(guild, s))
+    await msg.add_reaction("✅")
+    await msg.add_reaction("❌")
+    s["staff_msg_id"] = msg.id
+    s["staff_chan_id"] = sc.id
+    save_data()
+
+async def do_action(guild, s, action, raison="", actor=None):
+    """
+    Exécute une action sur un ticket.
+    — La décision (embed complet) est postée UNIQUEMENT dans le salon staff.
+    — Un court message informatif est envoyé dans le salon ticket pour le demandeur.
+    """
+    cfg = tconf(guild.id)
+    ch  = guild.get_channel(s["channel_id"])
+    who = actor.mention if actor else "le staff"
+    sc  = guild.get_channel(cfg["staff_channel_id"]) if cfg.get("staff_channel_id") else None
+
+    if action == "accepted":
+        s["status"] = "accepted"; save_data()
+        # Salon staff — embed complet
+        if sc:
+            e = discord.Embed(color=C_GREEN, timestamp=datetime.now(timezone.utc))
+            e.set_author(name="✅  Ticket #" + str(s["number"]).zfill(4) + " — Accepté")
+            e.add_field(name="Par",   value=who, inline=True)
+            e.add_field(name="Salon", value="<#" + str(s["channel_id"]) + ">", inline=True)
+            if raison: e.add_field(name="Raison", value=raison, inline=False)
+            await sc.send(embed=e)
+        # Salon ticket — message court pour informer le demandeur
+        if ch:
+            try:
+                msg = "✅ Ton ticket a été **accepté**."
+                if raison: msg += "\n> " + raison
+                await ch.send(msg)
+            except: pass
+
+    elif action == "refused":
+        s["status"] = "refused"; save_data()
+        if sc:
+            e = discord.Embed(color=C_RED, timestamp=datetime.now(timezone.utc))
+            e.set_author(name="❌  Ticket #" + str(s["number"]).zfill(4) + " — Refusé")
+            e.add_field(name="Par",   value=who, inline=True)
+            e.add_field(name="Salon", value="<#" + str(s["channel_id"]) + ">", inline=True)
+            if raison: e.add_field(name="Raison", value=raison, inline=False)
+            await sc.send(embed=e)
+        if ch:
+            try:
+                msg = "❌ Ton ticket a été **refusé**."
+                if raison: msg += "\n> " + raison
+                await ch.send(msg)
+            except: pass
+
+    elif action == "closed":
+        s["status"] = "closed"; save_data()
+        if sc:
+            e = discord.Embed(color=C_GREY, timestamp=datetime.now(timezone.utc))
+            e.set_author(name="🔒  Ticket #" + str(s["number"]).zfill(4) + " — Fermé")
+            e.add_field(name="Par", value=who, inline=True)
+            await sc.send(embed=e)
+        if ch:
+            try:
+                await ch.send("🔒 Ce salon sera supprimé dans 5 secondes.")
+                await asyncio.sleep(5)
+                await ch.delete()
+            except: pass
+        ticket_sessions.pop(s["channel_id"], None)
+        save_data()
+
+# ── Événements Discord ─────────────────────────────────────────────
+@client.event
+async def on_ready():
+    load_data()
+    print("[BOT]", str(client.user), " | ", len(client.guilds), "guild(s)")
+    total = 0
+    for g in client.guilds:
+        cfg = ticket_config.get(g.id)
+        if not cfg or not cfg.get("category_id"): continue
+        cat = g.get_channel(cfg["category_id"])
+        if not cat or not isinstance(cat, discord.CategoryChannel): continue
+        for ch in cat.channels:
+            if not isinstance(ch, discord.TextChannel): continue
+            if ch.id in ticket_sessions or ch.id in pending_channels: continue
+            # Essai de trouver le "propriétaire" : premier non-bot non-admin avec accès
+            humans = [m for m in g.members if not m.bot and ch.permissions_for(m).view_channel and not m.guild_permissions.administrator]
+            owner_id = humans[0].id if humans else None
+            pending_channels[ch.id] = {"guild_id": g.id, "channel": ch,
+                                       "detected_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                                       "owner_id": owner_id}
+            total += 1
+    if total: print("[BOT]", total, "salon(s) existant(s) détecté(s)")
+
+@client.event
+async def on_guild_channel_create(channel):
+    if not isinstance(channel, discord.TextChannel): return
+    cfg = ticket_config.get(channel.guild.id)
+    if not cfg or channel.category_id != cfg.get("category_id"): return
+    # Attendre un court instant pour que les permissions soient appliquées par DraftBot
+    await asyncio.sleep(2)
+    humans = [m for m in channel.guild.members if not m.bot
+              and channel.permissions_for(m).view_channel
+              and not m.guild_permissions.administrator]
+    owner_id = humans[0].id if humans else None
+    pending_channels[channel.id] = {"guild_id": channel.guild.id, "channel": channel,
+                                    "detected_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                                    "owner_id": owner_id}
+    print("[BOT] Salon détecté : #" + channel.name + (" — owner: " + str(owner_id) if owner_id else ""))
+
+@client.event
+async def on_guild_channel_delete(channel):
+    """Nettoie les sessions et pending quand un salon ticket est supprimé manuellement."""
+    if channel.id in ticket_sessions:
+        s = ticket_sessions.pop(channel.id)
+        print("[BOT] Salon #" + channel.name + " supprimé → session ticket #" + str(s.get("number", "?")) + " retirée.")
+        save_data()
+    if channel.id in pending_channels:
+        pending_channels.pop(channel.id)
+        print("[BOT] Salon #" + channel.name + " supprimé → pending retiré.")
+
+@client.event
+async def on_message(message):
+    if message.author.bot: return
+    if message.guild:
+        activity_tracker[message.guild.id][message.author.id] = datetime.now(timezone.utc)
+    await handle_cmds(message)
+
+@client.event
+async def on_raw_reaction_add(payload):
+    if payload.user_id == client.user.id: return
+    g = client.get_guild(payload.guild_id)
+    if not g: return
+    s = next((x for x in ticket_sessions.values()
+               if x.get("staff_msg_id") == payload.message_id and x["guild_id"] == g.id and x["status"] == "pending"), None)
+    if not s or payload.channel_id != s.get("staff_chan_id"): return
+    m = g.get_member(payload.user_id)
+    if not m or not is_staff(m, g.id): return
+    e = str(payload.emoji)
+    if   e == "✅": await do_action(g, s, "accepted", "", m)
+    elif e == "❌": await do_action(g, s, "refused",  "", m)
+
+# ── Commandes Discord ──────────────────────────────────────────────
+async def handle_cmds(message):
+    if not message.guild: return
+    content = message.content.strip()
+    guild   = message.guild
+    cfg     = tconf(guild.id)
+
+    # Les actions sur ticket se font uniquement via le salon staff (boutons/menu) ou commandes !taccept/trefuse/tclose
+    # On ignore !accept/refuse/close tapés dans le salon ticket lui-même
+
+    if not content.startswith("!"): return
+    parts = content[1:].split(); cmd = parts[0].lower(); args = parts[1:]
+
+    if cmd == "ticket":
+        if maintenance_mode: await message.channel.send("🔧 Maintenance en cours."); return
+        if not args:
+            if not cfg["types"]: await message.channel.send("❌ Aucun type configuré."); return
+            await message.channel.send("🎫 **Ouvrir un ticket :**\n" +
+                "\n".join("• `!ticket " + k + "` — " + v["emoji"] + " " + v["label"] for k, v in cfg["types"].items()))
+            return
+        key = args[0].lower()
+        if key not in cfg["types"]: await message.channel.send("❌ Type inconnu : `" + key + "`"); return
+        if not cfg.get("category_id"): await message.channel.send("❌ Système non configuré."); return
+        ch, err = await open_ticket(guild, message.author, key)
+        if err: await message.channel.send("❌ " + err)
+        return
+
+    if not is_staff(message.author, guild.id): return
+
+    if cmd == "menu":
+        await send_staff_menu(message.channel, guild, invoker=message.author)
+
+    elif cmd == "tpending":
+        gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == guild.id]
+        if not gp: await message.channel.send("📭 Aucun salon en attente."); return
+        lines = ["`" + str(i) + ".` <#" + str(k) + ">  " + v["detected_at"] for i, (k, v) in enumerate(gp, 1)]
+        await message.channel.send("📥 **En attente :**\n" + "\n".join(lines) + "\n`!tlaunch <n°> <type>`")
+
+    elif cmd == "tlaunch":
+        if len(args) < 2: await message.channel.send("❌ `!tlaunch <n°> <type> [membre]`"); return
+        gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == guild.id]
+        ch_obj = None; pdata = None
+        try:
+            idx = int(args[0]) - 1
+            if 0 <= idx < len(gp): ch_obj = guild.get_channel(gp[idx][0]); pdata = gp[idx][1]
+        except ValueError:
+            for k, v in gp:
+                c = guild.get_channel(k)
+                if c and args[0].lstrip("#").lower() in c.name.lower(): ch_obj = c; pdata = v; break
+        if not ch_obj: await message.channel.send("❌ Salon introuvable."); return
+        key = args[1].lower()
+        if key not in cfg["types"]: await message.channel.send("❌ Types : " + ", ".join("`" + k + "`" for k in cfg["types"])); return
+        # Priorité : 3e arg → owner_id stocké → premier non-admin dans salon
+        member = None
+        if len(args) >= 3:
+            member = find_member(args[2], guild)
+            if not member: await message.channel.send("❌ Membre introuvable."); return
+        if not member:
+            owner_id = (pdata or {}).get("owner_id")
+            if owner_id: member = guild.get_member(owner_id)
+        if not member:
+            membres_ch = [m for m in guild.members if not m.bot and ch_obj.permissions_for(m).view_channel
+                          and not m.guild_permissions.administrator]
+            if not membres_ch: membres_ch = [m for m in guild.members if not m.bot and ch_obj.permissions_for(m).view_channel]
+            if not membres_ch: await message.channel.send("❌ Aucun membre dans ce salon."); return
+            member = membres_ch[0]
+        await message.channel.send("▶️ Lancement pour " + member.mention + " dans " + ch_obj.mention + "…")
+        asyncio.create_task(run_questions(guild, cfg, ch_obj, member, key))
+
+    elif cmd == "tlist":
+        filtre = args[0].lower() if args else "open"
+        ss = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id]
+        if filtre == "open":   ss = [s for s in ss if s["status"] in ("open", "pending")]
+        elif filtre == "closed": ss = [s for s in ss if s["status"] not in ("open", "pending")]
+        if not ss: await message.channel.send("📭 Aucun ticket (" + filtre + ")."); return
+        icons = {"open": "🟡", "pending": "🟡", "accepted": "✅", "refused": "❌", "closed": "🔒"}
+        await message.channel.send("🎫 **Tickets :**\n" + "\n".join(
+            icons.get(s["status"], "❓") + " `#" + str(s["number"]).zfill(4) + "` " + s["type"] + " <@" + str(s["user_id"]) + ">"
+            for s in sorted(ss, key=lambda x: x["number"])))
+
+    elif cmd in ("taccept", "trefuse", "tclose"):
+        if not args: await message.channel.send("❌ `!" + cmd + " <n°>`"); return
+        try: num = int(args[0].lstrip("#"))
+        except ValueError: await message.channel.send("❌ Numéro invalide."); return
+        s = next((x for x in ticket_sessions.values() if x["guild_id"] == guild.id and x["number"] == num), None)
+        if not s: await message.channel.send("❌ Ticket #" + str(num) + " introuvable."); return
+        act = {"taccept": "accepted", "trefuse": "refused", "tclose": "closed"}[cmd]
+        raison = " ".join(args[1:]) if len(args) > 1 else {"accepted": "Accepté.", "refused": "Refusé.", "closed": "Fermé."}.get(act, "")
+        await do_action(guild, s, act, raison, message.author)
+        await message.add_reaction("✅")
+
+    elif cmd == "tsend":
+        if len(args) < 2: await message.channel.send("❌ `!tsend <n°> <msg>`"); return
+        try: num = int(args[0].lstrip("#"))
+        except ValueError: await message.channel.send("❌ Numéro invalide."); return
+        s = next((x for x in ticket_sessions.values() if x["guild_id"] == guild.id and x["number"] == num), None)
+        if not s: await message.channel.send("❌ Ticket #" + str(num) + " introuvable."); return
+        ch_obj = guild.get_channel(s["channel_id"])
+        if not ch_obj: await message.channel.send("❌ Salon introuvable."); return
+        await ch_obj.send("📢 **Staff** (" + message.author.display_name + ") : " + " ".join(args[1:]))
+        await message.add_reaction("✅")
+
+    elif cmd == "thelp":
+        await message.channel.send(
+            "🎫 **Commandes tickets**\n"
+            "`!ticket [type]` `!tpending` `!tlaunch <n°> <type>`\n"
+            "`!tlist [open|closed|all]` `!taccept <n°>` `!trefuse <n°>` `!tclose <n°>`\n"
+            "`!tsend <n°> <msg>` `!menu`")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MENU DISCORD STAFF — DESIGN MODERNE
+# ══════════════════════════════════════════════════════════════════
+
+
+def _e_ok(title, desc=""):
+    return discord.Embed(title=title, description=desc or None, color=C_GREEN)
+
+def _e_err(title, desc=""):
+    return discord.Embed(title=title, description=desc or None, color=C_RED)
+
+def _e_warn(title, desc=""):
+    return discord.Embed(title=title, description=desc or None, color=C_AMBER)
+
+def _e_empty(title, desc=""):
+    return discord.Embed(title=title, description="*" + desc + "*" if desc else None, color=C_GREY)
+
+
+async def send_staff_menu(channel, guild, invoker=None):
+    """
+    Envoie le panel staff.
+    invoker : membre Discord qui invoque (None = appelé depuis la console/API, pas de check).
+    """
+    if invoker and not is_staff(invoker, guild.id):
+        await channel.send(embed=_e_err("🚫  Accès refusé", "Réservé au staff configuré."))
+        return
+    if menu_locked:
+        if invoker:
+            await channel.send(embed=_e_warn("🔒  Menu verrouillé", "Déverrouille via la console (`unlockmenu`)."))
+        return
+    cfg = tconf(guild.id)
+    cat = guild.get_channel(cfg.get("category_id") or 0)
+    sch = guild.get_channel(cfg.get("staff_channel_id") or 0)
+    sro = guild.get_role(cfg.get("staff_role_id") or 0)
+
+    ot = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("open", "pending")]
+    pt = [v for v in pending_channels.values() if v["guild_id"] == guild.id]
+    ct = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("accepted", "refused", "closed")]
+
+    def bar(n, total, w=10):
+        if total == 0: return "`" + "░" * w + "`"
+        f = round(n / total * w)
+        return "`" + "█" * f + "░" * (w - f) + "`"
+
+    total_t = max(len(ot) + len(ct), 1)
+
+    e = discord.Embed(color=C_DARK, timestamp=datetime.now(timezone.utc))
+    e.set_author(name="⚡  Panel Staff — " + guild.name,
+                 icon_url=guild.icon.url if guild.icon else None)
+
+    # Config bloc
+    cfg_val  = "> 📁  **Catégorie** — " + ("`" + cat.name + "`" if cat else "❌ Non définie") + "\n"
+    cfg_val += "> 📣  **Salon staff** — " + (sch.mention if sch else "❌ Non défini") + "\n"
+    cfg_val += "> 🛡  **Rôle staff** — " + (sro.mention if sro else "⚠️ Non défini")
+    e.add_field(name="⚙️  Configuration", value=cfg_val, inline=False)
+
+    # Stats
+    stats_val  = "> 🟡  **En cours**    " + bar(len(ot), total_t) + "  `" + str(len(ot)) + "`\n"
+    stats_val += "> ✅  **Traités**     " + bar(len(ct), total_t) + "  `" + str(len(ct)) + "`\n"
+    stats_val += "> 📥  **En attente** (DraftBot)  `" + str(len(pt)) + "`\n"
+    stats_val += "> 📝  **Types configurés**        `" + str(len(cfg["types"])) + "`"
+    e.add_field(name="📊  Statistiques", value=stats_val, inline=False)
+
+    # Derniers tickets
+    if ot:
+        icons = {"open": "🟡", "pending": "⏳"}
+        recent = sorted(ot, key=lambda x: x["number"], reverse=True)[:3]
+        last = ""
+        for s in recent:
+            mem  = guild.get_member(s["user_id"])
+            name = mem.display_name if mem else str(s["user_id"])
+            last += "> " + icons.get(s["status"], "🟡") + "  `#" + str(s["number"]).zfill(4) + "` **" + s["type"] + "** — " + name + "\n"
+        e.add_field(name="🕐  Tickets récents", value=last.rstrip(), inline=False)
+
+    e.set_footer(text=("🔧 MAINTENANCE ACTIVE  •  " if maintenance_mode else "") + "Panel réservé à l'équipe staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
+    await channel.send(embed=e, view=DashboardView(guild))
+
+
+class DashboardView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=600)
+        self.guild = guild
+        sel = discord.ui.Select(
+            placeholder="📂  Choisir une section…",
+            options=[
+                discord.SelectOption(label="🎫  Tickets ouverts",    value="tickets",  description="Voir et gérer les tickets en cours"),
+                discord.SelectOption(label="📥  Salons en attente",   value="pending",  description="Lancer les questions DraftBot"),
+                discord.SelectOption(label="📝  Types de tickets",    value="types",    description="Voir, créer, modifier, supprimer les types"),
+                discord.SelectOption(label="⚙️   Configuration",      value="config",   description="Catégorie, salon staff, rôle staff"),
+                discord.SelectOption(label="👥  Membres",             value="members",  description="Liste des membres et modération"),
+                discord.SelectOption(label="📋  Rôles",               value="roles",    description="Liste des rôles du serveur"),
+                discord.SelectOption(label="📡  Salons",              value="channels", description="Salons texte par catégorie"),
+                discord.SelectOption(label="🌐  Infos serveur",       value="server",   description="Statistiques du serveur"),
+            ]
+        )
+        sel.callback = self.on_select
+        self.add_item(sel)
+
+    async def on_select(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫  Accès refusé", "Réservé au staff configuré."), ephemeral=True)
+            return
+        if menu_locked:
+            await inter.response.send_message(embed=_e_warn("🔒  Menu verrouillé", "Déverrouille via la console (`unlockmenu`)."), ephemeral=True)
+            return
+        val = inter.data["values"][0]
+        g   = self.guild
+        cfg = tconf(g.id)
+
+        # ── Tickets ouverts ──────────────────────────────────────
+        if val == "tickets":
+            ss = [s for s in ticket_sessions.values()
+                  if s["guild_id"] == g.id and s["status"] in ("open", "pending")]
+            if not ss:
+                await inter.response.send_message(embed=_e_empty("🎫  Tickets ouverts", "Aucun ticket en cours."), ephemeral=True)
+                return
+            icons = {"open": "🟡", "pending": "⏳"}
+            e = discord.Embed(title="🎫  Tickets en cours",
+                              description="`" + str(len(ss)) + "` ticket(s) ouvert(s)",
+                              color=C_ORANGE)
+            for s in sorted(ss, key=lambda x: x["number"])[:9]:
+                mem = g.get_member(s["user_id"])
+                mn  = mem.display_name if mem else str(s["user_id"])
+                ico = icons.get(s["status"], "🟡")
+                tt  = cfg["types"].get(s["type"], {})
+                field_val = "👤 **" + mn + "**\n📅 " + s["opened_at"] + "\n<#" + str(s["channel_id"]) + ">"
+                e.add_field(name=ico + "  #" + str(s["number"]).zfill(4) + " · " + tt.get("emoji", "🎫") + " " + tt.get("label", s["type"]),
+                            value=field_val, inline=True)
+            await inter.response.send_message(embed=e, view=TicketListView(g, ss, cfg), ephemeral=True)
+
+        # ── Salons en attente ────────────────────────────────────
+        elif val == "pending":
+            gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == g.id]
+            if not gp:
+                await inter.response.send_message(embed=_e_empty("📥  Salons en attente", "Aucun salon détecté."), ephemeral=True)
+                return
+            if not cfg["types"]:
+                await inter.response.send_message(embed=_e_warn("⚠️  Aucun type défini", "Configure des types via la console distante (`ttype add`)."), ephemeral=True)
+                return
+            e = discord.Embed(title="📥  Salons en attente",
+                              description="`" + str(len(gp)) + "` salon(s) détecté(s) par DraftBot",
+                              color=C_AMBER)
+            for k, v in gp[:10]:
+                ch = g.get_channel(k)
+                e.add_field(name="#" + (ch.name if ch else str(k)), value="⏱ " + v["detected_at"], inline=True)
+            await inter.response.send_message(embed=e, view=PendingLaunchView(g, cfg, gp), ephemeral=True)
+
+        # ── Types de tickets ─────────────────────────────────────
+        elif val == "types":
+            e = discord.Embed(title="📝  Types de tickets",
+                              description="`" + str(len(cfg["types"])) + "` type(s) configuré(s)",
+                              color=C_PURPLE)
+            if cfg["types"]:
+                for key, t in cfg["types"].items():
+                    qs    = t.get("questions", [])
+                    q_txt = "\n".join("• " + q for q in qs[:5]) or "*Aucune question*"
+                    if len(qs) > 5: q_txt += "\n*…+" + str(len(qs) - 5) + " autres*"
+                    e.add_field(name=t["emoji"] + "  **" + t["label"] + "**  `[" + key + "]`",
+                                value=q_txt[:256], inline=False)
+            else:
+                e.description += "\n\n*Aucun type — crées-en un avec le bouton ci-dessous.*"
+            await inter.response.send_message(embed=e, view=TypesManagerView(g, cfg), ephemeral=True)
+
+        # ── Configuration ────────────────────────────────────────
+        elif val == "config":
+            cat2 = g.get_channel(cfg.get("category_id") or 0)
+            sch2 = g.get_channel(cfg.get("staff_channel_id") or 0)
+            sro2 = g.get_role(cfg.get("staff_role_id") or 0)
+            e = discord.Embed(title="⚙️  Configuration du système de tickets", color=C_BLUE)
+            e.add_field(name="📁  Catégorie tickets",
+                        value="`" + cat2.name + "`" if cat2 else "❌ *Non définie*", inline=True)
+            e.add_field(name="📣  Salon staff",
+                        value=sch2.mention if sch2 else "❌ *Non défini*", inline=True)
+            e.add_field(name="🛡  Rôle staff",
+                        value=sro2.mention if sro2 else "⚠️ *Non défini*", inline=True)
+            e.add_field(name="🔢  Compteur",
+                        value="`#" + str(cfg["counter"]).zfill(4) + "`", inline=True)
+            e.add_field(name="📝  Types",
+                        value="`" + str(len(cfg["types"])) + "` type(s)", inline=True)
+            e.set_footer(text="Utilise les menus ci-dessous pour modifier la configuration.")
+            await inter.response.send_message(embed=e, view=ConfigFullView(g, cfg), ephemeral=True)
+
+        # ── Membres ──────────────────────────────────────────────
+        elif val == "members":
+            humans = [m for m in g.members if not m.bot]
+            si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
+                  discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+            e = discord.Embed(title="👥  Membres — " + g.name,
+                              description="`" + str(len(humans)) + "` membre(s)",
+                              color=C_GREEN)
+            chunk = humans[:24]
+            lines = [si.get(m.status, "⚫") + " **" + m.display_name + "**" for m in chunk]
+            col_size = max(1, (len(lines) + 2) // 3)
+            for ci in range(3):
+                col = lines[ci * col_size:(ci + 1) * col_size]
+                if col: e.add_field(name="\u200b", value="\n".join(col), inline=True)
+            if len(humans) > 24: e.set_footer(text="…et " + str(len(humans) - 24) + " autres membres")
+            await inter.response.send_message(embed=e, view=MemberActionView(g), ephemeral=True)
+
+        # ── Rôles ────────────────────────────────────────────────
+        elif val == "roles":
+            roles = [r for r in g.roles if r.name != "@everyone"][::-1]
+            e = discord.Embed(title="📋  Rôles — " + g.name,
+                              description="`" + str(len(roles)) + "` rôle(s)",
+                              color=C_BLURPLE)
+            lines = [("🔵" if r.color.value else "⚪") + " " + r.mention + "  `" + str(len(r.members)) + " membres`"
+                     for r in roles[:20]]
+            e.description += "\n\n" + "\n".join(lines)
+            if len(roles) > 20: e.set_footer(text="…et " + str(len(roles) - 20) + " autres rôles")
+            await inter.response.send_message(embed=e, ephemeral=True)
+
+        # ── Salons ───────────────────────────────────────────────
+        elif val == "channels":
+            e = discord.Embed(title="📡  Salons — " + g.name, color=C_TEAL)
+            cats = sorted(g.categories, key=lambda c: c.position)
+            for cat3 in cats[:6]:
+                txt = [c for c in cat3.channels if isinstance(c, discord.TextChannel)]
+                if not txt: continue
+                val_str = "\n".join("#" + c.name for c in txt[:8])
+                if len(txt) > 8: val_str += "\n*…+" + str(len(txt) - 8) + "*"
+                e.add_field(name="📁 " + cat3.name, value=val_str, inline=True)
+            await inter.response.send_message(embed=e, ephemeral=True)
+
+        # ── Infos serveur ────────────────────────────────────────
+        elif val == "server":
+            humans = [m for m in g.members if not m.bot]
+            online = [m for m in humans if m.status != discord.Status.offline]
+            bots   = [m for m in g.members if m.bot]
+            e = discord.Embed(title="🌐  " + g.name, color=C_DARK,
+                              timestamp=datetime.now(timezone.utc))
+            if g.icon: e.set_thumbnail(url=g.icon.url)
+            e.add_field(name="👥  Membres",  value="`" + str(len(humans)) + "` total\n`" + str(len(online)) + "` en ligne", inline=True)
+            e.add_field(name="🤖  Bots",     value="`" + str(len(bots)) + "`", inline=True)
+            e.add_field(name="📋  Rôles",    value="`" + str(len(g.roles) - 1) + "`", inline=True)
+            txt_chs = [c for c in g.channels if isinstance(c, discord.TextChannel)]
+            e.add_field(name="📡  Salons",   value="`" + str(len(txt_chs)) + "` texte\n`" + str(len(g.categories)) + "` catégorie(s)", inline=True)
+            e.add_field(name="📅  Création", value="<t:" + str(int(g.created_at.timestamp())) + ":D>", inline=True)
+            e.add_field(name="🆔  ID",       value="`" + str(g.id) + "`", inline=True)
+            await inter.response.send_message(embed=e, ephemeral=True)
+
+
+# ── Vue : liste tickets + sélection ──────────────────────────────
+class TicketListView(discord.ui.View):
+    def __init__(self, guild, sessions, cfg):
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.cfg   = cfg
+        icons = {"open": "🟡", "pending": "⏳"}
+        opts  = []
+        for s in sorted(sessions, key=lambda x: x["number"])[:25]:
+            mem = guild.get_member(s["user_id"])
+            mn  = (mem.display_name if mem else str(s["user_id"]))[:20]
+            ico = icons.get(s["status"], "🟡")
+            opts.append(discord.SelectOption(
+                label=(ico + "  #" + str(s["number"]).zfill(4) + " · " + s["type"])[:100],
+                description=("Par " + mn + " · " + s["opened_at"])[:100],
+                value=str(s["channel_id"])))
+        sel = discord.ui.Select(placeholder="🎫  Choisir un ticket…", options=opts)
+        sel.callback = self.on_select
+        self.add_item(sel)
+
+    async def on_select(self, inter: discord.Interaction):
+        s = ticket_sessions.get(int(inter.data["values"][0]))
+        if not s:
+            await inter.response.send_message(embed=_e_err("❌  Ticket introuvable"), ephemeral=True)
+            return
+        mem  = self.guild.get_member(s["user_id"])
+        mn   = mem.display_name if mem else str(s["user_id"])
+        tt   = self.cfg["types"].get(s["type"], {})
+        cols = {"open": C_ORANGE, "pending": C_AMBER, "accepted": C_GREEN, "refused": C_RED, "closed": C_GREY}
+        stat_lbl = {"open": "🟡 Ouvert", "pending": "⏳ En attente",
+                    "accepted": "✅ Accepté", "refused": "❌ Refusé", "closed": "🔒 Fermé"}
+        e = discord.Embed(
+            title=tt.get("emoji", "🎫") + "  Ticket #" + str(s["number"]).zfill(4) + " — " + tt.get("label", s["type"]),
+            color=cols.get(s["status"], 0x99AAB5))
+        e.add_field(name="👤  Demandeur", value=mem.mention if mem else mn,         inline=True)
+        e.add_field(name="📊  Statut",   value=stat_lbl.get(s["status"], s["status"]), inline=True)
+        e.add_field(name="📅  Ouvert le",value=s["opened_at"],                      inline=True)
+        e.add_field(name="📍  Salon",    value="<#" + str(s["channel_id"]) + ">",   inline=True)
+        for q, a in list(s["answers"].items())[:4]:
+            e.add_field(name="❓  " + q[:40], value="```" + a[:100] + "```", inline=False)
+        await inter.response.send_message(embed=e, view=TicketActionView(self.guild, s), ephemeral=True)
+
+
+# ── Vue : actions sur ticket ─────────────────────────────────────
+class TicketActionView(discord.ui.View):
+    """Vue initiale : Accepter (modal) / Refuser (modal) / Fermer / Envoyer message."""
+    def __init__(self, guild, s):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.s     = s
+
+    def _guard(self, inter):
+        return is_staff(inter.user, self.guild.id)
+
+    @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, emoji="✅", row=0)
+    async def accept(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(ActionCommentModal(self.guild, self.s, "accepted"))
+
+    @discord.ui.button(label="Refuser", style=discord.ButtonStyle.danger, emoji="❌", row=0)
+    async def refuse(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(ActionCommentModal(self.guild, self.s, "refused"))
+
+    @discord.ui.button(label="Fermer", style=discord.ButtonStyle.secondary, emoji="🔒", row=0)
+    async def close(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await do_action(self.guild, self.s, "closed", "", inter.user)
+        await inter.response.send_message(embed=_e_empty("🔒  Fermé", "Salon supprimé sous peu."), ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="Message", style=discord.ButtonStyle.primary, emoji="💬", row=0)
+    async def send_msg(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(SendMsgModal(self.guild, self.s))
+
+
+class ActionCommentModal(discord.ui.Modal):
+    """Modal affiché lors d'un Accepter ou Refuser — permet de saisir un commentaire."""
+    commentaire = discord.ui.TextInput(
+        label="Commentaire (optionnel)",
+        placeholder="Laisse vide pour ne rien ajouter…",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=False)
+
+    def __init__(self, guild, s, action):
+        label = "✅  Accepter le ticket" if action == "accepted" else "❌  Refuser le ticket"
+        super().__init__(title=label)
+        self.guild  = guild
+        self.s      = s
+        self.action = action
+
+    async def on_submit(self, inter: discord.Interaction):
+        commentaire = self.commentaire.value.strip()
+        await do_action(self.guild, self.s, self.action, commentaire, inter.user)
+        if self.action == "accepted":
+            desc = ("💬 " + commentaire) if commentaire else "Aucun commentaire."
+            await inter.response.send_message(embed=_e_ok("✅  Ticket accepté", desc), view=PostActionView(self.guild, self.s), ephemeral=True)
+        else:
+            desc = ("💬 " + commentaire) if commentaire else "Aucun commentaire."
+            await inter.response.send_message(embed=_e_err("❌  Ticket refusé", desc), view=PostActionView(self.guild, self.s), ephemeral=True)
+
+
+class PostActionView(discord.ui.View):
+    """Vue après accept/refuse : Fermer le salon + Envoyer un message."""
+    def __init__(self, guild, s):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.s     = s
+
+    @discord.ui.button(label="Fermer le salon", style=discord.ButtonStyle.secondary, emoji="🔒")
+    async def close(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await do_action(self.guild, self.s, "closed", "", inter.user)
+        await inter.response.send_message(embed=_e_empty("🔒  Fermé", "Salon supprimé sous peu."), ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="Envoyer message", style=discord.ButtonStyle.primary, emoji="💬")
+    async def send_msg(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(SendMsgModal(self.guild, self.s))
+
+
+class SendMsgModal(discord.ui.Modal, title="💬  Message dans le ticket"):
+    message = discord.ui.TextInput(label="Message", placeholder="Votre message pour le demandeur…",
+                                    style=discord.TextStyle.paragraph, max_length=1000)
+
+    def __init__(self, guild, s):
+        super().__init__()
+        self.guild = guild
+        self.s     = s
+
+    async def on_submit(self, inter: discord.Interaction):
+        ch = self.guild.get_channel(self.s["channel_id"])
+        if not ch:
+            await inter.response.send_message(embed=_e_err("❌  Salon introuvable"), ephemeral=True); return
+        await ch.send("📢  **Staff** (" + inter.user.display_name + ") :\n" + self.message.value)
+        await inter.response.send_message(embed=_e_ok("✅  Message envoyé"), ephemeral=True)
+
+
+# ── Vue : salons en attente ──────────────────────────────────────
+class PendingLaunchView(discord.ui.View):
+    def __init__(self, guild, cfg, pending_list):
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.cfg   = cfg
+        self.sel_ch = None
+        opts = []
+        for k, v in pending_list[:25]:
+            ch = guild.get_channel(k)
+            opts.append(discord.SelectOption(
+                label="#" + (ch.name if ch else str(k)),
+                description="Détecté le " + v["detected_at"],
+                value=str(k), emoji="📥"))
+        s1 = discord.ui.Select(placeholder="1️⃣  Choisir le salon…", options=opts)
+        s1.callback = self.sel_channel
+        self.add_item(s1)
+
+    async def sel_channel(self, inter: discord.Interaction):
+        self.sel_ch = int(inter.data["values"][0])
+        opts_t = []
+        for k, v in self.cfg["types"].items():
+            opts_t.append(discord.SelectOption(
+                label=v["emoji"] + "  " + v["label"],
+                description="Clé : " + k + "  ·  " + str(len(v.get("questions", []))) + " question(s)",
+                value=k))
+        s2 = discord.ui.Select(placeholder="2️⃣  Type de questions…", options=opts_t)
+        s2.callback = self.sel_type
+        v2 = discord.ui.View(timeout=60)
+        v2.add_item(s2)
+        e = discord.Embed(title="2️⃣  Choisir le type", description="Quel type de ticket est-ce ?", color=C_AMBER)
+        await inter.response.send_message(embed=e, view=v2, ephemeral=True)
+
+    async def sel_type(self, inter: discord.Interaction):
+        key = inter.data["values"][0]
+        ch  = self.guild.get_channel(self.sel_ch)
+        if not ch:
+            await inter.response.send_message(embed=_e_err("❌  Salon introuvable"), ephemeral=True); return
+
+        # Priorité au propriétaire détecté
+        owner_id = pending_channels.get(self.sel_ch, {}).get("owner_id")
+        owner    = self.guild.get_member(owner_id) if owner_id else None
+
+        membres = [m for m in self.guild.members if not m.bot and ch.permissions_for(m).view_channel
+                   and not m.guild_permissions.administrator]
+        if not membres:
+            membres = [m for m in self.guild.members if not m.bot and ch.permissions_for(m).view_channel]
+        if not membres:
+            await inter.response.send_message(embed=_e_err("❌  Aucun membre dans ce salon"), ephemeral=True); return
+
+        # Mettre le owner en tête de liste
+        if owner and owner in membres:
+            membres = [owner] + [m for m in membres if m.id != owner.id]
+        elif owner:
+            membres = [owner] + membres
+
+        self._sel_key = key
+        self._sel_ch  = self.sel_ch
+        opts = [discord.SelectOption(
+            label=("⭐ " if m == owner else "") + m.display_name[:47],
+            description=("Propriétaire détecté — " if m == owner else "ID: ") + str(m.id),
+            value=str(m.id),
+            default=(m == owner)) for m in membres[:25]]
+        sel_m = discord.ui.Select(placeholder="3️⃣  Choisir le demandeur…", options=opts)
+        sel_m.callback = self.sel_member
+        v3 = discord.ui.View(timeout=60)
+        v3.add_item(sel_m)
+        tt = self.cfg["types"][key]
+        e  = discord.Embed(title="3️⃣  Qui est le demandeur ?",
+                           description="Type : **" + tt["emoji"] + " " + tt["label"] + "**\n" +
+                                       ("⭐ Propriétaire détecté : **" + owner.display_name + "**" if owner else "*Aucun propriétaire détecté*"),
+                           color=C_ORANGE)
+        await inter.response.send_message(embed=e, view=v3, ephemeral=True)
+
+    async def sel_member(self, inter: discord.Interaction):
+        member = self.guild.get_member(int(inter.data["values"][0]))
+        ch     = self.guild.get_channel(self.sel_ch)
+        key    = self._sel_key
+        if not member or not ch:
+            await inter.response.send_message(embed=_e_err("❌  Introuvable"), ephemeral=True); return
+        tt = self.cfg["types"][key]
+        e  = discord.Embed(title="▶️  Questions lancées",
+                           description="**" + tt["emoji"] + " " + tt["label"] + "** dans " + ch.mention + " pour " + member.mention + ".",
+                           color=C_GREEN)
+        await inter.response.send_message(embed=e, ephemeral=True)
+        asyncio.create_task(run_questions(self.guild, self.cfg, ch, member, key))
+
+
+# ── Vue : configuration complète ─────────────────────────────────
+class ConfigFullView(discord.ui.View):
+    def __init__(self, guild, cfg, role_page=0):
+        super().__init__(timeout=300)
+        self.guild     = guild
+        self.cfg       = cfg
+        self.role_page = role_page
+        cats  = sorted(guild.categories, key=lambda c: c.position)
+        chs   = sorted([c for c in guild.channels if isinstance(c, discord.TextChannel)], key=lambda c: c.name)
+        all_roles = [r for r in guild.roles if r.name != "@everyone"]
+
+        if cats:
+            s1 = discord.ui.Select(
+                placeholder="📁  Catégorie des tickets…",
+                options=[discord.SelectOption(
+                    label=cat.name[:50],
+                    description=str(len(cat.channels)) + " salon(s)",
+                    value=str(cat.id),
+                    default=(cfg.get("category_id") == cat.id)) for cat in cats[:25]],
+                row=0)
+            s1.callback = self.set_cat
+            self.add_item(s1)
+
+        if chs:
+            s2 = discord.ui.Select(
+                placeholder="📣  Salon des notifications staff…",
+                options=[discord.SelectOption(
+                    label=("#" + c.name)[:50],
+                    value=str(c.id),
+                    default=(cfg.get("staff_channel_id") == c.id)) for c in chs[:25]],
+                row=1)
+            s2.callback = self.set_sch
+            self.add_item(s2)
+
+        # Rôles paginés : page de 24 + option "page suivante" si besoin
+        if all_roles:
+            page_start = role_page * 24
+            page_roles = all_roles[page_start:page_start + 24]
+            has_next   = (page_start + 24) < len(all_roles)
+            opts_r = [discord.SelectOption(
+                label=r.name[:50],
+                description=str(len(r.members)) + " membre(s)",
+                value=str(r.id),
+                default=(cfg.get("staff_role_id") == r.id)) for r in page_roles]
+            if has_next:
+                opts_r.append(discord.SelectOption(
+                    label="➡️  Page suivante (" + str(len(all_roles) - page_start - 24) + " rôles restants)",
+                    value="__next_page__",
+                    description="Voir les rôles suivants"))
+            suffix = "  (p." + str(role_page + 1) + ")" if len(all_roles) > 24 else ""
+            s3 = discord.ui.Select(
+                placeholder="🛡  Rôle staff autorisé" + suffix + "…",
+                options=opts_r, row=2)
+            s3.callback = self.set_sro
+            self.add_item(s3)
+
+        # Bouton saisie manuelle du rôle (pour les très grands serveurs)
+        btn_role = discord.ui.Button(label="Saisir rôle (nom)", style=discord.ButtonStyle.secondary,
+                                     emoji="🔍", row=3)
+        btn_role.callback = self.manual_role
+        self.add_item(btn_role)
+
+        btn_show = discord.ui.Button(label="Config actuelle", style=discord.ButtonStyle.secondary,
+                                     emoji="📊", row=3)
+        btn_show.callback = self.show_cfg
+        self.add_item(btn_show)
+
+    async def set_cat(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["category_id"] = int(inter.data["values"][0])
+        save_data()
+        cat = self.guild.get_channel(self.cfg["category_id"])
+        await inter.response.send_message(
+            embed=_e_ok("✅  Catégorie mise à jour", "**" + (cat.name if cat else "?") + "**"), ephemeral=True)
+
+    async def set_sch(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["staff_channel_id"] = int(inter.data["values"][0])
+        save_data()
+        ch = self.guild.get_channel(self.cfg["staff_channel_id"])
+        await inter.response.send_message(
+            embed=_e_ok("✅  Salon staff mis à jour", "**#" + (ch.name if ch else "?") + "**"), ephemeral=True)
+
+    async def set_sro(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        val = inter.data["values"][0]
+        if val == "__next_page__":
+            new_view = ConfigFullView(self.guild, self.cfg, self.role_page + 1)
+            await inter.response.edit_message(view=new_view)
+            return
+        self.cfg["staff_role_id"] = int(val)
+        save_data()
+        r = self.guild.get_role(self.cfg["staff_role_id"])
+        await inter.response.send_message(
+            embed=_e_ok("✅  Rôle staff mis à jour", "**" + (r.name if r else "?") + "**"), ephemeral=True)
+
+    async def manual_role(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(RoleSearchModal(self.guild, self.cfg))
+
+    async def show_cfg(self, inter: discord.Interaction):
+        cat2 = self.guild.get_channel(self.cfg.get("category_id") or 0)
+        sch2 = self.guild.get_channel(self.cfg.get("staff_channel_id") or 0)
+        sro2 = self.guild.get_role(self.cfg.get("staff_role_id") or 0)
+        e = discord.Embed(title="📊  Config actuelle", color=C_BLUE)
+        e.add_field(name="📁 Catégorie",   value="`" + cat2.name + "`" if cat2 else "❌", inline=True)
+        e.add_field(name="📣 Salon staff", value=sch2.mention if sch2 else "❌",          inline=True)
+        e.add_field(name="🛡 Rôle staff",  value=sro2.mention if sro2 else "⚠️",         inline=True)
+        await inter.response.send_message(embed=e, ephemeral=True)
+
+
+class RoleSearchModal(discord.ui.Modal, title="🔍  Chercher un rôle par nom"):
+    query = discord.ui.TextInput(label="Nom du rôle (partiel accepté)",
+                                  placeholder="ex: Admin, Modérateur…",
+                                  max_length=50)
+
+    def __init__(self, guild, cfg):
+        super().__init__()
+        self.guild = guild
+        self.cfg   = cfg
+
+    async def on_submit(self, inter: discord.Interaction):
+        q = self.query.value.lower()
+        matches = [r for r in self.guild.roles if q in r.name.lower() and r.name != "@everyone"]
+        if not matches:
+            await inter.response.send_message(embed=_e_err("❌  Aucun rôle trouvé", "Essaie avec un autre nom."), ephemeral=True); return
+        if len(matches) == 1:
+            self.cfg["staff_role_id"] = matches[0].id
+            save_data()
+            await inter.response.send_message(embed=_e_ok("✅  Rôle staff mis à jour", "**" + matches[0].name + "**"), ephemeral=True)
+            return
+        # Plusieurs correspondances → proposer un select
+        opts = [discord.SelectOption(label=r.name[:50], description=str(len(r.members)) + " membre(s)", value=str(r.id))
+                for r in matches[:25]]
+        sel = discord.ui.Select(placeholder="Choisir parmi les résultats…", options=opts)
+        cfg_ref = self.cfg
+        guild_ref = self.guild
+        async def _pick(i2):
+            cfg_ref["staff_role_id"] = int(i2.data["values"][0])
+            save_data()
+            r2 = guild_ref.get_role(cfg_ref["staff_role_id"])
+            await i2.response.send_message(embed=_e_ok("✅  Rôle staff mis à jour", "**" + (r2.name if r2 else "?") + "**"), ephemeral=True)
+        sel.callback = _pick
+        v2 = discord.ui.View(timeout=60); v2.add_item(sel)
+        await inter.response.send_message(embed=discord.Embed(title="🔍  Résultats — " + str(len(matches)) + " rôle(s)", color=C_BLUE),
+                                          view=v2, ephemeral=True)
+
+
+# ── Vue : gestion complète des types depuis Discord ───────────────
+class TypesManagerView(discord.ui.View):
+    def __init__(self, guild, cfg):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.cfg   = cfg
+
+    @discord.ui.button(label="Créer un type", style=discord.ButtonStyle.success, emoji="➕", row=0)
+    async def create_type(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(TypeCreateModal(self.guild, self.cfg))
+
+    @discord.ui.button(label="Modifier un type", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
+    async def edit_type(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        if not self.cfg["types"]:
+            await inter.response.send_message(embed=_e_warn("⚠️", "Aucun type à modifier."), ephemeral=True); return
+        opts = [discord.SelectOption(label=t["emoji"] + " " + t["label"], value=k)
+                for k, t in self.cfg["types"].items()]
+        sel = discord.ui.Select(placeholder="Choisir le type à modifier…", options=opts)
+        cfg_ref = self.cfg; guild_ref = self.guild
+        async def _pick(i2):
+            key = i2.data["values"][0]
+            await i2.response.send_modal(TypeEditModal(guild_ref, cfg_ref, key))
+        sel.callback = _pick
+        v2 = discord.ui.View(timeout=60); v2.add_item(sel)
+        await inter.response.send_message(embed=discord.Embed(title="✏️  Modifier quel type ?", color=C_PURPLE),
+                                          view=v2, ephemeral=True)
+
+    @discord.ui.button(label="Supprimer un type", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
+    async def delete_type(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        if not self.cfg["types"]:
+            await inter.response.send_message(embed=_e_warn("⚠️", "Aucun type à supprimer."), ephemeral=True); return
+        opts = [discord.SelectOption(label=t["emoji"] + " " + t["label"], value=k)
+                for k, t in self.cfg["types"].items()]
+        sel = discord.ui.Select(placeholder="Choisir le type à supprimer…", options=opts)
+        cfg_ref = self.cfg
+        async def _del(i2):
+            key = i2.data["values"][0]
+            label = cfg_ref["types"][key]["label"]
+            del cfg_ref["types"][key]; save_data()
+            await i2.response.send_message(embed=_e_ok("🗑️  Type supprimé", "**" + label + "** supprimé."), ephemeral=True)
+        sel.callback = _del
+        v2 = discord.ui.View(timeout=60); v2.add_item(sel)
+        await inter.response.send_message(embed=discord.Embed(title="🗑️  Supprimer quel type ?", color=C_RED),
+                                          view=v2, ephemeral=True)
+
+
+class TypeCreateModal(discord.ui.Modal, title="➕  Créer un type de ticket"):
+    t_key   = discord.ui.TextInput(label="Clé interne (ex: support)",     placeholder="support",       max_length=20)
+    t_label = discord.ui.TextInput(label="Nom affiché",                    placeholder="Support technique", max_length=40)
+    t_emoji = discord.ui.TextInput(label="Emoji",                          placeholder="🎫",            max_length=4,  required=False)
+    t_qs    = discord.ui.TextInput(label="Questions (une par ligne)",
+                                    placeholder="Décris ton problème\nDepuis quand ?",
+                                    style=discord.TextStyle.paragraph,     max_length=1000, required=False)
+
+    def __init__(self, guild, cfg):
+        super().__init__(); self.guild = guild; self.cfg = cfg
+
+    async def on_submit(self, inter: discord.Interaction):
+        key   = self.t_key.value.strip().lower().replace(" ", "_")
+        label = self.t_label.value.strip()
+        emoji = self.t_emoji.value.strip() or "🎫"
+        qs    = [q.strip() for q in self.t_qs.value.splitlines() if q.strip()]
+        if not key or not label:
+            await inter.response.send_message(embed=_e_err("❌  Clé et nom requis"), ephemeral=True); return
+        self.cfg["types"][key] = {"label": label, "emoji": emoji, "questions": qs}
+        save_data()
+        desc = emoji + " **" + label + "**  `[" + key + "]`\n" + str(len(qs)) + " question(s)"
+        await inter.response.send_message(embed=_e_ok("✅  Type créé", desc), ephemeral=True)
+
+
+class TypeEditModal(discord.ui.Modal, title="✏️  Modifier un type de ticket"):
+    t_label = discord.ui.TextInput(label="Nom affiché",   max_length=40)
+    t_emoji = discord.ui.TextInput(label="Emoji",         max_length=4, required=False)
+    t_qs    = discord.ui.TextInput(label="Questions (une par ligne)",
+                                    style=discord.TextStyle.paragraph, max_length=1000, required=False)
+
+    def __init__(self, guild, cfg, key):
+        super().__init__()
+        self.guild = guild; self.cfg = cfg; self.key = key
+        t = cfg["types"][key]
+        self.t_label.default = t["label"]
+        self.t_emoji.default = t["emoji"]
+        self.t_qs.default    = "\n".join(t.get("questions", []))
+
+    async def on_submit(self, inter: discord.Interaction):
+        label = self.t_label.value.strip() or self.cfg["types"][self.key]["label"]
+        emoji = self.t_emoji.value.strip() or self.cfg["types"][self.key]["emoji"]
+        qs    = [q.strip() for q in self.t_qs.value.splitlines() if q.strip()]
+        self.cfg["types"][self.key] = {"label": label, "emoji": emoji, "questions": qs}
+        save_data()
+        await inter.response.send_message(embed=_e_ok("✅  Type mis à jour", emoji + " **" + label + "**  — " + str(len(qs)) + " question(s)"), ephemeral=True)
+
+
+# ── Vue : membres ────────────────────────────────────────────────
+class MemberActionView(discord.ui.View):
+    def __init__(self, guild, page=0):
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.page  = page
+        humans = [m for m in guild.members if not m.bot]
+        start  = page * 24
+        chunk  = humans[start:start + 24]
+        has_next = (start + 24) < len(humans)
+        si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
+              discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+        opts = [discord.SelectOption(
+            label=(si.get(m.status, "⚫") + " " + m.display_name)[:50],
+            description="ID: " + str(m.id),
+            value=str(m.id)) for m in chunk]
+        if has_next:
+            opts.append(discord.SelectOption(
+                label="➡️  Page suivante (" + str(len(humans) - start - 24) + " membres restants)",
+                value="__next_page__",
+                description="Voir plus de membres"))
+        if opts:
+            suffix = "  (p." + str(page + 1) + ")" if len(humans) > 24 else ""
+            sel = discord.ui.Select(placeholder="👤  Choisir un membre" + suffix + "…", options=opts)
+            sel.callback = self.on_select
+            self.add_item(sel)
+
+    async def on_select(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        val = inter.data["values"][0]
+        if val == "__next_page__":
+            await inter.response.edit_message(view=MemberActionView(self.guild, self.page + 1))
+            return
+        mem = self.guild.get_member(int(val))
+        if not mem:
+            await inter.response.send_message(embed=_e_err("❌  Membre introuvable"), ephemeral=True); return
+        si  = {discord.Status.online: "🟢 En ligne", discord.Status.idle: "🟡 AFK",
+               discord.Status.dnd: "🔴 DND", discord.Status.offline: "⚫ Hors ligne"}
+        col = mem.top_role.color if mem.top_role and mem.top_role.color.value else discord.Color.default()
+        e   = discord.Embed(title="👤  " + mem.display_name,
+                            description="Membre depuis <t:" + str(int(mem.joined_at.timestamp())) + ":D>",
+                            color=col)
+        if mem.avatar: e.set_thumbnail(url=mem.avatar.url)
+        e.add_field(name="📊  Statut",   value=si.get(mem.status, "⚫"), inline=True)
+        e.add_field(name="🏷  Top rôle", value=mem.top_role.mention if mem.top_role else "—", inline=True)
+        e.add_field(name="🆔  ID",       value="`" + str(mem.id) + "`", inline=True)
+        roles_txt = " ".join(r.mention for r in reversed(mem.roles) if r.name != "@everyone")[:512] or "*Aucun*"
+        e.add_field(name="📋  Rôles", value=roles_txt, inline=False)
+        await inter.response.send_message(embed=e, view=MemberModView(self.guild, mem), ephemeral=True)
+
+
+# ── Vue : actions membre (ticket, kick, ban) ─────────────────────
+class MemberModView(discord.ui.View):
+    def __init__(self, guild, member):
+        super().__init__(timeout=60)
+        self.guild  = guild
+        self.member = member
+
+    @discord.ui.button(label="Ouvrir un ticket", style=discord.ButtonStyle.primary, emoji="🎫")
+    async def open_tkt(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        if maintenance_mode:
+            await inter.response.send_message(embed=_e_warn("🔧  Maintenance active", "Les tickets sont désactivés."), ephemeral=True); return
+        cfg = tconf(self.guild.id)
+        if not cfg["types"]:
+            await inter.response.send_message(embed=_e_warn("⚠️", "Aucun type configuré."), ephemeral=True); return
+        opts = [discord.SelectOption(label=v["emoji"] + " " + v["label"], value=k)
+                for k, v in cfg["types"].items()]
+        sel  = discord.ui.Select(placeholder="Type de ticket…", options=opts)
+        _g   = self.guild
+        _m   = self.member
+
+        async def _pick(i3):
+            key = i3.data["values"][0]
+            ch, err = await open_ticket(_g, _m, key)
+            if err: await i3.response.send_message(embed=_e_err("❌  " + err), ephemeral=True)
+            else:   await i3.response.send_message(embed=_e_ok("✅  Ticket créé", ch.mention), ephemeral=True)
+
+        sel.callback = _pick
+        v2 = discord.ui.View(timeout=30)
+        v2.add_item(sel)
+        await inter.response.send_message(view=v2, ephemeral=True)
+
+    @discord.ui.button(label="Kick", style=discord.ButtonStyle.danger, emoji="👢")
+    async def kick_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(ModModal(self.guild, self.member, "kick"))
+
+    @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="🔨")
+    async def ban_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(ModModal(self.guild, self.member, "ban"))
+
+
+class ModModal(discord.ui.Modal):
+    raison = discord.ui.TextInput(label="Raison", placeholder="Raison de la sanction…",
+                                   style=discord.TextStyle.short, max_length=200, required=False)
+
+    def __init__(self, guild, member, action):
+        super().__init__(title=("👢 Kick" if action == "kick" else "🔨 Ban") + " — " + member.display_name)
+        self.guild  = guild
+        self.member = member
+        self.action = action
+
+    async def on_submit(self, inter: discord.Interaction):
+        raison = self.raison.value or "Sanction par le staff."
+        try:
+            if self.action == "kick":
+                await self.member.kick(reason=raison)
+                await inter.response.send_message(
+                    embed=_e_ok("👢  " + self.member.display_name + " expulsé", raison), ephemeral=True)
+            else:
+                await self.member.ban(reason=raison, delete_message_days=0)
+                await inter.response.send_message(
+                    embed=_e_ok("🔨  " + self.member.display_name + " banni", raison), ephemeral=True)
+        except discord.Forbidden:
+            await inter.response.send_message(embed=_e_err("❌  Permission refusée"), ephemeral=True)
+
+
+# ── API HTTP ───────────────────────────────────────────────────────
+def _vsig(body, sig):
+    return hmac.compare_digest(hmac.new(REMOTE_SECRET.encode(), body, hashlib.sha256).hexdigest(), sig)
+
+async def handle_health(req): return web.Response(text="ok")
+
+async def handle_remote(req):
+    if not REMOTE_ENABLED: return web.json_response({"error": "Remote disabled"}, status=403)
+    body = await req.read()
+    if not _vsig(body, req.headers.get("X-Signature", "")): return web.json_response({"error": "Unauthorized"}, status=401)
+    try:    p = json.loads(body)
+    except: return web.json_response({"error": "Invalid JSON"}, status=400)
+    return web.json_response(await dispatch(p.get("action", ""), p))
+
+def _g(p):
+    gid = p.get("guild_id")
+    if gid: return client.get_guild(gid)
+    return client.guilds[0] if client.guilds else None
+
+async def dispatch(action, p):
+    global maintenance_mode, menu_locked
+
+    if action == "status":
+        guilds = []
+        for g in client.guilds:
+            cfg = ticket_config.get(g.id, {})
+            cat = g.get_channel(cfg.get("category_id") or 0)
+            sch = g.get_channel(cfg.get("staff_channel_id") or 0)
+            sro = g.get_role(cfg.get("staff_role_id") or 0)
+            guilds.append({"id": g.id, "name": g.name, "members": g.member_count,
+                "category": cat.name if cat else None, "staff_channel": sch.name if sch else None,
+                "staff_role": sro.name if sro else None,
+                "ticket_types": list(cfg.get("types", {}).keys()), "counter": cfg.get("counter", 0)})
+        return {"bot": str(client.user), "guilds": guilds,
+                "maintenance": maintenance_mode, "menu_locked": menu_locked,
+                "open_tickets": len([s for s in ticket_sessions.values() if s["status"] in ("open", "pending")]),
+                "pending": len(pending_channels)}
+
+    elif action == "maintenance":
+        val = p.get("enabled")
+        maintenance_mode = bool(val) if val is not None else (not maintenance_mode)
+        save_data()
+        print("[BOT] maintenance_mode =", maintenance_mode)
+        return {"maintenance": maintenance_mode, "ok": True}
+    elif action == "lockmenu":
+        menu_locked = True;  save_data(); return {"menu_locked": True}
+    elif action == "unlockmenu":
+        menu_locked = False; save_data(); return {"menu_locked": False}
+
+    elif action == "basecfg":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        for k in ("category_id", "staff_channel_id", "staff_role_id"):
+            if k in p: cfg[k] = p[k]
+        save_data(); return {"ok": True}
+
+    elif action == "ttype_list":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        return {"types": tconf(g.id)["types"]}
+
+    elif action == "ttype_add":
+        g = _g(p); key = p.get("key", "").lower()
+        if not g: return {"error": "Guild not found"}
+        if not key: return {"error": "key required"}
+        cfg = tconf(g.id)
+        cfg["types"][key] = {"label": p.get("label", key), "emoji": p.get("emoji", "🎫"), "questions": p.get("questions", [])}
+        save_data(); return {"ok": True, "key": key}
+
+    elif action == "ttype_edit":
+        g = _g(p); key = p.get("key", "").lower()
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        if key not in cfg["types"]: return {"error": "Type '" + key + "' not found"}
+        for f in ("label", "emoji", "questions"):
+            if f in p: cfg["types"][key][f] = p[f]
+        save_data(); return {"ok": True}
+
+    elif action == "ttype_delete":
+        g = _g(p); key = p.get("key", "").lower()
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        if key not in cfg["types"]: return {"error": "Type '" + key + "' not found"}
+        del cfg["types"][key]; save_data(); return {"ok": True}
+
+    elif action == "topen":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        m = find_member(str(p.get("member", "")), g)
+        if not m: return {"error": "Member not found"}
+        type_key = str(p.get("type_key", "")).lower()
+        ch, err = await open_ticket(g, m, type_key)
+        if err: return {"error": err}
+        cfg2 = tconf(g.id)
+        # Si le type a des questions → lancer run_questions avec la session existante (pas de double compteur)
+        if cfg2["types"].get(type_key, {}).get("questions"):
+            s = ticket_sessions.get(ch.id)
+            if s:
+                asyncio.create_task(run_questions(g, cfg2, ch, m, type_key, existing_session=s))
+                return {"ok": True, "channel": ch.name, "channel_id": ch.id, "questions": True}
+        return {"ok": True, "channel": ch.name, "channel_id": ch.id, "questions": False}
+
+    elif action == "tlaunch":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        cid = p.get("channel_id")
+        ch  = g.get_channel(int(cid)) if cid else find_channel(str(p.get("channel", "")), g)
+        if not ch: return {"error": "Channel not found"}
+        key = str(p.get("type_key", "")).lower()
+        if key not in cfg["types"]: return {"error": "Type '" + key + "' not found"}
+        # Priorité : member_id explicite → owner_id stocké dans pending → premier non-admin dans salon
+        member = None
+        explicit_mid = p.get("member_id")
+        if explicit_mid:
+            member = g.get_member(int(explicit_mid))
+        if not member:
+            owner_id = pending_channels.get(ch.id, {}).get("owner_id")
+            if owner_id:
+                member = g.get_member(owner_id)
+        if not member:
+            membres = [m for m in g.members if not m.bot and ch.permissions_for(m).view_channel
+                       and not m.guild_permissions.administrator]
+            if not membres:
+                membres = [m for m in g.members if not m.bot and ch.permissions_for(m).view_channel]
+            if not membres: return {"error": "No member in channel"}
+            member = membres[0]
+        asyncio.create_task(run_questions(g, cfg, ch, member, key))
+        return {"ok": True, "channel": ch.name, "member": member.display_name, "member_id": member.id}
+
+    elif action in ("taccept", "trefuse", "tclose"):
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        try: num = int(str(p.get("number", "")).lstrip("#"))
+        except: return {"error": "Invalid number"}
+        s = next((x for x in ticket_sessions.values() if x["guild_id"] == g.id and x["number"] == num), None)
+        if not s: return {"error": "Ticket #" + str(num) + " not found"}
+        act    = {"taccept": "accepted", "trefuse": "refused", "tclose": "closed"}[action]
+        raison = str(p.get("raison", "")) or {"accepted": "Accepté.", "refused": "Refusé.", "closed": "Fermé."}.get(act, "")
+        await do_action(g, s, act, raison); return {"ok": True, "number": num, "action": act}
+
+    elif action == "tsend":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        try: num = int(str(p.get("number", "")).lstrip("#"))
+        except: return {"error": "Invalid number"}
+        s = next((x for x in ticket_sessions.values() if x["guild_id"] == g.id and x["number"] == num), None)
+        if not s: return {"error": "Ticket #" + str(num) + " not found"}
+        ch = g.get_channel(s["channel_id"])
+        if not ch: return {"error": "Channel not found"}
+        await ch.send("📢 **Staff** : " + p.get("message", "")); return {"ok": True}
+
+    elif action == "tlist":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        f  = p.get("filter", "all")
+        ss = [s for s in ticket_sessions.values() if s["guild_id"] == g.id]
+        if f == "open":   ss = [s for s in ss if s["status"] in ("open", "pending")]
+        elif f == "closed": ss = [s for s in ss if s["status"] not in ("open", "pending")]
+        return {"tickets": [{"number": s["number"], "type": s["type"], "status": s["status"],
+                              "user_id": s["user_id"], "opened_at": s["opened_at"]} for s in ss]}
+
+    elif action == "tpending":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        result = []
+        for i, (k, v) in enumerate([(k, v) for k, v in pending_channels.items() if v["guild_id"] == g.id], 1):
+            ch = g.get_channel(k)
+            result.append({"index": i, "channel_id": k, "name": ch.name if ch else str(k), "detected_at": v["detected_at"]})
+        return {"pending": result}
+
+    elif action == "guilds":
+        return {"guilds": [{"id": g.id, "name": g.name, "members": g.member_count} for g in client.guilds]}
+
+    elif action == "members":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        return {"members": [{"index": i, "id": m.id, "name": m.display_name, "status": str(m.status)}
+                             for i, m in enumerate([m for m in g.members if not m.bot], 1)]}
+
+    elif action == "roles":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        return {"roles": [{"index": i, "id": r.id, "name": r.name, "members": len(r.members)}
+                           for i, r in enumerate([r for r in g.roles if r.name != "@everyone"], 1)]}
+
+    elif action == "channels":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        return {"channels": [{"index": i, "id": c.id, "name": c.name}
+                              for i, c in enumerate([c for c in g.channels if isinstance(c, discord.TextChannel)], 1)]}
+
+    elif action == "categories":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        return {"categories": [{"index": i, "id": c.id, "name": c.name, "channels": len(c.channels)}
+                                for i, c in enumerate(sorted(g.categories, key=lambda x: x.position), 1)]}
+
+    elif action == "send":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        ch = find_channel(str(p.get("channel", "")), g)
+        if not ch: return {"error": "Channel not found"}
+        await ch.send(str(p.get("message", ""))); return {"ok": True}
+
+    elif action == "kick":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        m = find_member(str(p.get("member", "")), g)
+        if not m: return {"error": "Member not found"}
+        await m.kick(reason=p.get("reason", "Console")); return {"ok": True, "kicked": m.display_name}
+
+    elif action == "ban":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        m = find_member(str(p.get("member", "")), g)
+        if not m: return {"error": "Member not found"}
+        await m.ban(reason=p.get("reason", "Console"), delete_message_days=0); return {"ok": True, "banned": m.display_name}
+
+    return {"error": "Unknown action: " + action}
+
+
+# ── Lancement ──────────────────────────────────────────────────────
+async def main():
+    if not TOKEN: print("[ERROR] DISCORD_TOKEN manquant."); sys.exit(1)
+    app = web.Application()
+    app.router.add_get("/health", handle_health)
+    app.router.add_post("/remote", handle_remote)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    print("[HTTP] 0.0.0.0:" + str(PORT))
+    await client.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: discord-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_agent.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: BOT_REMOTE_SECRET
+        sync: false
+      - key: BOT_REMOTE_ENABLED
+        value: "true"
+    healthCheckPath: /health
+    autoDeploy: true
