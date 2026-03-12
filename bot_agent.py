@@ -480,10 +480,14 @@ async def _delete_active_menu(guild_id: int, channel=None):
 async def on_ready():
     load_data()
     print("[BOT]", str(client.user), " | ", len(client.guilds), "guild(s)")
-    # Synchronisation slash commands — nettoie les anciennes, enregistre les nouvelles
+    # Synchronisation slash commands
+    # Purge globale : vide toutes les commandes sur Discord puis re-sync proprement
     try:
-        synced = await tree.sync()
-        print("[SLASH] Commandes synchronisées :", [c.name for c in synced])
+        tree.clear_commands(guild=None)   # vide le cache local
+        await tree.sync()                 # envoie liste vide → supprime tout sur Discord
+        tree.add_command(slash_menu)      # réenregistre uniquement /menu
+        synced = await tree.sync()        # pousse la liste finale
+        print("[SLASH] Commandes actives :", [c.name for c in synced])
     except Exception as e:
         print("[SLASH] Erreur sync :", e)
     total = 0
@@ -681,8 +685,8 @@ async def slash_menu(inter: discord.Interaction):
     if not is_staff(inter.user, guild.id):
         await inter.response.send_message("🚫 Accès réservé au staff.", ephemeral=True)
         return
-    await inter.response.defer(ephemeral=False)
-    await send_staff_menu(inter.channel, guild)
+    # Construire et envoyer le panel directement via l'interaction
+    await send_staff_menu_inter(inter, guild)
 
 # ══════════════════════════════════════════════════════════════════
 #  MENU DISCORD STAFF — DESIGN MODERNE
@@ -763,6 +767,60 @@ async def send_staff_menu(channel, guild, invoker=None):
                  "Panel staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
     msg = await channel.send(embed=e, view=DashboardView(guild))
     active_menu_msgs[guild.id] = (channel.id, msg.id)
+
+
+async def send_staff_menu_inter(inter: discord.Interaction, guild):
+    """Version de send_staff_menu qui répond à une interaction slash."""
+    cfg = tconf(guild.id)
+    # Supprimer l'ancien menu actif
+    await _delete_active_menu(guild.id, channel=inter.channel)
+
+    cat = guild.get_channel(cfg.get("category_id") or 0)
+    sch = guild.get_channel(cfg.get("staff_channel_id") or 0)
+    sro = guild.get_role(cfg.get("staff_role_id") or 0)
+    ot  = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("open", "pending")]
+    pt  = [v for v in pending_channels.values() if v["guild_id"] == guild.id]
+    ct  = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("accepted", "refused", "closed")]
+
+    def bar(n, total, w=10):
+        if total == 0: return "`" + "░" * w + "`"
+        f = round(n / total * w)
+        return "`" + "█" * f + "░" * (w - f) + "`"
+
+    total_t = max(len(ot) + len(ct), 1)
+    e = discord.Embed(color=C_DARK, timestamp=datetime.now(timezone.utc))
+    e.set_author(name="⚡  Panel Staff — " + guild.name,
+                 icon_url=guild.icon.url if guild.icon else None)
+
+    cfg_val  = "> 📁  **Catégorie** — " + ("`" + cat.name + "`" if cat else "❌ Non définie") + "\n"
+    cfg_val += "> 📣  **Salon staff** — " + (sch.mention if sch else "❌ Non défini") + "\n"
+    cfg_val += "> 🛡  **Rôle staff** — " + (sro.mention if sro else "⚠️ Non défini")
+    e.add_field(name="⚙️  Configuration", value=cfg_val, inline=False)
+
+    stats_val  = "> 🟡  **En cours**    " + bar(len(ot), total_t) + "  `" + str(len(ot)) + "`\n"
+    stats_val += "> ✅  **Traités**     " + bar(len(ct), total_t) + "  `" + str(len(ct)) + "`\n"
+    stats_val += "> 📥  **En attente** (DraftBot)  `" + str(len(pt)) + "`\n"
+    stats_val += "> 📝  **Types configurés**        `" + str(len(cfg["types"])) + "`"
+    e.add_field(name="📊  Statistiques", value=stats_val, inline=False)
+
+    if ot:
+        icons = {"open": "🟡", "pending": "⏳"}
+        recent = sorted(ot, key=lambda x: x["number"], reverse=True)[:3]
+        last = ""
+        for s in recent:
+            mem  = guild.get_member(s["user_id"])
+            name = mem.display_name if mem else str(s["user_id"])
+            last += "> " + icons.get(s["status"], "🟡") + "  `#" + str(s["number"]).zfill(4) + "` **" + s["type"] + "** — " + name + "\n"
+        e.add_field(name="🕐  Tickets récents", value=last.rstrip(), inline=False)
+
+    e.set_footer(text=("🔧 MAINTENANCE  •  " if maintenance_mode else "") +
+                 ("🔒 Menu verrouillé  •  " if cfg.get("menu_locked") else "") +
+                 "Panel staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
+
+    # Répondre via l'interaction → Discord sait que la commande est traitée
+    await inter.response.send_message(embed=e, view=DashboardView(guild))
+    msg = await inter.original_response()
+    active_menu_msgs[guild.id] = (inter.channel.id, msg.id)
 
 
 class DashboardView(discord.ui.View):
