@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v4.0 — hébergé sur Render
+  BOT AGENT v5.0 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
-  v4 : config par serveur, menu_locked local, maintenance globale,
-       vérification prérequis, actions enrichies acceptation,
-       menu un-seul-actif + bouton Fermer + Rafraîchir
+  v5 : /menu slash command, persistance SQLite, boutons désactivés
+       après action ticket, menu_locked console-only
 """
-import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib
+import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, sqlite3
+from discord import app_commands
 from datetime import datetime, timezone
 from collections import defaultdict
 from aiohttp import web
@@ -20,6 +20,7 @@ REMOTE_SECRET  = os.getenv("BOT_REMOTE_SECRET", "changeme")
 REMOTE_ENABLED = os.getenv("BOT_REMOTE_ENABLED", "true").lower() == "true"
 PORT           = int(os.getenv("PORT", 8080))
 DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
+DB_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
 
 # ── État global ────────────────────────────────────────────────────
 maintenance_mode = False          # GLOBAL — touche tous les serveurs
@@ -31,36 +32,128 @@ pending_channels = {}
 # Message de menu actif par serveur → (channel_id, message_id)
 active_menu_msgs = {}
 
-# ── Persistance ────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  PERSISTANCE SQLITE
+#  Toutes les données survivent aux redémarrages / redéploiements
+# ════════════════════════════════════════════════════════════════
+def _db():
+    """Retourne une connexion SQLite (thread-safe via check_same_thread=False)."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Crée les tables si elles n'existent pas encore."""
+    with _db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS kv (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS guild_config (
+                guild_id         INTEGER PRIMARY KEY,
+                category_id      INTEGER,
+                staff_channel_id INTEGER,
+                staff_role_id    INTEGER,
+                counter          INTEGER DEFAULT 0,
+                menu_locked      INTEGER DEFAULT 0,
+                types_json       TEXT    DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS ticket_session (
+                channel_id  INTEGER PRIMARY KEY,
+                guild_id    INTEGER NOT NULL,
+                data_json   TEXT    NOT NULL
+            );
+        """)
+    print("[DB] SQLite prêt :", DB_FILE)
+
 def save_data():
+    """Sauvegarde incrémentale : configs + sessions + maintenance."""
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "ticket_config": {str(k): v for k, v in ticket_config.items()},
-                "ticket_sessions": {
-                    str(k): {x: y for x, y in v.items() if x not in ("staff_msg_id","staff_chan_id")}
-                    for k, v in ticket_sessions.items()
-                },
-                "maintenance_mode": maintenance_mode,
-            }, f, ensure_ascii=False, indent=2)
+        with _db() as conn:
+            # Maintenance globale
+            conn.execute("INSERT OR REPLACE INTO kv VALUES (?,?)",
+                         ("maintenance_mode", "1" if maintenance_mode else "0"))
+            # Configs par serveur
+            for gid, cfg in ticket_config.items():
+                conn.execute("""
+                    INSERT OR REPLACE INTO guild_config
+                    (guild_id, category_id, staff_channel_id, staff_role_id,
+                     counter, menu_locked, types_json)
+                    VALUES (?,?,?,?,?,?,?)
+                """, (gid,
+                       cfg.get("category_id"),
+                       cfg.get("staff_channel_id"),
+                       cfg.get("staff_role_id"),
+                       cfg.get("counter", 0),
+                       1 if cfg.get("menu_locked") else 0,
+                       json.dumps(cfg.get("types", {}), ensure_ascii=False)))
+            # Sessions de tickets
+            conn.execute("DELETE FROM ticket_session")
+            for ch_id, s in ticket_sessions.items():
+                safe = {k: v for k, v in s.items() if k not in ("staff_msg_id", "staff_chan_id")}
+                conn.execute("INSERT OR REPLACE INTO ticket_session VALUES (?,?,?)",
+                             (ch_id, s["guild_id"], json.dumps(safe, ensure_ascii=False)))
     except Exception as e:
         print("[SAVE]", e)
+        # Fallback JSON
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump({"ticket_config": {str(k): v for k, v in ticket_config.items()},
+                           "ticket_sessions": {str(k): v for k, v in ticket_sessions.items()},
+                           "maintenance_mode": maintenance_mode}, f, ensure_ascii=False, indent=2)
+        except: pass
 
 def load_data():
+    """Charge toutes les données depuis SQLite. Fallback JSON si DB absente."""
+    global ticket_config, ticket_sessions, maintenance_mode
+    init_db()
+    try:
+        with _db() as conn:
+            # Maintenance
+            row = conn.execute("SELECT value FROM kv WHERE key='maintenance_mode'").fetchone()
+            if row: maintenance_mode = row[0] == "1"
+            # Configs serveurs
+            for row in conn.execute("SELECT * FROM guild_config").fetchall():
+                ticket_config[row["guild_id"]] = {
+                    "category_id":      row["category_id"],
+                    "staff_channel_id": row["staff_channel_id"],
+                    "staff_role_id":    row["staff_role_id"],
+                    "counter":          row["counter"],
+                    "menu_locked":      bool(row["menu_locked"]),
+                    "types":            json.loads(row["types_json"] or "{}"),
+                }
+            # Sessions tickets
+            for row in conn.execute("SELECT * FROM ticket_session").fetchall():
+                ticket_sessions[row["channel_id"]] = json.loads(row["data_json"])
+        print("[DB]", len(ticket_config), "guild(s),", len(ticket_sessions), "ticket(s)",
+              "| maintenance=" + str(maintenance_mode))
+        # Migration JSON → SQLite si DB vide mais JSON existe
+        if not ticket_config and os.path.exists(DATA_FILE):
+            _migrate_from_json()
+    except Exception as e:
+        print("[LOAD-DB]", e)
+        _load_from_json()
+
+def _load_from_json():
+    """Fallback : charge depuis bot_data.json (ancien système)."""
     global ticket_config, ticket_sessions, maintenance_mode
     if not os.path.exists(DATA_FILE): return
     try:
-        with open(DATA_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        for k, v in d.get("ticket_config", {}).items():
-            ticket_config[int(k)] = v
-        for k, v in d.get("ticket_sessions", {}).items():
-            ticket_sessions[int(k)] = v
+        with open(DATA_FILE, encoding="utf-8") as f: d = json.load(f)
+        for k, v in d.get("ticket_config", {}).items():  ticket_config[int(k)]  = v
+        for k, v in d.get("ticket_sessions", {}).items(): ticket_sessions[int(k)] = v
         maintenance_mode = d.get("maintenance_mode", False)
-        print("[DATA]", len(ticket_config), "guild(s),", len(ticket_sessions), "ticket(s)",
-              "| maintenance=" + str(maintenance_mode))
+        print("[LOAD-JSON] fallback OK —", len(ticket_config), "guild(s)")
     except Exception as e:
-        print("[LOAD]", e)
+        print("[LOAD-JSON]", e)
+
+def _migrate_from_json():
+    """Migration unique JSON → SQLite."""
+    _load_from_json()
+    if ticket_config or ticket_sessions:
+        save_data()
+        print("[MIGRATE] JSON → SQLite terminé.")
 
 def tconf(gid):
     if gid not in ticket_config:
@@ -79,7 +172,7 @@ def is_configured(gid):
     if not cfg.get("staff_channel_id"): missing.append("salon staff")
     if not cfg.get("staff_role_id"):    missing.append("rôle staff")
     if missing:
-        return False, "Config incomplète — manque : " + ", ".join(missing) + ". Utilise `!menu` → Configuration."
+        return False, "Config incomplète — manque : " + ", ".join(missing) + ". Utilise `/menu` → Configuration."
     return True, None
 
 # ── Palette de couleurs (utilisée partout) ────────────────────────
@@ -97,6 +190,7 @@ C_GREY    = 0x36393F
 # ── Client Discord ─────────────────────────────────────────────────
 intents = discord.Intents.all()
 client  = discord.Client(intents=intents)
+tree    = app_commands.CommandTree(client)
 
 # ── Helpers ────────────────────────────────────────────────────────
 def find_member(arg, guild):
@@ -348,25 +442,50 @@ async def do_accept_actions(guild, s, actions: dict):
     return errors
 
 # ── Gestion du menu actif (1 seul par serveur) ─────────────────────
-async def _delete_active_menu(guild_id: int):
-    entry = active_menu_msgs.get(guild_id)
-    if not entry: return
-    chan_id, msg_id = entry
-    g = client.get_guild(guild_id)
-    if not g: return
-    ch = g.get_channel(chan_id)
-    if not ch: active_menu_msgs.pop(guild_id, None); return
-    try:
-        msg = await ch.fetch_message(msg_id)
-        await msg.delete()
-    except: pass
-    active_menu_msgs.pop(guild_id, None)
+async def _delete_active_menu(guild_id: int, channel=None):
+    """
+    Supprime l'ancien message de menu pour ce serveur.
+    Stratégie : d'abord via active_menu_msgs (en mémoire),
+    ensuite scan des 15 derniers messages du salon si channel fourni.
+    """
+    # 1. Suppression via ID mémorisé
+    entry = active_menu_msgs.pop(guild_id, None)
+    if entry:
+        chan_id, msg_id = entry
+        g = client.get_guild(guild_id)
+        if g:
+            ch = g.get_channel(chan_id)
+            if ch:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.delete()
+                    return   # supprimé proprement, pas besoin de scanner
+                except: pass
+
+    # 2. Scan fallback : supprimer les messages du bot avec le panel dans ce salon
+    if channel:
+        try:
+            async for msg in channel.history(limit=15):
+                if msg.author == channel.guild.me and msg.embeds:
+                    emb = msg.embeds[0]
+                    author_name = emb.author.name if emb.author else ""
+                    if "Panel Staff" in author_name:
+                        try: await msg.delete()
+                        except: pass
+                        break   # un seul menu à la fois
+        except: pass
 
 # ── Événements Discord ─────────────────────────────────────────────
 @client.event
 async def on_ready():
     load_data()
     print("[BOT]", str(client.user), " | ", len(client.guilds), "guild(s)")
+    # Synchronisation slash commands — nettoie les anciennes, enregistre les nouvelles
+    try:
+        synced = await tree.sync()
+        print("[SLASH] Commandes synchronisées :", [c.name for c in synced])
+    except Exception as e:
+        print("[SLASH] Erreur sync :", e)
     total = 0
     for g in client.guilds:
         cfg = ticket_config.get(g.id)
@@ -464,14 +583,7 @@ async def handle_cmds(message):
 
     if not is_staff(message.author, guild.id): return
 
-    if cmd == "menu":
-        if maintenance_mode:
-            await message.channel.send("🔧 **Bot en maintenance** — menu indisponible."); return
-        if cfg.get("menu_locked"):
-            await message.channel.send(embed=_e_warn("🔒  Menu verrouillé", "Déverrouille via la console (`lockmenu off`).")); return
-        await send_staff_menu(message.channel, guild)
-
-    elif cmd == "tpending":
+    if cmd == "tpending":
         gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == guild.id]
         if not gp: await message.channel.send("📭 Aucun salon en attente."); return
         lines = ["`" + str(i) + ".` <#" + str(k) + ">  " + v["detected_at"] for i, (k, v) in enumerate(gp, 1)]
@@ -546,8 +658,31 @@ async def handle_cmds(message):
             "🎫 **Commandes tickets**\n"
             "`!ticket [type]` `!tpending` `!tlaunch <n°> <type>`\n"
             "`!tlist [open|closed|all]` `!taccept <n°>` `!trefuse <n°>` `!tclose <n°>`\n"
-            "`!tsend <n°> <msg>` `!menu`")
+            "`!tsend <n°> <msg>` `/menu`")
 
+
+
+# ════════════════════════════════════════════════════════════════
+#  SLASH COMMANDS
+# ════════════════════════════════════════════════════════════════
+@tree.command(name="menu", description="Ouvrir le panel de gestion staff")
+async def slash_menu(inter: discord.Interaction):
+    if not inter.guild:
+        await inter.response.send_message("Cette commande n'est disponible que sur un serveur.", ephemeral=True)
+        return
+    guild = inter.guild
+    cfg   = tconf(guild.id)
+    if maintenance_mode:
+        await inter.response.send_message("🔧 Le bot est actuellement en maintenance. Réessaie plus tard.", ephemeral=True)
+        return
+    if cfg.get("menu_locked"):
+        await inter.response.send_message("🔒 Le menu est actuellement désactivé par l'administration.", ephemeral=True)
+        return
+    if not is_staff(inter.user, guild.id):
+        await inter.response.send_message("🚫 Accès réservé au staff.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=False)
+    await send_staff_menu(inter.channel, guild)
 
 # ══════════════════════════════════════════════════════════════════
 #  MENU DISCORD STAFF — DESIGN MODERNE
@@ -577,8 +712,8 @@ async def send_staff_menu(channel, guild, invoker=None):
         if invoker:
             await channel.send(embed=_e_warn("🔒  Menu verrouillé [" + guild.name + "]", "Déverrouille via la console (`lockmenu off`)."))
         return
-    # Supprimer l'ancien menu actif pour ce serveur
-    await _delete_active_menu(guild.id)
+    # Supprimer l'ancien menu actif pour ce serveur (via ID mémorisé ou scan du salon)
+    await _delete_active_menu(guild.id, channel=channel)
 
     cat = guild.get_channel(cfg.get("category_id") or 0)
     sch = guild.get_channel(cfg.get("staff_channel_id") or 0)
@@ -679,10 +814,35 @@ class DashboardView(discord.ui.View):
         ok2, reason = self._guard(inter)
         if not ok2:
             await inter.response.send_message(embed=_e_warn("⚠️", reason), ephemeral=True); return
-        await send_staff_menu(inter.channel, self.guild)
-        try: await inter.message.delete()
-        except: pass
-        await inter.response.send_message(embed=_e_ok("🔄  Menu rafraîchi"), ephemeral=True)
+        # Reconstruire l'embed à jour et éditer le message EN PLACE (pas de nouveau message)
+        cfg = tconf(self.guild.id)
+        cat = self.guild.get_channel(cfg.get("category_id") or 0)
+        sch = self.guild.get_channel(cfg.get("staff_channel_id") or 0)
+        sro = self.guild.get_role(cfg.get("staff_role_id") or 0)
+        ot  = [s for s in ticket_sessions.values() if s["guild_id"] == self.guild.id and s["status"] in ("open", "pending")]
+        pt  = [v for v in pending_channels.values() if v["guild_id"] == self.guild.id]
+        ct  = [s for s in ticket_sessions.values() if s["guild_id"] == self.guild.id and s["status"] in ("accepted", "refused", "closed")]
+        total_t = max(len(ot) + len(ct), 1)
+        def bar(n, t, w=10):
+            if t == 0: return "`" + "░" * w + "`"
+            f = round(n / t * w); return "`" + "█" * f + "░" * (w - f) + "`"
+        e = discord.Embed(color=C_DARK, timestamp=datetime.now(timezone.utc))
+        e.set_author(name="⚡  Panel Staff — " + self.guild.name,
+                     icon_url=self.guild.icon.url if self.guild.icon else None)
+        cfg_val  = "> 📁  **Catégorie** — " + ("`" + cat.name + "`" if cat else "❌ Non définie") + "\n"
+        cfg_val += "> 📣  **Salon staff** — " + (sch.mention if sch else "❌ Non défini") + "\n"
+        cfg_val += "> 🛡  **Rôle staff** — " + (sro.mention if sro else "⚠️ Non défini")
+        e.add_field(name="⚙️  Configuration", value=cfg_val, inline=False)
+        stats_val  = "> 🟡 En cours " + bar(len(ot), total_t) + " `" + str(len(ot)) + "`\n"
+        stats_val += "> ✅ Traités   " + bar(len(ct), total_t) + " `" + str(len(ct)) + "`\n"
+        stats_val += "> 📥 En attente `" + str(len(pt)) + "`  •  📝 Types `" + str(len(cfg["types"])) + "`"
+        e.add_field(name="📊  Statistiques", value=stats_val, inline=False)
+        e.set_footer(text=("🔧 MAINTENANCE  •  " if maintenance_mode else "") +
+                     ("🔒 Menu verrouillé  •  " if cfg.get("menu_locked") else "") +
+                     "Panel staff  •  " + str(len([m for m in self.guild.members if not m.bot])) + " membres  •  🔄 " + datetime.now().strftime("%H:%M:%S"))
+        # Éditer le message existant — aucun nouveau message créé
+        await inter.response.edit_message(embed=e, view=DashboardView(self.guild))
+        active_menu_msgs[self.guild.id] = (inter.channel.id, inter.message.id)
 
     async def on_select(self, inter: discord.Interaction):
         ok2, reason = self._guard(inter)
@@ -883,25 +1043,38 @@ class TicketActionView(discord.ui.View):
     def _guard(self, inter):
         return is_staff(inter.user, self.guild.id)
 
+    async def _lock_buttons(self, inter: discord.Interaction):
+        """Désactive tous les boutons et met à jour le message original."""
+        for item in self.children:
+            item.disabled = True
+        try:
+            await inter.message.edit(view=self)
+        except: pass
+        self.stop()
+
     @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, emoji="✅", row=0)
     async def accept(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not self._guard(inter):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        await inter.response.send_modal(ActionCommentModal(self.guild, self.s, "accepted"))
+        await inter.response.send_modal(
+            ActionCommentModal(self.guild, self.s, "accepted", inter.message))
 
     @discord.ui.button(label="Refuser", style=discord.ButtonStyle.danger, emoji="❌", row=0)
     async def refuse(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not self._guard(inter):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        await inter.response.send_modal(ActionCommentModal(self.guild, self.s, "refused"))
+        await inter.response.send_modal(
+            ActionCommentModal(self.guild, self.s, "refused", inter.message))
 
     @discord.ui.button(label="Fermer", style=discord.ButtonStyle.secondary, emoji="🔒", row=0)
     async def close(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not self._guard(inter):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        await do_action(self.guild, self.s, "closed", "", inter.user)
-        await inter.response.send_message(embed=_e_empty("🔒  Fermé", "Salon supprimé sous peu."), ephemeral=True)
+        for item in self.children: item.disabled = True
+        await inter.response.edit_message(view=self)
         self.stop()
+        await do_action(self.guild, self.s, "closed", "", inter.user)
+        await inter.followup.send(embed=_e_empty("🔒  Fermé", "Salon supprimé sous peu."), ephemeral=True)
 
     @discord.ui.button(label="Message", style=discord.ButtonStyle.primary, emoji="💬", row=0)
     async def send_msg(self, inter: discord.Interaction, btn: discord.ui.Button):
@@ -919,16 +1092,26 @@ class ActionCommentModal(discord.ui.Modal):
         max_length=500,
         required=False)
 
-    def __init__(self, guild, s, action):
+    def __init__(self, guild, s, action, origin_msg=None):
         label = "✅  Accepter le ticket" if action == "accepted" else "❌  Refuser le ticket"
         super().__init__(title=label)
-        self.guild  = guild
-        self.s      = s
-        self.action = action
+        self.guild      = guild
+        self.s          = s
+        self.action     = action
+        self.origin_msg = origin_msg  # message Discord contenant les boutons
 
     async def on_submit(self, inter: discord.Interaction):
         commentaire = self.commentaire.value.strip()
         await do_action(self.guild, self.s, self.action, commentaire, inter.user)
+        # Désactiver les boutons du message d'origine
+        if self.origin_msg:
+            try:
+                disabled_view = discord.ui.View()
+                for item in TicketActionView(self.guild, self.s).children:
+                    item.disabled = True
+                    disabled_view.add_item(item)
+                await self.origin_msg.edit(view=disabled_view)
+            except: pass
         if self.action == "accepted":
             desc = ("💬 " + commentaire) if commentaire else "Aucun commentaire."
             await inter.response.send_message(embed=_e_ok("✅  Ticket accepté", desc), view=PostActionView(self.guild, self.s), ephemeral=True)
@@ -1203,13 +1386,6 @@ class ConfigFullView(discord.ui.View):
         btn_role.callback = self.manual_role
         self.add_item(btn_role)
 
-        lock_lbl = "🔓 Déverrouiller menu" if cfg.get("menu_locked") else "🔒 Verrouiller menu"
-        btn_lock = discord.ui.Button(label=lock_lbl,
-            style=discord.ButtonStyle.success if cfg.get("menu_locked") else discord.ButtonStyle.danger,
-            emoji="🔒", row=3)
-        btn_lock.callback = self.toggle_menu_lock
-        self.add_item(btn_lock)
-
         btn_show = discord.ui.Button(label="Config actuelle", style=discord.ButtonStyle.secondary,
                                      emoji="📊", row=3)
         btn_show.callback = self.show_cfg
@@ -1252,15 +1428,6 @@ class ConfigFullView(discord.ui.View):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         await inter.response.send_modal(RoleSearchModal(self.guild, self.cfg))
 
-    async def toggle_menu_lock(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        self.cfg["menu_locked"] = not self.cfg.get("menu_locked", False)
-        save_data()
-        state = "verrouillé 🔒" if self.cfg["menu_locked"] else "déverrouillé 🔓"
-        await inter.response.send_message(
-            embed=_e_ok("🔒  Menu Discord " + state + " — " + self.guild.name), ephemeral=True)
-
     async def show_cfg(self, inter: discord.Interaction):
         cat2 = self.guild.get_channel(self.cfg.get("category_id") or 0)
         sch2 = self.guild.get_channel(self.cfg.get("staff_channel_id") or 0)
@@ -1270,7 +1437,7 @@ class ConfigFullView(discord.ui.View):
         e.add_field(name="📁 Catégorie",   value="`" + cat2.name + "`" if cat2 else "❌", inline=True)
         e.add_field(name="📣 Salon staff", value=sch2.mention if sch2 else "❌",          inline=True)
         e.add_field(name="🛡 Rôle staff",  value=sro2.mention if sro2 else "⚠️",         inline=True)
-        e.add_field(name="🔒 Menu Discord", value="Verrouillé" if self.cfg.get("menu_locked") else "Libre", inline=True)
+        e.add_field(name="🔒 Menu Discord", value=("Verrouillé 🔒" if self.cfg.get("menu_locked") else "Libre 🔓") + "\n*Modifiable via console*", inline=True)
         if not ok_cfg: e.add_field(name="⚠️ Manquant", value=msg_cfg, inline=False)
         await inter.response.send_message(embed=e, ephemeral=True)
 
