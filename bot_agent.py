@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT — hébergé sur Render
+  BOT AGENT v4.0 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
+
+  v4 : config par serveur, menu_locked local, maintenance globale,
+       vérification prérequis, actions enrichies acceptation,
+       menu un-seul-actif + bouton Fermer + Rafraîchir
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib
 from datetime import datetime, timezone
@@ -18,12 +22,14 @@ PORT           = int(os.getenv("PORT", 8080))
 DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
 
 # ── État global ────────────────────────────────────────────────────
-maintenance_mode = False
-menu_locked      = False
+maintenance_mode = False          # GLOBAL — touche tous les serveurs
+# menu_locked est maintenant LOCAL dans tconf(guild_id)["menu_locked"]
 activity_tracker = defaultdict(dict)
 ticket_config    = {}
 ticket_sessions  = {}
 pending_channels = {}
+# Message de menu actif par serveur → (channel_id, message_id)
+active_menu_msgs = {}
 
 # ── Persistance ────────────────────────────────────────────────────
 def save_data():
@@ -36,13 +42,12 @@ def save_data():
                     for k, v in ticket_sessions.items()
                 },
                 "maintenance_mode": maintenance_mode,
-                "menu_locked": menu_locked,
             }, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print("[SAVE]", e)
 
 def load_data():
-    global ticket_config, ticket_sessions, maintenance_mode, menu_locked
+    global ticket_config, ticket_sessions, maintenance_mode
     if not os.path.exists(DATA_FILE): return
     try:
         with open(DATA_FILE, encoding="utf-8") as f:
@@ -52,7 +57,6 @@ def load_data():
         for k, v in d.get("ticket_sessions", {}).items():
             ticket_sessions[int(k)] = v
         maintenance_mode = d.get("maintenance_mode", False)
-        menu_locked      = d.get("menu_locked", False)
         print("[DATA]", len(ticket_config), "guild(s),", len(ticket_sessions), "ticket(s)",
               "| maintenance=" + str(maintenance_mode))
     except Exception as e:
@@ -61,8 +65,22 @@ def load_data():
 def tconf(gid):
     if gid not in ticket_config:
         ticket_config[gid] = {"category_id": None, "staff_channel_id": None,
-                               "staff_role_id": None, "counter": 0, "types": {}}
+                               "staff_role_id": None, "counter": 0, "types": {},
+                               "menu_locked": False}
+    if "menu_locked" not in ticket_config[gid]:
+        ticket_config[gid]["menu_locked"] = False
     return ticket_config[gid]
+
+def is_configured(gid):
+    """Retourne (True, None) si config OK, sinon (False, message erreur)."""
+    cfg = tconf(gid)
+    missing = []
+    if not cfg.get("category_id"):      missing.append("catégorie des tickets")
+    if not cfg.get("staff_channel_id"): missing.append("salon staff")
+    if not cfg.get("staff_role_id"):    missing.append("rôle staff")
+    if missing:
+        return False, "Config incomplète — manque : " + ", ".join(missing) + ". Utilise `!menu` → Configuration."
+    return True, None
 
 # ── Palette de couleurs (utilisée partout) ────────────────────────
 C_ORANGE  = 0xF0A500
@@ -118,11 +136,13 @@ def is_staff(member, guild_id):
 async def open_ticket(guild, member, type_key):
     if maintenance_mode:
         return None, "Bot en maintenance — les tickets sont temporairement désactivés."
+    ok_cfg, msg_cfg = is_configured(guild.id)
+    if not ok_cfg: return None, msg_cfg
     cfg = tconf(guild.id)
-    if type_key not in cfg["types"]:   return None, "Type inconnu"
-    if not cfg.get("category_id"):     return None, "Catégorie non configurée"
+    if type_key not in cfg["types"]:
+        return None, "Type inconnu : `" + type_key + "`. Disponibles : " + ", ".join("`" + k + "`" for k in cfg["types"])
     cat = guild.get_channel(cfg["category_id"])
-    if not cat:                        return None, "Catégorie introuvable"
+    if not cat: return None, "Catégorie introuvable (id=" + str(cfg["category_id"]) + ")"
     tt = cfg["types"][type_key]
     cfg["counter"] += 1
     n = cfg["counter"]
@@ -284,6 +304,64 @@ async def do_action(guild, s, action, raison="", actor=None):
         ticket_sessions.pop(s["channel_id"], None)
         save_data()
 
+# ── Actions enrichies à l'acceptation ─────────────────────────────
+async def do_accept_actions(guild, s, actions: dict):
+    """
+    actions = {
+      "rename": "pseudo",   # renommer le demandeur
+      "invite": True,       # créer lien invitation 1 usage
+      "add_role": role_id,  # attribuer un rôle existant
+      "create_role": "nom", # créer un rôle et l'attribuer
+    }
+    """
+    member = guild.get_member(s["user_id"])
+    ch     = guild.get_channel(s["channel_id"])
+    errors = []
+    if not member: return ["Membre introuvable (a-t-il quitté le serveur ?)"]
+
+    if actions.get("rename"):
+        try: await member.edit(nick=str(actions["rename"])[:32])
+        except discord.Forbidden: errors.append("Rename : permission refusée")
+
+    if actions.get("invite") and ch:
+        try:
+            invite = await ch.create_invite(max_uses=1, unique=True,
+                reason="Acceptation ticket #" + str(s["number"]))
+            await ch.send("🔗 **Lien d'invitation** (1 utilisation) : " + invite.url)
+        except discord.Forbidden: errors.append("Invite : permission refusée")
+
+    if actions.get("add_role"):
+        role = guild.get_role(int(actions["add_role"]))
+        if role:
+            try: await member.add_roles(role, reason="Ticket accepté #" + str(s["number"]))
+            except discord.Forbidden: errors.append("Add_role : permission refusée")
+        else: errors.append("Add_role : rôle introuvable")
+
+    if actions.get("create_role"):
+        try:
+            new_role = await guild.create_role(name=str(actions["create_role"]),
+                reason="Ticket #" + str(s["number"]))
+            await member.add_roles(new_role, reason="Ticket accepté #" + str(s["number"]))
+            if ch: await ch.send("🎭 Rôle **" + new_role.name + "** créé et attribué.")
+        except discord.Forbidden: errors.append("Create_role : permission refusée")
+
+    return errors
+
+# ── Gestion du menu actif (1 seul par serveur) ─────────────────────
+async def _delete_active_menu(guild_id: int):
+    entry = active_menu_msgs.get(guild_id)
+    if not entry: return
+    chan_id, msg_id = entry
+    g = client.get_guild(guild_id)
+    if not g: return
+    ch = g.get_channel(chan_id)
+    if not ch: active_menu_msgs.pop(guild_id, None); return
+    try:
+        msg = await ch.fetch_message(msg_id)
+        await msg.delete()
+    except: pass
+    active_menu_msgs.pop(guild_id, None)
+
 # ── Événements Discord ─────────────────────────────────────────────
 @client.event
 async def on_ready():
@@ -369,15 +447,17 @@ async def handle_cmds(message):
     parts = content[1:].split(); cmd = parts[0].lower(); args = parts[1:]
 
     if cmd == "ticket":
-        if maintenance_mode: await message.channel.send("🔧 Maintenance en cours."); return
+        if maintenance_mode:
+            await message.channel.send("🔧 **Bot en maintenance** — tickets temporairement indisponibles."); return
+        ok_cfg, msg_cfg = is_configured(guild.id)
+        if not ok_cfg: await message.channel.send("❌ " + msg_cfg); return
         if not args:
-            if not cfg["types"]: await message.channel.send("❌ Aucun type configuré."); return
+            if not cfg["types"]: await message.channel.send("❌ Aucun type de ticket configuré."); return
             await message.channel.send("🎫 **Ouvrir un ticket :**\n" +
                 "\n".join("• `!ticket " + k + "` — " + v["emoji"] + " " + v["label"] for k, v in cfg["types"].items()))
             return
         key = args[0].lower()
         if key not in cfg["types"]: await message.channel.send("❌ Type inconnu : `" + key + "`"); return
-        if not cfg.get("category_id"): await message.channel.send("❌ Système non configuré."); return
         ch, err = await open_ticket(guild, message.author, key)
         if err: await message.channel.send("❌ " + err)
         return
@@ -385,7 +465,11 @@ async def handle_cmds(message):
     if not is_staff(message.author, guild.id): return
 
     if cmd == "menu":
-        await send_staff_menu(message.channel, guild, invoker=message.author)
+        if maintenance_mode:
+            await message.channel.send("🔧 **Bot en maintenance** — menu indisponible."); return
+        if cfg.get("menu_locked"):
+            await message.channel.send(embed=_e_warn("🔒  Menu verrouillé", "Déverrouille via la console (`lockmenu off`).")); return
+        await send_staff_menu(message.channel, guild)
 
     elif cmd == "tpending":
         gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == guild.id]
@@ -484,18 +568,18 @@ def _e_empty(title, desc=""):
 
 
 async def send_staff_menu(channel, guild, invoker=None):
-    """
-    Envoie le panel staff.
-    invoker : membre Discord qui invoque (None = appelé depuis la console/API, pas de check).
-    """
+    """Envoie le panel staff. Supprime l'ancien message actif pour ce serveur."""
     if invoker and not is_staff(invoker, guild.id):
         await channel.send(embed=_e_err("🚫  Accès refusé", "Réservé au staff configuré."))
         return
-    if menu_locked:
-        if invoker:
-            await channel.send(embed=_e_warn("🔒  Menu verrouillé", "Déverrouille via la console (`unlockmenu`)."))
-        return
     cfg = tconf(guild.id)
+    if cfg.get("menu_locked"):
+        if invoker:
+            await channel.send(embed=_e_warn("🔒  Menu verrouillé [" + guild.name + "]", "Déverrouille via la console (`lockmenu off`)."))
+        return
+    # Supprimer l'ancien menu actif pour ce serveur
+    await _delete_active_menu(guild.id)
+
     cat = guild.get_channel(cfg.get("category_id") or 0)
     sch = guild.get_channel(cfg.get("staff_channel_id") or 0)
     sro = guild.get_role(cfg.get("staff_role_id") or 0)
@@ -539,8 +623,11 @@ async def send_staff_menu(channel, guild, invoker=None):
             last += "> " + icons.get(s["status"], "🟡") + "  `#" + str(s["number"]).zfill(4) + "` **" + s["type"] + "** — " + name + "\n"
         e.add_field(name="🕐  Tickets récents", value=last.rstrip(), inline=False)
 
-    e.set_footer(text=("🔧 MAINTENANCE ACTIVE  •  " if maintenance_mode else "") + "Panel réservé à l'équipe staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
-    await channel.send(embed=e, view=DashboardView(guild))
+    e.set_footer(text=("🔧 MAINTENANCE  •  " if maintenance_mode else "") +
+                 ("🔒 Menu verrouillé  •  " if cfg.get("menu_locked") else "") +
+                 "Panel staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
+    msg = await channel.send(embed=e, view=DashboardView(guild))
+    active_menu_msgs[guild.id] = (channel.id, msg.id)
 
 
 class DashboardView(discord.ui.View):
@@ -549,6 +636,7 @@ class DashboardView(discord.ui.View):
         self.guild = guild
         sel = discord.ui.Select(
             placeholder="📂  Choisir une section…",
+            row=0,
             options=[
                 discord.SelectOption(label="🎫  Tickets ouverts",    value="tickets",  description="Voir et gérer les tickets en cours"),
                 discord.SelectOption(label="📥  Salons en attente",   value="pending",  description="Lancer les questions DraftBot"),
@@ -562,14 +650,44 @@ class DashboardView(discord.ui.View):
         )
         sel.callback = self.on_select
         self.add_item(sel)
+        # Bouton Fermer le menu
+        btn_close = discord.ui.Button(label="Fermer le menu", style=discord.ButtonStyle.secondary,
+                                      emoji="✖️", row=1)
+        btn_close.callback = self.close_menu
+        self.add_item(btn_close)
+        # Bouton Rafraîchir
+        btn_refresh = discord.ui.Button(label="Rafraîchir", style=discord.ButtonStyle.secondary,
+                                        emoji="🔄", row=1)
+        btn_refresh.callback = self.refresh_menu
+        self.add_item(btn_refresh)
+
+    def _guard(self, inter):
+        cfg = tconf(self.guild.id)
+        if maintenance_mode: return False, "🔧 Bot en maintenance."
+        if not is_staff(inter.user, self.guild.id): return False, "🚫 Réservé au staff."
+        if cfg.get("menu_locked"): return False, "🔒 Menu verrouillé sur ce serveur."
+        return True, None
+
+    async def close_menu(self, inter: discord.Interaction):
+        try: await inter.message.delete()
+        except: pass
+        active_menu_msgs.pop(self.guild.id, None)
+        await inter.response.send_message(embed=_e_empty("✖️  Menu fermé"), ephemeral=True)
+        self.stop()
+
+    async def refresh_menu(self, inter: discord.Interaction):
+        ok2, reason = self._guard(inter)
+        if not ok2:
+            await inter.response.send_message(embed=_e_warn("⚠️", reason), ephemeral=True); return
+        await send_staff_menu(inter.channel, self.guild)
+        try: await inter.message.delete()
+        except: pass
+        await inter.response.send_message(embed=_e_ok("🔄  Menu rafraîchi"), ephemeral=True)
 
     async def on_select(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫  Accès refusé", "Réservé au staff configuré."), ephemeral=True)
-            return
-        if menu_locked:
-            await inter.response.send_message(embed=_e_warn("🔒  Menu verrouillé", "Déverrouille via la console (`unlockmenu`)."), ephemeral=True)
-            return
+        ok2, reason = self._guard(inter)
+        if not ok2:
+            await inter.response.send_message(embed=_e_warn("⚠️", reason), ephemeral=True); return
         val = inter.data["values"][0]
         g   = self.guild
         cfg = tconf(g.id)
@@ -601,8 +719,11 @@ class DashboardView(discord.ui.View):
             if not gp:
                 await inter.response.send_message(embed=_e_empty("📥  Salons en attente", "Aucun salon détecté."), ephemeral=True)
                 return
+            ok_cfg2, msg_cfg2 = is_configured(g.id)
+            if not ok_cfg2:
+                await inter.response.send_message(embed=_e_warn("⚠️  Config incomplète", msg_cfg2), ephemeral=True); return
             if not cfg["types"]:
-                await inter.response.send_message(embed=_e_warn("⚠️  Aucun type défini", "Configure des types via la console distante (`ttype add`)."), ephemeral=True)
+                await inter.response.send_message(embed=_e_warn("⚠️  Aucun type défini", "Crée des types via la section Types."), ephemeral=True)
                 return
             e = discord.Embed(title="📥  Salons en attente",
                               description="`" + str(len(gp)) + "` salon(s) détecté(s) par DraftBot",
@@ -644,6 +765,8 @@ class DashboardView(discord.ui.View):
                         value="`#" + str(cfg["counter"]).zfill(4) + "`", inline=True)
             e.add_field(name="📝  Types",
                         value="`" + str(len(cfg["types"])) + "` type(s)", inline=True)
+            e.add_field(name="🔒  Menu Discord",
+                        value="Verrouillé 🔒" if cfg.get("menu_locked") else "Libre 🔓", inline=True)
             e.set_footer(text="Utilise les menus ci-dessous pour modifier la configuration.")
             await inter.response.send_message(embed=e, view=ConfigFullView(g, cfg), ephemeral=True)
 
@@ -829,11 +952,88 @@ class PostActionView(discord.ui.View):
         await inter.response.send_message(embed=_e_empty("🔒  Fermé", "Salon supprimé sous peu."), ephemeral=True)
         self.stop()
 
-    @discord.ui.button(label="Envoyer message", style=discord.ButtonStyle.primary, emoji="💬")
+    @discord.ui.button(label="Envoyer message", style=discord.ButtonStyle.primary, emoji="💬", row=0)
     async def send_msg(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not is_staff(inter.user, self.guild.id):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         await inter.response.send_modal(SendMsgModal(self.guild, self.s))
+
+    @discord.ui.button(label="Actions enrichies", style=discord.ButtonStyle.success, emoji="⚡", row=1)
+    async def extra_actions(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_message(
+            embed=discord.Embed(title="⚡  Actions enrichies", color=0x1ABC9C,
+                description="Que veux-tu faire pour ce membre ?"),
+            view=ExtraActionsView(self.guild, self.s), ephemeral=True)
+
+
+# ── Vue : actions enrichies ───────────────────────────────────
+class ExtraActionsView(discord.ui.View):
+    def __init__(self, guild, s):
+        super().__init__(timeout=120)
+        self.guild = guild; self.s = s
+
+    @discord.ui.button(label="Créer invitation (1 usage)", style=discord.ButtonStyle.primary, emoji="🔗", row=0)
+    async def create_invite(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        errs = await do_accept_actions(self.guild, self.s, {"invite": True})
+        if errs: await inter.response.send_message(embed=_e_warn("⚠️", "\n".join(errs)), ephemeral=True)
+        else:    await inter.response.send_message(embed=_e_ok("🔗  Invitation envoyée dans le salon ticket"), ephemeral=True)
+
+    @discord.ui.button(label="Attribuer un rôle", style=discord.ButtonStyle.secondary, emoji="🎭", row=0)
+    async def add_role(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        roles = [r for r in self.guild.roles if r.name != "@everyone" and r < self.guild.me.top_role]
+        if not roles:
+            await inter.response.send_message(embed=_e_warn("⚠️", "Aucun rôle attribuable."), ephemeral=True); return
+        opts = [discord.SelectOption(label=r.name[:50], value=str(r.id)) for r in roles[:25]]
+        sel  = discord.ui.Select(placeholder="Choisir le rôle…", options=opts)
+        s_ref = self.s; guild_ref = self.guild
+        async def _pick(i2):
+            rid = int(i2.data["values"][0])
+            errs = await do_accept_actions(guild_ref, s_ref, {"add_role": rid})
+            r = guild_ref.get_role(rid)
+            if errs: await i2.response.send_message(embed=_e_warn("⚠️", "\n".join(errs)), ephemeral=True)
+            else:    await i2.response.send_message(embed=_e_ok("🎭  Rôle attribué", "**" + (r.name if r else "?") + "**"), ephemeral=True)
+        sel.callback = _pick
+        v2 = discord.ui.View(timeout=60); v2.add_item(sel)
+        await inter.response.send_message(embed=discord.Embed(title="🎭  Quel rôle ?", color=0x9B59B6), view=v2, ephemeral=True)
+
+    @discord.ui.button(label="Renommer le membre", style=discord.ButtonStyle.secondary, emoji="✏️", row=0)
+    async def rename_member(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(RenameModal(self.guild, self.s))
+
+    @discord.ui.button(label="Créer un rôle", style=discord.ButtonStyle.success, emoji="➕", row=1)
+    async def create_role_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(CreateRoleModal(self.guild, self.s))
+
+
+class RenameModal(discord.ui.Modal, title="✏️  Renommer le membre"):
+    new_nick = discord.ui.TextInput(label="Nouveau pseudo (max 32 car.)",
+        placeholder="Laisse vide pour réinitialiser…", max_length=32, required=False)
+    def __init__(self, guild, s):
+        super().__init__(); self.guild = guild; self.s = s
+    async def on_submit(self, inter: discord.Interaction):
+        errs = await do_accept_actions(self.guild, self.s, {"rename": self.new_nick.value or None})
+        if errs: await inter.response.send_message(embed=_e_warn("⚠️", "\n".join(errs)), ephemeral=True)
+        else:    await inter.response.send_message(embed=_e_ok("✏️  Pseudo modifié", self.new_nick.value or "(réinitialisé)"), ephemeral=True)
+
+
+class CreateRoleModal(discord.ui.Modal, title="➕  Créer un rôle"):
+    role_name = discord.ui.TextInput(label="Nom du rôle", placeholder="ex: VIP, Accès serveur…", max_length=50)
+    def __init__(self, guild, s):
+        super().__init__(); self.guild = guild; self.s = s
+    async def on_submit(self, inter: discord.Interaction):
+        errs = await do_accept_actions(self.guild, self.s, {"create_role": self.role_name.value.strip()})
+        if errs: await inter.response.send_message(embed=_e_warn("⚠️", "\n".join(errs)), ephemeral=True)
+        else:    await inter.response.send_message(embed=_e_ok("➕  Rôle créé et attribué", "**" + self.role_name.value.strip() + "**"), ephemeral=True)
 
 
 class SendMsgModal(discord.ui.Modal, title="💬  Message dans le ticket"):
@@ -1003,6 +1203,13 @@ class ConfigFullView(discord.ui.View):
         btn_role.callback = self.manual_role
         self.add_item(btn_role)
 
+        lock_lbl = "🔓 Déverrouiller menu" if cfg.get("menu_locked") else "🔒 Verrouiller menu"
+        btn_lock = discord.ui.Button(label=lock_lbl,
+            style=discord.ButtonStyle.success if cfg.get("menu_locked") else discord.ButtonStyle.danger,
+            emoji="🔒", row=3)
+        btn_lock.callback = self.toggle_menu_lock
+        self.add_item(btn_lock)
+
         btn_show = discord.ui.Button(label="Config actuelle", style=discord.ButtonStyle.secondary,
                                      emoji="📊", row=3)
         btn_show.callback = self.show_cfg
@@ -1045,14 +1252,26 @@ class ConfigFullView(discord.ui.View):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         await inter.response.send_modal(RoleSearchModal(self.guild, self.cfg))
 
+    async def toggle_menu_lock(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["menu_locked"] = not self.cfg.get("menu_locked", False)
+        save_data()
+        state = "verrouillé 🔒" if self.cfg["menu_locked"] else "déverrouillé 🔓"
+        await inter.response.send_message(
+            embed=_e_ok("🔒  Menu Discord " + state + " — " + self.guild.name), ephemeral=True)
+
     async def show_cfg(self, inter: discord.Interaction):
         cat2 = self.guild.get_channel(self.cfg.get("category_id") or 0)
         sch2 = self.guild.get_channel(self.cfg.get("staff_channel_id") or 0)
         sro2 = self.guild.get_role(self.cfg.get("staff_role_id") or 0)
-        e = discord.Embed(title="📊  Config actuelle", color=C_BLUE)
+        ok_cfg, msg_cfg = is_configured(self.guild.id)
+        e = discord.Embed(title="📊  Config — " + self.guild.name, color=C_BLUE)
         e.add_field(name="📁 Catégorie",   value="`" + cat2.name + "`" if cat2 else "❌", inline=True)
         e.add_field(name="📣 Salon staff", value=sch2.mention if sch2 else "❌",          inline=True)
         e.add_field(name="🛡 Rôle staff",  value=sro2.mention if sro2 else "⚠️",         inline=True)
+        e.add_field(name="🔒 Menu Discord", value="Verrouillé" if self.cfg.get("menu_locked") else "Libre", inline=True)
+        if not ok_cfg: e.add_field(name="⚠️ Manquant", value=msg_cfg, inline=False)
         await inter.response.send_message(embed=e, ephemeral=True)
 
 
@@ -1104,6 +1323,9 @@ class TypesManagerView(discord.ui.View):
     async def create_type(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not is_staff(inter.user, self.guild.id):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        ok_cfg, msg_cfg = is_configured(self.guild.id)
+        if not ok_cfg:
+            await inter.response.send_message(embed=_e_warn("⚠️  Config incomplète", msg_cfg), ephemeral=True); return
         await inter.response.send_modal(TypeCreateModal(self.guild, self.cfg))
 
     @discord.ui.button(label="Modifier un type", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
@@ -1257,6 +1479,9 @@ class MemberModView(discord.ui.View):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         if maintenance_mode:
             await inter.response.send_message(embed=_e_warn("🔧  Maintenance active", "Les tickets sont désactivés."), ephemeral=True); return
+        ok_cfg, msg_cfg = is_configured(self.guild.id)
+        if not ok_cfg:
+            await inter.response.send_message(embed=_e_warn("⚠️  Config incomplète", msg_cfg), ephemeral=True); return
         cfg = tconf(self.guild.id)
         if not cfg["types"]:
             await inter.response.send_message(embed=_e_warn("⚠️", "Aucun type configuré."), ephemeral=True); return
@@ -1344,12 +1569,14 @@ async def dispatch(action, p):
             cat = g.get_channel(cfg.get("category_id") or 0)
             sch = g.get_channel(cfg.get("staff_channel_id") or 0)
             sro = g.get_role(cfg.get("staff_role_id") or 0)
+            ok_cfg, _ = is_configured(g.id)
             guilds.append({"id": g.id, "name": g.name, "members": g.member_count,
                 "category": cat.name if cat else None, "staff_channel": sch.name if sch else None,
                 "staff_role": sro.name if sro else None,
-                "ticket_types": list(cfg.get("types", {}).keys()), "counter": cfg.get("counter", 0)})
+                "ticket_types": list(cfg.get("types", {}).keys()), "counter": cfg.get("counter", 0),
+                "menu_locked": cfg.get("menu_locked", False), "configured": ok_cfg})
         return {"bot": str(client.user), "guilds": guilds,
-                "maintenance": maintenance_mode, "menu_locked": menu_locked,
+                "maintenance": maintenance_mode,
                 "open_tickets": len([s for s in ticket_sessions.values() if s["status"] in ("open", "pending")]),
                 "pending": len(pending_channels)}
 
@@ -1360,9 +1587,15 @@ async def dispatch(action, p):
         print("[BOT] maintenance_mode =", maintenance_mode)
         return {"maintenance": maintenance_mode, "ok": True}
     elif action == "lockmenu":
-        menu_locked = True;  save_data(); return {"menu_locked": True}
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        tconf(g.id)["menu_locked"] = True; save_data()
+        return {"menu_locked": True, "guild": g.name}
     elif action == "unlockmenu":
-        menu_locked = False; save_data(); return {"menu_locked": False}
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        tconf(g.id)["menu_locked"] = False; save_data()
+        return {"menu_locked": False, "guild": g.name}
 
     elif action == "basecfg":
         g = _g(p)
@@ -1381,6 +1614,8 @@ async def dispatch(action, p):
         g = _g(p); key = p.get("key", "").lower()
         if not g: return {"error": "Guild not found"}
         if not key: return {"error": "key required"}
+        ok_cfg, msg_cfg = is_configured(g.id)
+        if not ok_cfg: return {"error": "Config incomplète : " + msg_cfg}
         cfg = tconf(g.id)
         cfg["types"][key] = {"label": p.get("label", key), "emoji": p.get("emoji", "🎫"), "questions": p.get("questions", [])}
         save_data(); return {"ok": True, "key": key}
@@ -1404,6 +1639,8 @@ async def dispatch(action, p):
     elif action == "topen":
         g = _g(p)
         if not g: return {"error": "Guild not found"}
+        ok_cfg, msg_cfg = is_configured(g.id)
+        if not ok_cfg: return {"error": msg_cfg}
         m = find_member(str(p.get("member", "")), g)
         if not m: return {"error": "Member not found"}
         type_key = str(p.get("type_key", "")).lower()
@@ -1421,6 +1658,8 @@ async def dispatch(action, p):
     elif action == "tlaunch":
         g = _g(p)
         if not g: return {"error": "Guild not found"}
+        ok_cfg, msg_cfg = is_configured(g.id)
+        if not ok_cfg: return {"error": msg_cfg}
         cfg = tconf(g.id)
         cid = p.get("channel_id")
         ch  = g.get_channel(int(cid)) if cid else find_channel(str(p.get("channel", "")), g)
@@ -1454,7 +1693,7 @@ async def dispatch(action, p):
         s = next((x for x in ticket_sessions.values() if x["guild_id"] == g.id and x["number"] == num), None)
         if not s: return {"error": "Ticket #" + str(num) + " not found"}
         act    = {"taccept": "accepted", "trefuse": "refused", "tclose": "closed"}[action]
-        raison = str(p.get("raison", "")) or {"accepted": "Accepté.", "refused": "Refusé.", "closed": "Fermé."}.get(act, "")
+        raison = str(p.get("raison", ""))
         await do_action(g, s, act, raison); return {"ok": True, "number": num, "action": act}
 
     elif action == "tsend":
@@ -1519,7 +1758,40 @@ async def dispatch(action, p):
         if not g: return {"error": "Guild not found"}
         ch = find_channel(str(p.get("channel", "")), g)
         if not ch: return {"error": "Channel not found"}
-        await ch.send(str(p.get("message", ""))); return {"ok": True}
+        content = str(p.get("message", ""))
+        mid = p.get("mention_id")
+        if mid:
+            m = g.get_member(int(mid))
+            if m: content = m.mention + " " + content
+        await ch.send(content); return {"ok": True}
+
+    elif action == "read_messages":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        ch = find_channel(str(p.get("channel", "")), g)
+        if not ch: return {"error": "Channel not found"}
+        limit = int(p.get("limit", 20))
+        try:
+            msgs = []
+            async for msg in ch.history(limit=min(limit, 50)):
+                msgs.append({"id": msg.id, "author": msg.author.display_name,
+                             "author_id": msg.author.id, "content": msg.content,
+                             "timestamp": msg.created_at.strftime("%d/%m/%Y %H:%M:%S"),
+                             "bot": msg.author.bot})
+            return {"messages": msgs, "channel": ch.name}
+        except discord.Forbidden:
+            return {"error": "Permission refusée pour lire ce salon"}
+
+    elif action == "accept_actions":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        try: num = int(str(p.get("number", "")).lstrip("#"))
+        except: return {"error": "Invalid number"}
+        s = next((x for x in ticket_sessions.values() if x["guild_id"] == g.id and x["number"] == num), None)
+        if not s: return {"error": "Ticket #" + str(num) + " not found"}
+        actions = {k: v for k, v in p.items() if k in ("rename", "invite", "add_role", "create_role")}
+        errs = await do_accept_actions(g, s, actions)
+        return {"ok": True, "errors": errs}
 
     elif action == "kick":
         g = _g(p)
