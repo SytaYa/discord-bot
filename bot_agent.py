@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.4 — hébergé sur Render
+  BOT AGENT v5.5 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -10,6 +10,8 @@
          was_empty, global menu_locked, logs debug complets)
   v5.4 : fix définitif musique — YTDL_STREAM format corrigé, User-Agent FFmpeg,
          _auto_disconnect non-bloquant, after callback guard loop, logs CDN URL
+  v5.5 : fix lecture audio — player_client ios (anti-bot-check YouTube datacenter),
+         diagnostic boot FFmpeg+PyNaCl, logs vc.is_playing() post-play, erreurs yt_dlp typées
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -49,7 +51,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.4"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.5"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -884,16 +886,31 @@ FFMPEG_OPTS = {
     "options": "-vn",
 }
 
-# ── Options yt_dlp — trois jeux distincts, ne jamais mélanger ────
-# YTDL_FLAT         : recherche + métadonnées (extract_flat=True → PAS de stream CDN)
-# YTDL_FLAT_PLAYLIST: listing playlist       (extract_flat=True → PAS de stream CDN)
-# YTDL_STREAM       : résolution CDN audio   (extract_flat=False → OBLIGATOIRE)
+# ══════════════════════════════════════════════════════════════════
+# Options yt_dlp — trois jeux distincts, ne jamais mélanger
+#
+# PROBLÈME DATACENTER (Render/AWS/GCP) :
+# YouTube détecte les IPs de datacenter et répond
+# "Sign in to confirm you're not a bot" pour le client web standard.
+# FIX : forcer player_client="ios" — le client iOS contourne ce check
+# car YouTube ne vérifie pas le JS player pour les requêtes mobiles Apple.
+# Source: https://github.com/yt-dlp/yt-dlp/issues/9997
+# ══════════════════════════════════════════════════════════════════
+
+# Extractor args partagés : forcer le client iOS pour contourner le bot check
+_YT_EXTRACTOR_ARGS = {
+    "youtube": {
+        "player_client": ["ios", "web"],  # ios en premier, fallback web
+    }
+}
+
 _YTDL_BASE = {
-    "quiet":          True,
-    "no_warnings":    True,
-    "socket_timeout": 15,  # réduit à 15s (était 20s) — fail-fast sur les requêtes lentes
-    "geo_bypass":     True,
-    "http_headers":   {"User-Agent": _YT_UA},
+    "quiet":           True,
+    "no_warnings":     True,
+    "socket_timeout":  15,
+    "geo_bypass":      True,
+    "http_headers":    {"User-Agent": _YT_UA},
+    "extractor_args":  _YT_EXTRACTOR_ARGS,
 }
 
 YTDL_FLAT = {
@@ -910,11 +927,9 @@ YTDL_FLAT_PLAYLIST = {
     "noplaylist":   False,
 }
 
-# YTDL_STREAM : le seul qui résout réellement le stream CDN audio
-# extract_flat=False OBLIGATOIRE — sans ça yt_dlp retourne la page HTML
-# format="bestaudio/best" : laisse yt_dlp choisir le meilleur format audio dispo
-# Ne pas restreindre à [ext=webm]/[ext=m4a] — YouTube peut ne pas proposer ces formats
-# et yt_dlp lèverait "Requested format is not available"
+# YTDL_STREAM : résout l'URL en stream CDN audio réel
+# extract_flat=False OBLIGATOIRE — avec True yt_dlp retourne la page HTML
+# player_client=ios (via _YT_EXTRACTOR_ARGS) → contourne le bot check datacenter
 YTDL_STREAM = {
     **_YTDL_BASE,
     "format":            "bestaudio/best",
@@ -1162,8 +1177,17 @@ async def _get_stream_info(webpage_url: str) -> dict | None:
             try:
                 info = ydl.extract_info(webpage_url, download=False)
             except Exception as ex:
-                # Logger l'erreur exacte : "Sign in to confirm", 403, 429, etc.
-                log("MUSIC", f"yt_dlp erreur sur {webpage_url[:60]} : {ex}", flush=True)
+                err_str = str(ex)
+                if "Sign in" in err_str or "bot" in err_str.lower() or "confirm" in err_str:
+                    log("MUSIC", f"BLOCAGE BOT YouTube pour {webpage_url[:50]} — player_client ios devrait contourner", flush=True)
+                elif "403" in err_str:
+                    log("MUSIC", f"HTTP 403 YouTube pour {webpage_url[:50]} — vidéo bloquée géographiquement ?", flush=True)
+                elif "429" in err_str:
+                    log("MUSIC", f"HTTP 429 YouTube pour {webpage_url[:50]} — trop de requêtes, attendre", flush=True)
+                elif "unavailable" in err_str.lower() or "private" in err_str.lower():
+                    log("MUSIC", f"Vidéo indisponible/privée : {webpage_url[:50]}", flush=True)
+                else:
+                    log("MUSIC", f"yt_dlp erreur sur {webpage_url[:50]} : {err_str[:120]}", flush=True)
                 return None
             if not info:
                 log("MUSIC", f"yt_dlp info=None pour {webpage_url[:60]}", flush=True)
@@ -1341,12 +1365,17 @@ async def _play_next(guild: discord.Guild):
     track_title_for_after = track.get("title") or "?"
     def _after(error):
         if error:
-            log("MUSIC", f"[{guild.name}] after erreur : {error}", flush=True)
+            # Convertir l'erreur en string pour le log (peut être une exception ou un string)
+            err_msg = str(error)
+            log("MUSIC", f"[{guild.name}] after erreur (FFmpeg/Discord) : {err_msg[:200]}", flush=True)
+            if "encoder" in err_msg.lower() or "opus" in err_msg.lower():
+                log("MUSIC", f"[{guild.name}] after : erreur encoder Opus — PyNaCl manquant ?", flush=True)
         else:
-            log("MUSIC", f"[{guild.name}] Lecture terminée : '{track_title_for_after}'", flush=True)
+            log("MUSIC", f"[{guild.name}] Lecture terminée normalement : '{track_title_for_after}'", flush=True)
         try:
             loop = client.loop
             if loop and not loop.is_closed():
+                log("MUSIC", f"[{guild.name}] after : planification _play_next", flush=True)
                 asyncio.run_coroutine_threadsafe(_play_next(guild), loop)
             else:
                 log("MUSIC", f"[{guild.name}] after : event loop fermée — impossible de lancer _play_next", flush=True)
@@ -1355,17 +1384,26 @@ async def _play_next(guild: discord.Guild):
 
     # Étape 5 : vc.play()
     try:
+        if vc.is_playing():
+            log("MUSIC", f"[{guild.name}] vc déjà en lecture — stop avant play", flush=True)
+            vc.stop()
         vc.play(source, after=_after)
-        log("MUSIC", f"[{guild.name}] vc.play() lancé ✔", flush=True)
+        # Vérification immédiate : vc.is_playing() doit être True
+        playing_confirmed = vc.is_playing()
+        log("MUSIC", f"[{guild.name}] vc.play() appelé — is_playing()={playing_confirmed}", flush=True)
+        if not playing_confirmed:
+            log("MUSIC", f"[{guild.name}] AVERTISSEMENT : vc.is_playing()=False immédiatement après vc.play()", flush=True)
     except discord.errors.ClientException as e:
         log("MUSIC", f"[{guild.name}] vc.play ClientException : {e}", flush=True)
         if "already" in str(e).lower():
-            st["queue"].insert(0, track)  # remettre en tête
+            st["queue"].insert(0, track)
         else:
             await _play_next(guild)
         return
     except Exception as e:
+        import traceback as _tb
         log("MUSIC", f"[{guild.name}] vc.play erreur : {e}", flush=True)
+        log("MUSIC", _tb.format_exc(), flush=True)
         await _play_next(guild)
         return
 
@@ -3438,9 +3476,22 @@ async def main():
     log("BOOT", "=" * 52)
     log("BOOT", f"Python         : {sys.version.split()[0]}")
     log("BOOT", f"discord.py     : {discord.__version__}")
-    log("BOOT", f"yt_dlp         : {'OK' if YT_DLP_OK else 'NON INSTALLE'}")
+    log("BOOT", f"yt_dlp         : {'OK' if YT_DLP_OK else 'NON INSTALLE — musique impossible'}")
     log("BOOT", f"spotipy        : {'OK' if SPOTIPY_OK else 'non installe (optionnel)'}")
     log("BOOT", f"FFmpeg         : {FFMPEG_EXECUTABLE}")
+    # Vérifications critiques pour l'audio Discord
+    import shutil as _shutil_boot
+    ffmpeg_ok = _shutil_boot.which("ffmpeg") is not None
+    log("BOOT", f"FFmpeg dispo   : {'OK ✔' if ffmpeg_ok else 'INTROUVABLE ❌ — musique silencieuse sans FFmpeg'}")
+    try:
+        import nacl
+        log("BOOT", f"PyNaCl         : OK ✔ (chiffrement vocal Discord)")
+    except ImportError:
+        log("BOOT", "PyNaCl         : MANQUANT ❌ — vc.play() ne transmettra AUCUN son sans PyNaCl !")
+        log("BOOT", "                 Ajouter PyNaCl>=1.5.0 dans requirements.txt")
+    # Test rapide yt_dlp si disponible
+    if YT_DLP_OK:
+        log("BOOT", f"yt_dlp player_client : ios+web (anti-bot-check datacenter)")
     log("BOOT", f"PORT           : {PORT}")
     log("BOOT", f"REMOTE_ENABLED : {REMOTE_ENABLED}")
     log("BOOT", "DISCORD_TOKEN  : " + ("OK" if TOKEN else "*** MANQUANT ***"))
