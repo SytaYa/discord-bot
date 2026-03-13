@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.3 — hébergé sur Render
+  BOT AGENT v5.4 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
   v5.2 : /menu slash, PostgreSQL, musique (yt_dlp + FFmpeg + Spotify)
   v5.3 : fix pipeline musique (timeout autocomplete, blocage silencieux,
          was_empty, global menu_locked, logs debug complets)
+  v5.4 : fix définitif musique — YTDL_STREAM format corrigé, User-Agent FFmpeg,
+         _auto_disconnect non-bloquant, after callback guard loop, logs CDN URL
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -47,7 +49,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.3"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.4"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -862,26 +864,36 @@ import shutil as _shutil
 FFMPEG_EXECUTABLE = _shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 log("MUSIC", f"FFmpeg : {FFMPEG_EXECUTABLE}", flush=True)
 
+# ── User-Agent Chrome — évite la détection bot YouTube sur les IPs datacenter ──
+_YT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+# ── Options FFmpeg ────────────────────────────────────────────────
+# -user_agent : transmis à YouTube par FFmpeg pour éviter le blocage 403
+# -reconnect  : reconnexion automatique si le CDN coupe le flux en cours de lecture
 FFMPEG_OPTS = {
     "executable":     FFMPEG_EXECUTABLE,
     "before_options": (
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+        f"-user_agent '{_YT_UA}' "
         "-loglevel warning"
     ),
     "options": "-vn",
 }
 
-# ── Options yt_dlp séparées par usage ────────────────────────────
-# YTDL_FLAT         : recherche et métadonnées rapides (PAS de stream audio)
-# YTDL_FLAT_PLAYLIST: listing playlist (PAS de stream audio)
-# YTDL_STREAM       : résolution d'une URL en stream CDN audio
-#                     extract_flat=False OBLIGATOIRE — sans ça yt_dlp renvoie
-#                     la webpage_url HTML au lieu du CDN → FFmpeg lit du HTML → silence
-
+# ── Options yt_dlp — trois jeux distincts, ne jamais mélanger ────
+# YTDL_FLAT         : recherche + métadonnées (extract_flat=True → PAS de stream CDN)
+# YTDL_FLAT_PLAYLIST: listing playlist       (extract_flat=True → PAS de stream CDN)
+# YTDL_STREAM       : résolution CDN audio   (extract_flat=False → OBLIGATOIRE)
 _YTDL_BASE = {
     "quiet":          True,
     "no_warnings":    True,
-    "socket_timeout": 20,
+    "socket_timeout": 15,  # réduit à 15s (était 20s) — fail-fast sur les requêtes lentes
+    "geo_bypass":     True,
+    "http_headers":   {"User-Agent": _YT_UA},
 }
 
 YTDL_FLAT = {
@@ -898,11 +910,17 @@ YTDL_FLAT_PLAYLIST = {
     "noplaylist":   False,
 }
 
+# YTDL_STREAM : le seul qui résout réellement le stream CDN audio
+# extract_flat=False OBLIGATOIRE — sans ça yt_dlp retourne la page HTML
+# format="bestaudio/best" : laisse yt_dlp choisir le meilleur format audio dispo
+# Ne pas restreindre à [ext=webm]/[ext=m4a] — YouTube peut ne pas proposer ces formats
+# et yt_dlp lèverait "Requested format is not available"
 YTDL_STREAM = {
     **_YTDL_BASE,
-    "format":       "bestaudio/best",
-    "extract_flat": False,   # FIX CRITIQUE — obligatoire pour obtenir le CDN audio
-    "noplaylist":   True,
+    "format":            "bestaudio/best",
+    "extract_flat":      False,
+    "noplaylist":        True,
+    "extractor_retries": 3,
 }
 
 
@@ -1144,50 +1162,64 @@ async def _get_stream_info(webpage_url: str) -> dict | None:
             try:
                 info = ydl.extract_info(webpage_url, download=False)
             except Exception as ex:
-                log("MUSIC", f"yt_dlp extract_info erreur : {ex}", flush=True)
+                # Logger l'erreur exacte : "Sign in to confirm", 403, 429, etc.
+                log("MUSIC", f"yt_dlp erreur sur {webpage_url[:60]} : {ex}", flush=True)
                 return None
             if not info:
+                log("MUSIC", f"yt_dlp info=None pour {webpage_url[:60]}", flush=True)
                 return None
 
             title     = info.get("title") or None
             duration  = int(info.get("duration") or 0)
             thumbnail = info.get("thumbnail")
+            fmts      = info.get("formats") or []
 
-            # Chemin 1 : info["url"] = CDN direct
+            log("MUSIC", f"yt_dlp OK — title='{title}' dur={duration}s formats={len(fmts)}", flush=True)
+
+            # Chemin 1 : info["url"] = CDN direct (format single-stream résolu)
             stream = info.get("url")
             if stream and stream.startswith("http"):
+                fmt_note = info.get("format") or info.get("ext") or "?"
+                log("MUSIC", f"Stream CDN direct ✔ format='{fmt_note}' url={stream[:60]}", flush=True)
                 return {"stream_url": stream, "title": title,
                         "duration": duration, "thumbnail": thumbnail}
 
-            # Chemin 2 : formats audio-only
-            fmts = info.get("formats") or []
+            # Chemin 2 : formats audio-only (vcodec=none, acodec présent)
             audio_only = [f for f in fmts
                           if f.get("acodec") not in (None, "none")
                           and f.get("vcodec") in (None, "none")
                           and (f.get("url") or "").startswith("http")]
             if audio_only:
                 audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
-                log("MUSIC", f"{len(audio_only)} formats audio-only disponibles", flush=True)
+                log("MUSIC", f"{len(audio_only)} formats audio-only — abr={audio_only[0].get('abr')} ext={audio_only[0].get('ext')}", flush=True)
                 return {"stream_url": audio_only[0]["url"], "title": title,
                         "duration": duration, "thumbnail": thumbnail}
 
-            # Chemin 3 : premier format avec URL HTTP
+            # Chemin 3 : fallback — n'importe quel format avec URL HTTP
+            log("MUSIC", f"Pas de format audio-only — fallback sur {len(fmts)} formats totaux", flush=True)
             for f in reversed(fmts):
                 u = f.get("url") or ""
                 if u.startswith("http"):
+                    log("MUSIC", f"Fallback format ext={f.get('ext')} acodec={f.get('acodec')}", flush=True)
                     return {"stream_url": u, "title": title,
                             "duration": duration, "thumbnail": thumbnail}
 
-            log("MUSIC", "Aucun format audio valide dans info[formats]", flush=True)
+            log("MUSIC", f"AUCUN format utilisable — liste formats: {[f.get('ext') for f in fmts[:5]]}", flush=True)
             return None
 
     try:
-        result = await loop.run_in_executor(None, _fetch)
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch),
+            timeout=45.0
+        )
         if result:
             log("MUSIC", f"Stream+méta résolu ✔ — titre='{result['title'] or '?'}' dur={result['duration']}s", flush=True)
         else:
             log("MUSIC", "Stream introuvable — aucun format utilisable", flush=True)
         return result
+    except asyncio.TimeoutError:
+        log("MUSIC", f"TIMEOUT 45s _get_stream_info pour : {webpage_url[:70]}", flush=True)
+        return None
     except Exception as e:
         log("MUSIC", f"Exception _get_stream_info : {e}", flush=True)
         return None
@@ -1223,19 +1255,25 @@ async def _play_next(guild: discord.Guild):
         return
 
     if not st["queue"]:
-        log("MUSIC", f"[{guild.name}] File vide — attente 60 s puis déco si inactif", flush=True)
+        log("MUSIC", f"[{guild.name}] File vide — déconnexion auto dans 60 s si inactif", flush=True)
         st["current"] = None
-        await asyncio.sleep(60)
-        vc2 = guild.voice_client
-        if vc2 and vc2.is_connected() and not vc2.is_playing() and not vc2.is_paused():
-            log("MUSIC", f"[{guild.name}] Déconnexion après inactivité", flush=True)
-            await vc2.disconnect()
+        # Lancer le timer de déco en tâche de fond — NE PAS bloquer _play_next
+        async def _auto_disconnect():
+            await asyncio.sleep(60)
+            vc2 = guild.voice_client
+            if vc2 and vc2.is_connected() and not vc2.is_playing() and not vc2.is_paused():
+                log("MUSIC", f"[{guild.name}] Déconnexion après 60 s d'inactivité", flush=True)
+                await vc2.disconnect()
+        asyncio.create_task(_auto_disconnect())
         return
 
     track = st["queue"].pop(0)
     st["current"] = track
-    url_preview = (track.get("url") or "None")[:60]
-    log("MUSIC", f"[{guild.name}] Dépile '{track['title']}' | url={url_preview}", flush=True)
+    # title peut être None si la track vient d'une URL directe (autocomplete)
+    # sera rempli par _get_stream_info après résolution
+    title_preview = track.get("title") or f"(URL: {(track.get('url') or '')[:40]})"
+    url_preview   = (track.get("url") or "None")[:60]
+    log("MUSIC", f"[{guild.name}] Dépile '{title_preview}' | url={url_preview}", flush=True)
 
     # Étape 1 : si url=None (track Spotify), chercher sur YT
     if not track.get("url"):
@@ -1261,13 +1299,18 @@ async def _play_next(guild: discord.Guild):
     if not stream_url:
         stream_info = await _get_stream_info(track["url"])
         if not stream_info:
-            log("MUSIC", f"[{guild.name}] CDN introuvable pour '{track.get('title') or track['url'][:50]}' — skip", flush=True)
+            title_disp = track.get("title") or track.get("url", "")[:60] or "morceau inconnu"
+            log("MUSIC", f"[{guild.name}] Stream introuvable pour '{title_disp}' — skip (vérifier logs yt_dlp ci-dessus)", flush=True)
             ch_id = st.get("np_channel")
             ch    = guild.get_channel(ch_id) if ch_id else None
-            title_disp = track.get("title") or track["url"][:60]
             if ch:
-                try: await ch.send(f"⚠️ Stream audio indisponible pour **{title_disp}** — skippé.")
-                except Exception: pass
+                try:
+                    await ch.send(
+                        f"⚠️ Impossible de lire **{title_disp}** — source audio indisponible.\n"
+                        "_(Possible cause : vidéo avec restriction d'âge, indisponible dans ta région, ou privée.)_"
+                    )
+                except Exception:
+                    pass
             await _play_next(guild)
             return
         stream_url = stream_info["stream_url"]
@@ -1283,23 +1326,32 @@ async def _play_next(guild: discord.Guild):
 
     # Étape 3 : créer la source FFmpeg
     volume = st.get("volume", 0.5)
+    log("MUSIC", f"[{guild.name}] FFmpegPCMAudio({stream_url[:70]}) vol={volume:.0%}", flush=True)
     try:
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS),
             volume=volume)
-        log("MUSIC", f"[{guild.name}] Source FFmpeg créée (vol={volume:.0%})", flush=True)
+        log("MUSIC", f"[{guild.name}] Source FFmpeg créée ✔", flush=True)
     except Exception as e:
         log("MUSIC", f"[{guild.name}] Erreur FFmpegPCMAudio : {e}", flush=True)
         await _play_next(guild)
         return
 
-    # Étape 4 : after callback
+    # Étape 4 : after callback (appelé depuis le thread FFmpeg, PAS l'event loop)
+    track_title_for_after = track.get("title") or "?"
     def _after(error):
         if error:
-            log("MUSIC", f"[{guild.name}] Erreur after : {error}", flush=True)
+            log("MUSIC", f"[{guild.name}] after erreur : {error}", flush=True)
         else:
-            log("MUSIC", f"[{guild.name}] Fin : '{track['title']}'", flush=True)
-        asyncio.run_coroutine_threadsafe(_play_next(guild), client.loop)
+            log("MUSIC", f"[{guild.name}] Lecture terminée : '{track_title_for_after}'", flush=True)
+        try:
+            loop = client.loop
+            if loop and not loop.is_closed():
+                asyncio.run_coroutine_threadsafe(_play_next(guild), loop)
+            else:
+                log("MUSIC", f"[{guild.name}] after : event loop fermée — impossible de lancer _play_next", flush=True)
+        except Exception as ex:
+            log("MUSIC", f"[{guild.name}] after exception run_coroutine_threadsafe : {ex}", flush=True)
 
     # Étape 5 : vc.play()
     try:
@@ -1389,8 +1441,14 @@ async def _autocomplete_play(inter: discord.Interaction, current: str):
             return []
 
     try:
-        results = await loop.run_in_executor(None, _search)
+        results = await asyncio.wait_for(
+            loop.run_in_executor(None, _search),
+            timeout=2.8  # Discord coupe l'autocomplete après 3s — on doit répondre avant
+        )
         return [app_commands.Choice(name=t, value=u) for t, u in results if u][:5]
+    except asyncio.TimeoutError:
+        log("MUSIC", f"Autocomplete TIMEOUT 2.8s pour '{current[:30]}'", flush=True)
+        return []
     except Exception as ex:
         log("MUSIC", f"Autocomplete exception executor : {ex}", flush=True)
         return []
@@ -1631,7 +1689,7 @@ async def slash_play(inter: discord.Interaction, query: str):
         st["queue"].extend(tracks)
 
         if len(tracks) == 1:
-            title = tracks[0]["title"]
+            title = tracks[0].get("title") or "🎵 Morceau en attente de résolution"
             msg   = f"✅ **{title}** ajouté à la file."
         else:
             msg = f"✅ **{len(tracks)} morceaux** ajoutés à la file."
