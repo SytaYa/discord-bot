@@ -1,9 +1,10 @@
 services:
   - type: web
     name: discord-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot_agent.py
+    env: docker                    # ← Docker runtime, plus Python natif
+    dockerfilePath: ./Dockerfile   # chemin relatif à la racine du repo
+    # Plus de buildCommand ni startCommand : le Dockerfile gère tout
+
     envVars:
       - key: DISCORD_TOKEN
         sync: false
@@ -11,5 +12,17 @@ services:
         sync: false
       - key: BOT_REMOTE_ENABLED
         value: "true"
+      - key: DATABASE_URL
+        sync: false
+      # Optionnel — Spotify
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+
     healthCheckPath: /health
     autoDeploy: true
+
+    # Plan recommandé pour la musique (FFmpeg + yt-dlp consomment de la RAM)
+    # plan: starter          # 512 MB RAM — suffisant pour 1–2 serveurs
+    # plan: standard         # 2 GB RAM  — recommandé pour usage intensif

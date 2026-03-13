@@ -852,7 +852,12 @@ YTDL_OPTS = {
     "default_search":  "ytsearch",
     "source_address":  "0.0.0.0",
 }
+# Chemin ffmpeg : /usr/bin/ffmpeg dans le container Docker (apt-get install ffmpeg)
+# Fallback sur le PATH si jamais l'environnement diffère
+import shutil as _shutil
+FFMPEG_EXECUTABLE = _shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 FFMPEG_OPTS = {
+    "executable":     FFMPEG_EXECUTABLE,
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options":        "-vn",
 }
