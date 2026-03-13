@@ -7,7 +7,7 @@
   v5 : /menu slash command, persistance SQLite, boutons désactivés
        après action ticket, menu_locked console-only
 """
-import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib
+import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
 from discord import app_commands
 from datetime import datetime, timezone
@@ -31,6 +31,8 @@ PORT           = int(os.getenv("PORT", 8080))
 DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
+
+BOT_VERSION    = "5.1"  # version affichée dans le message de mise à jour
 
 # ── État global ────────────────────────────────────────────────────
 maintenance_mode = False          # GLOBAL — touche tous les serveurs
@@ -606,6 +608,59 @@ async def _delete_active_menu(guild_id: int, channel=None):
         except: pass
 
 # ── Événements Discord ─────────────────────────────────────────────
+def get_last_commit_message() -> str:
+    """Lit le dernier message de commit Git via subprocess."""
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--pretty=%B"],
+            capture_output=True, text=True, timeout=5
+        )
+        msg = result.stdout.strip()
+        return msg if msg else "Mise à jour sans description de commit."
+    except Exception as e:
+        log("BOT", f"get_last_commit_message erreur : {e}")
+        return "Mise à jour déployée."
+
+
+async def send_update_notifications():
+    """Envoie un embed de mise à jour dans chaque salon staff configuré.
+    Appelé une seule fois par démarrage, après load_data().
+    """
+    commit_msg = get_last_commit_message()
+    log("BOT", f"Notification mise à jour — commit : {commit_msg[:60]}")
+
+    sent = 0
+    for g in client.guilds:
+        cfg = ticket_config.get(g.id)
+        if not cfg or not cfg.get("staff_channel_id"):
+            continue
+        ch = g.get_channel(cfg["staff_channel_id"])
+        if not ch:
+            log("BOT", f"[{g.name}] salon staff introuvable (id={cfg['staff_channel_id']})")
+            continue
+        # Vérifier la permission d'envoyer
+        if not ch.permissions_for(g.me).send_messages:
+            log("BOT", f"[{g.name}] permission refusée dans #{ch.name}")
+            continue
+        try:
+            e = discord.Embed(
+                title="✅  Bot mis à jour",
+                description=commit_msg,
+                color=C_GREEN,
+                timestamp=datetime.now(timezone.utc)
+            )
+            e.add_field(name="🔖  Version", value=f"`{BOT_VERSION}`", inline=True)
+            e.add_field(name="🌐  Serveur", value=g.name, inline=True)
+            e.set_footer(text=client.user.name)
+            await ch.send(embed=e)
+            sent += 1
+            log("BOT", f"[{g.name}] notification envoyée dans #{ch.name}")
+        except Exception as ex:
+            log("BOT", f"[{g.name}] erreur envoi notification : {ex}")
+
+    log("BOT", f"Notifications envoyées : {sent}/{len(client.guilds)} serveur(s)")
+
+
 @client.event
 async def on_ready():
     log("BOT", "Connecte en tant que", str(client.user))
@@ -653,6 +708,9 @@ async def on_ready():
                                        "owner_id": owner_id}
             total += 1
     if total: log("BOT", str(total) + " salon(s) existant(s) detecte(s)")
+
+    # Notification de mise à jour dans les salons staff
+    await send_update_notifications()
 
 @client.event
 async def on_guild_channel_create(channel):
@@ -817,21 +875,27 @@ async def handle_cmds(message):
 # ════════════════════════════════════════════════════════════════
 @tree.command(name="menu", description="Ouvrir le panel de gestion staff")
 async def slash_menu(inter: discord.Interaction):
+    # defer() immédiat — répond à Discord en < 1s pour éviter l'expiration
+    # Le vrai contenu est envoyé via followup juste après
     if not inter.guild:
-        await inter.response.send_message("Cette commande n'est disponible que sur un serveur.", ephemeral=True)
+        await inter.response.send_message(
+            "Cette commande n'est disponible que sur un serveur.", ephemeral=True)
         return
     guild = inter.guild
     cfg   = tconf(guild.id)
     if maintenance_mode:
-        await inter.response.send_message("🔧 Le bot est actuellement en maintenance. Réessaie plus tard.", ephemeral=True)
+        await inter.response.send_message(
+            "🔧 Le bot est actuellement en maintenance. Réessaie plus tard.", ephemeral=True)
         return
     if cfg.get("menu_locked"):
-        await inter.response.send_message("🔒 Le menu est actuellement désactivé par l'administration.", ephemeral=True)
+        await inter.response.send_message(
+            "🔒 Le menu est actuellement désactivé par l'administration.", ephemeral=True)
         return
     if not is_staff(inter.user, guild.id):
         await inter.response.send_message("🚫 Accès réservé au staff.", ephemeral=True)
         return
-    # Construire et envoyer le panel directement via l'interaction
+    # defer() public — Discord reçoit la réponse immédiate, on a 15 min pour le followup
+    await inter.response.defer(ephemeral=False)
     await send_staff_menu_inter(inter, guild)
 
 # ══════════════════════════════════════════════════════════════════
@@ -963,9 +1027,12 @@ async def send_staff_menu_inter(inter: discord.Interaction, guild):
                  ("🔒 Menu verrouillé  •  " if cfg.get("menu_locked") else "") +
                  "Panel staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
 
-    # Répondre via l'interaction → Discord sait que la commande est traitée
-    await inter.response.send_message(embed=e, view=DashboardView(guild))
-    msg = await inter.original_response()
+    # Envoyer le panel — via followup si defer() a déjà été appelé, sinon send_message
+    if inter.response.is_done():
+        msg = await inter.followup.send(embed=e, view=DashboardView(guild), wait=True)
+    else:
+        await inter.response.send_message(embed=e, view=DashboardView(guild))
+        msg = await inter.original_response()
     active_menu_msgs[guild.id] = (inter.channel.id, msg.id)
 
 
