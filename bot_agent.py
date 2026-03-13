@@ -28,8 +28,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def log(tag: str, *args):
-    """Log horodate avec flush immediat — visible dans Render sans buffer."""
+def log(tag: str, *args, **_):
+    """Log horodate avec flush immediat — visible dans Render sans buffer.
+    Accepte flush=True et autres kwargs pour compatibilité — ignorés (print utilise déjà flush=True).
+    """
     from datetime import datetime
     ts  = datetime.now().strftime("%H:%M:%S")
     msg = " ".join(str(a) for a in args)
@@ -3301,27 +3303,61 @@ async def _dispatch_inner(action, p):
 
 # ── Lancement ──────────────────────────────────────────────────────
 async def main():
+    import traceback as _tb
+
     log("BOOT", "=" * 52)
-    log("BOOT", "Demarrage bot_agent.py")
+    log("BOOT", f"bot_agent.py  v{BOT_VERSION}")
     log("BOOT", "=" * 52)
-    log("BOOT", f"PORT           = {PORT}")
-    log("BOOT", f"REMOTE_ENABLED = {REMOTE_ENABLED}")
-    log("BOOT", "DISCORD_TOKEN  = " + ("OK" if TOKEN else "MANQUANT"))
-    log("BOOT", "DATABASE_URL   = " + ("OK (" + DATABASE_URL.split('@')[-1] + ")" if DATABASE_URL else "NON DEFINIE — persistance desactivee"))
-    log("BOOT", "BOT_REMOTE_SECRET = " + ("OK" if REMOTE_SECRET != 'changeme' else "valeur par defaut (changeme)"))
+    log("BOOT", f"Python         : {sys.version.split()[0]}")
+    log("BOOT", f"discord.py     : {discord.__version__}")
+    log("BOOT", f"yt_dlp         : {'OK' if YT_DLP_OK else 'NON INSTALLE'}")
+    log("BOOT", f"spotipy        : {'OK' if SPOTIPY_OK else 'non installe (optionnel)'}")
+    log("BOOT", f"FFmpeg         : {FFMPEG_EXECUTABLE}")
+    log("BOOT", f"PORT           : {PORT}")
+    log("BOOT", f"REMOTE_ENABLED : {REMOTE_ENABLED}")
+    log("BOOT", "DISCORD_TOKEN  : " + ("OK" if TOKEN else "*** MANQUANT ***"))
+    log("BOOT", "DATABASE_URL   : " + ("OK (" + DATABASE_URL.split("@")[-1] + ")" if DATABASE_URL else "non definie — mode memoire"))
+    log("BOOT", "SPOTIFY        : " + ("OK" if (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET) else "non configure (optionnel)"))
+
     if not TOKEN:
-        log("BOOT", "DISCORD_TOKEN manquant — arret.")
+        log("BOOT", "FATAL : DISCORD_TOKEN manquant — impossible de se connecter.")
+        log("BOOT", "Ajoute DISCORD_TOKEN dans les variables d'environnement Render.")
         sys.exit(1)
-    log("HTTP", "Demarrage serveur HTTP...")
-    app = web.Application()
-    app.router.add_get("/health", handle_health)
-    app.router.add_post("/remote", handle_remote)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log("HTTP", f"Serveur HTTP actif sur 0.0.0.0:{PORT}")
-    log("BOT", "Connexion a Discord...")
-    await client.start(TOKEN)
+
+    try:
+        log("HTTP", "Demarrage serveur HTTP...")
+        app = web.Application()
+        app.router.add_get("/health", handle_health)
+        app.router.add_post("/remote", handle_remote)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+        log("HTTP", f"Serveur HTTP actif sur 0.0.0.0:{PORT}")
+    except Exception as e:
+        log("BOOT", f"FATAL : impossible de demarrer le serveur HTTP : {e}")
+        log("BOOT", _tb.format_exc())
+        sys.exit(1)
+
+    try:
+        log("BOT", "Connexion a Discord...")
+        await client.start(TOKEN)
+    except discord.LoginFailure as e:
+        log("BOT", f"FATAL : token Discord invalide : {e}")
+        log("BOT", "Verifie la variable DISCORD_TOKEN dans Render.")
+        sys.exit(1)
+    except Exception as e:
+        log("BOT", f"FATAL : erreur connexion Discord : {e}")
+        log("BOT", _tb.format_exc())
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import traceback as _tb_main
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("BOOT", "Arret demande (KeyboardInterrupt).")
+    except Exception as e:
+        log("BOOT", f"EXCEPTION NON GEREE AU DEMARRAGE : {e}")
+        log("BOOT", _tb_main.format_exc())
+        sys.exit(1)
