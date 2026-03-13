@@ -7,7 +7,8 @@
   v5 : /menu slash command, persistance SQLite, boutons désactivés
        après action ticket, menu_locked console-only
 """
-import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, sqlite3
+import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib
+import asyncpg
 from discord import app_commands
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -20,7 +21,8 @@ REMOTE_SECRET  = os.getenv("BOT_REMOTE_SECRET", "changeme")
 REMOTE_ENABLED = os.getenv("BOT_REMOTE_ENABLED", "true").lower() == "true"
 PORT           = int(os.getenv("PORT", 8080))
 DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
-DB_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
+DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
+_db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
 # ── État global ────────────────────────────────────────────────────
 maintenance_mode = False          # GLOBAL — touche tous les serveurs
@@ -36,85 +38,119 @@ active_menu_msgs = {}
 #  PERSISTANCE SQLITE
 #  Toutes les données survivent aux redémarrages / redéploiements
 # ════════════════════════════════════════════════════════════════
-def _db():
-    """Retourne une connexion SQLite (thread-safe via check_same_thread=False)."""
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ════════════════════════════════════════════════════════════════
+#  PERSISTANCE POSTGRESQL (Supabase)
+#  Toutes les données survivent aux redémarrages et redéploiements.
+#  Variable d'env requise : DATABASE_URL
+#  Format : postgresql://user:password@host:5432/dbname
+# ════════════════════════════════════════════════════════════════
 
-def init_db():
-    """Crée les tables si elles n'existent pas encore."""
-    with _db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS kv (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS guild_config (
-                guild_id         INTEGER PRIMARY KEY,
-                category_id      INTEGER,
-                staff_channel_id INTEGER,
-                staff_role_id    INTEGER,
-                counter          INTEGER DEFAULT 0,
-                menu_locked      INTEGER DEFAULT 0,
-                types_json       TEXT    DEFAULT '{}'
-            );
-            CREATE TABLE IF NOT EXISTS ticket_session (
-                channel_id  INTEGER PRIMARY KEY,
-                guild_id    INTEGER NOT NULL,
-                data_json   TEXT    NOT NULL
-            );
-        """)
-    print("[DB] SQLite prêt :", DB_FILE)
-
-def save_data():
-    """Sauvegarde incrémentale : configs + sessions + maintenance."""
+async def init_db():
+    """Crée le pool de connexions et les tables si nécessaire."""
+    global _db_pool
+    if not DATABASE_URL:
+        print("[DB] ⚠  DATABASE_URL non définie — persistance désactivée (données en mémoire seulement)")
+        return
     try:
-        with _db() as conn:
-            # Maintenance globale
-            conn.execute("INSERT OR REPLACE INTO kv VALUES (?,?)",
-                         ("maintenance_mode", "1" if maintenance_mode else "0"))
-            # Configs par serveur
-            for gid, cfg in ticket_config.items():
-                conn.execute("""
-                    INSERT OR REPLACE INTO guild_config
-                    (guild_id, category_id, staff_channel_id, staff_role_id,
-                     counter, menu_locked, types_json)
-                    VALUES (?,?,?,?,?,?,?)
-                """, (gid,
-                       cfg.get("category_id"),
-                       cfg.get("staff_channel_id"),
-                       cfg.get("staff_role_id"),
-                       cfg.get("counter", 0),
-                       1 if cfg.get("menu_locked") else 0,
-                       json.dumps(cfg.get("types", {}), ensure_ascii=False)))
-            # Sessions de tickets
-            conn.execute("DELETE FROM ticket_session")
-            for ch_id, s in ticket_sessions.items():
-                # Inclure staff_msg_id et staff_chan_id pour restaurer les views après redémarrage
-                conn.execute("INSERT OR REPLACE INTO ticket_session VALUES (?,?,?)",
-                             (ch_id, s["guild_id"], json.dumps(s, ensure_ascii=False)))
+        _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with _db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS kv (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS guild_config (
+                    guild_id         BIGINT PRIMARY KEY,
+                    category_id      BIGINT,
+                    staff_channel_id BIGINT,
+                    staff_role_id    BIGINT,
+                    counter          INTEGER DEFAULT 0,
+                    menu_locked      BOOLEAN DEFAULT FALSE,
+                    types_json       TEXT    DEFAULT '{}'
+                );
+                CREATE TABLE IF NOT EXISTS ticket_session (
+                    channel_id  BIGINT PRIMARY KEY,
+                    guild_id    BIGINT NOT NULL,
+                    data_json   TEXT   NOT NULL
+                );
+            """)
+        print("[DB] PostgreSQL connecté et tables vérifiées ✔")
+        # Migration depuis JSON si la DB est vide
+        await _maybe_migrate_json()
+    except Exception as e:
+        print("[DB] Erreur connexion :", e)
+        print("[DB] Fallback → chargement JSON")
+        _load_from_json()
+
+async def _maybe_migrate_json():
+    """Migration unique bot_data.json → PostgreSQL si la DB est vide."""
+    if not _db_pool: return
+    async with _db_pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM guild_config")
+    if count == 0 and os.path.exists(DATA_FILE):
+        _load_from_json()
+        if ticket_config or ticket_sessions:
+            await save_data()
+            print("[MIGRATE] bot_data.json → PostgreSQL terminé.")
+
+async def save_data():
+    """Sauvegarde toutes les configs et sessions en base."""
+    if not _db_pool:
+        _save_json_fallback(); return
+    try:
+        async with _db_pool.acquire() as conn:
+            async with conn.transaction():
+                # Maintenance globale
+                await conn.execute(
+                    "INSERT INTO kv VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2",
+                    "maintenance_mode", "1" if maintenance_mode else "0")
+                # Configs par serveur
+                for gid, cfg in ticket_config.items():
+                    await conn.execute("""
+                        INSERT INTO guild_config
+                            (guild_id, category_id, staff_channel_id, staff_role_id,
+                             counter, menu_locked, types_json)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7)
+                        ON CONFLICT(guild_id) DO UPDATE SET
+                            category_id      = EXCLUDED.category_id,
+                            staff_channel_id = EXCLUDED.staff_channel_id,
+                            staff_role_id    = EXCLUDED.staff_role_id,
+                            counter          = EXCLUDED.counter,
+                            menu_locked      = EXCLUDED.menu_locked,
+                            types_json       = EXCLUDED.types_json
+                    """,
+                    gid,
+                    cfg.get("category_id"),
+                    cfg.get("staff_channel_id"),
+                    cfg.get("staff_role_id"),
+                    cfg.get("counter", 0),
+                    bool(cfg.get("menu_locked")),
+                    json.dumps(cfg.get("types", {}), ensure_ascii=False))
+                # Sessions tickets — suppression + réinsertion complète
+                await conn.execute("DELETE FROM ticket_session")
+                for ch_id, s in ticket_sessions.items():
+                    await conn.execute(
+                        "INSERT INTO ticket_session VALUES ($1,$2,$3)",
+                        ch_id, s["guild_id"],
+                        json.dumps(s, ensure_ascii=False))
     except Exception as e:
         print("[SAVE]", e)
-        # Fallback JSON
-        try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump({"ticket_config": {str(k): v for k, v in ticket_config.items()},
-                           "ticket_sessions": {str(k): v for k, v in ticket_sessions.items()},
-                           "maintenance_mode": maintenance_mode}, f, ensure_ascii=False, indent=2)
-        except: pass
+        _save_json_fallback()
 
-def load_data():
-    """Charge toutes les données depuis SQLite. Fallback JSON si DB absente."""
+async def load_data():
+    """Charge toutes les données depuis PostgreSQL au démarrage."""
     global ticket_config, ticket_sessions, maintenance_mode
-    init_db()
+    await init_db()
+    if not _db_pool:
+        return  # init_db a déjà fait le fallback JSON si nécessaire
     try:
-        with _db() as conn:
+        async with _db_pool.acquire() as conn:
             # Maintenance
-            row = conn.execute("SELECT value FROM kv WHERE key='maintenance_mode'").fetchone()
-            if row: maintenance_mode = row[0] == "1"
+            row = await conn.fetchrow("SELECT value FROM kv WHERE key='maintenance_mode'")
+            if row: maintenance_mode = row["value"] == "1"
             # Configs serveurs
-            for row in conn.execute("SELECT * FROM guild_config").fetchall():
+            rows = await conn.fetch("SELECT * FROM guild_config")
+            for row in rows:
                 ticket_config[row["guild_id"]] = {
                     "category_id":      row["category_id"],
                     "staff_channel_id": row["staff_channel_id"],
@@ -124,36 +160,39 @@ def load_data():
                     "types":            json.loads(row["types_json"] or "{}"),
                 }
             # Sessions tickets
-            for row in conn.execute("SELECT * FROM ticket_session").fetchall():
+            rows = await conn.fetch("SELECT * FROM ticket_session")
+            for row in rows:
                 ticket_sessions[row["channel_id"]] = json.loads(row["data_json"])
         print("[DB]", len(ticket_config), "guild(s),", len(ticket_sessions), "ticket(s)",
               "| maintenance=" + str(maintenance_mode))
-        # Migration JSON → SQLite si DB vide mais JSON existe
-        if not ticket_config and os.path.exists(DATA_FILE):
-            _migrate_from_json()
     except Exception as e:
-        print("[LOAD-DB]", e)
+        print("[LOAD]", e)
         _load_from_json()
 
+def _save_json_fallback():
+    """Fallback JSON si PostgreSQL inaccessible."""
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "ticket_config":  {str(k): v for k, v in ticket_config.items()},
+                "ticket_sessions": {str(k): v for k, v in ticket_sessions.items()},
+                "maintenance_mode": maintenance_mode
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[JSON-SAVE]", e)
+
 def _load_from_json():
-    """Fallback : charge depuis bot_data.json (ancien système)."""
+    """Fallback : charge depuis bot_data.json."""
     global ticket_config, ticket_sessions, maintenance_mode
     if not os.path.exists(DATA_FILE): return
     try:
         with open(DATA_FILE, encoding="utf-8") as f: d = json.load(f)
-        for k, v in d.get("ticket_config", {}).items():  ticket_config[int(k)]  = v
+        for k, v in d.get("ticket_config", {}).items():   ticket_config[int(k)]   = v
         for k, v in d.get("ticket_sessions", {}).items(): ticket_sessions[int(k)] = v
         maintenance_mode = d.get("maintenance_mode", False)
-        print("[LOAD-JSON] fallback OK —", len(ticket_config), "guild(s)")
+        print("[JSON] Chargé —", len(ticket_config), "guild(s)")
     except Exception as e:
-        print("[LOAD-JSON]", e)
-
-def _migrate_from_json():
-    """Migration unique JSON → SQLite."""
-    _load_from_json()
-    if ticket_config or ticket_sessions:
-        save_data()
-        print("[MIGRATE] JSON → SQLite terminé.")
+        print("[JSON-LOAD]", e)
 
 def tconf(gid):
     if gid not in ticket_config:
@@ -259,7 +298,7 @@ async def open_ticket(guild, member, type_key):
     s = {"guild_id": guild.id, "user_id": member.id, "type": type_key, "status": "open", "answers": {},
          "opened_at": datetime.now().strftime("%d/%m/%Y %H:%M"), "number": n, "channel_id": ch.id}
     ticket_sessions[ch.id] = s
-    save_data()
+    await save_data()
     await ch.send("👋 " + member.mention + " — Ticket **#" + str(n).zfill(4) + "** " + tt["emoji"] + " " + tt["label"] + "\n" + "━" * 40)
     await _notify_embed(guild, cfg, s, tt)
     return ch, None
@@ -284,7 +323,7 @@ async def run_questions(guild, cfg, channel, member, type_key, existing_session=
         s = {"guild_id": guild.id, "user_id": member.id, "type": type_key, "status": "pending", "answers": {},
              "opened_at": datetime.now().strftime("%d/%m/%Y %H:%M"), "number": n, "channel_id": channel.id}
         ticket_sessions[channel.id] = s
-    save_data()
+    await save_data()
     pending_channels.pop(channel.id, None)
     try:
         await channel.set_permissions(guild.me, view_channel=True, send_messages=True,
@@ -303,7 +342,7 @@ async def run_questions(guild, cfg, channel, member, type_key, existing_session=
     lines.append("━" * 40)
     await channel.send("\n".join(lines))
     await _notify_reactions(guild, cfg, s, tt)
-    save_data()
+    await save_data()
     return s, None
 
 async def _notify_embed(guild, cfg, s, tt):
@@ -319,7 +358,7 @@ async def _notify_embed(guild, cfg, s, tt):
     msg = await sc.send(content=rm, embed=e, view=TicketActionView(guild, s))
     s["staff_msg_id"] = msg.id
     s["staff_chan_id"] = sc.id
-    save_data()
+    await save_data()
 
 async def _notify_reactions(guild, cfg, s, tt):
     if not cfg.get("staff_channel_id"): return
@@ -338,7 +377,7 @@ async def _notify_reactions(guild, cfg, s, tt):
     await msg.add_reaction("❌")
     s["staff_msg_id"] = msg.id
     s["staff_chan_id"] = sc.id
-    save_data()
+    await save_data()
 
 async def _disable_ticket_buttons(guild, s):
     """
@@ -368,7 +407,7 @@ async def do_action(guild, s, action, raison="", actor=None):
     sc  = guild.get_channel(cfg["staff_channel_id"]) if cfg.get("staff_channel_id") else None
 
     if action == "accepted":
-        s["status"] = "accepted"; save_data()
+        s["status"] = "accepted"; await save_data()
         # Désactiver les boutons du message staff (persistant)
         await _disable_ticket_buttons(guild, s)
         # Salon staff — embed complet
@@ -388,7 +427,7 @@ async def do_action(guild, s, action, raison="", actor=None):
             except: pass
 
     elif action == "refused":
-        s["status"] = "refused"; save_data()
+        s["status"] = "refused"; await save_data()
         # Désactiver les boutons du message staff (persistant)
         await _disable_ticket_buttons(guild, s)
         if sc:
@@ -406,7 +445,7 @@ async def do_action(guild, s, action, raison="", actor=None):
             except: pass
 
     elif action == "closed":
-        s["status"] = "closed"; save_data()
+        s["status"] = "closed"; await save_data()
         # Désactiver les boutons du message staff (persistant)
         await _disable_ticket_buttons(guild, s)
         if sc:
@@ -421,7 +460,7 @@ async def do_action(guild, s, action, raison="", actor=None):
                 await ch.delete()
             except: pass
         ticket_sessions.pop(s["channel_id"], None)
-        save_data()
+        await save_data()
 
 # ── Actions enrichies à l'acceptation ─────────────────────────────
 async def do_accept_actions(guild, s, actions: dict):
@@ -503,7 +542,7 @@ async def _delete_active_menu(guild_id: int, channel=None):
 # ── Événements Discord ─────────────────────────────────────────────
 @client.event
 async def on_ready():
-    load_data()
+    await load_data()
     print("[BOT]", str(client.user), " | ", len(client.guilds), "guild(s)")
     # Restaurer les views persistantes pour les tickets en attente
     # On passe message_id= pour que discord.py rattache la view
@@ -570,7 +609,7 @@ async def on_guild_channel_delete(channel):
     if channel.id in ticket_sessions:
         s = ticket_sessions.pop(channel.id)
         print("[BOT] Salon #" + channel.name + " supprimé → session ticket #" + str(s.get("number", "?")) + " retirée.")
-        save_data()
+        await save_data()
     if channel.id in pending_channels:
         pending_channels.pop(channel.id)
         print("[BOT] Salon #" + channel.name + " supprimé → pending retiré.")
@@ -1558,7 +1597,7 @@ class ConfigFullView(discord.ui.View):
         if not is_staff(inter.user, self.guild.id):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         self.cfg["category_id"] = int(inter.data["values"][0])
-        save_data()
+        await save_data()
         cat = self.guild.get_channel(self.cfg["category_id"])
         await inter.response.send_message(
             embed=_e_ok("✅  Catégorie mise à jour", "**" + (cat.name if cat else "?") + "**"), ephemeral=True)
@@ -1567,7 +1606,7 @@ class ConfigFullView(discord.ui.View):
         if not is_staff(inter.user, self.guild.id):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         self.cfg["staff_channel_id"] = int(inter.data["values"][0])
-        save_data()
+        await save_data()
         ch = self.guild.get_channel(self.cfg["staff_channel_id"])
         await inter.response.send_message(
             embed=_e_ok("✅  Salon staff mis à jour", "**#" + (ch.name if ch else "?") + "**"), ephemeral=True)
@@ -1581,7 +1620,7 @@ class ConfigFullView(discord.ui.View):
             await inter.response.edit_message(view=new_view)
             return
         self.cfg["staff_role_id"] = int(val)
-        save_data()
+        await save_data()
         r = self.guild.get_role(self.cfg["staff_role_id"])
         await inter.response.send_message(
             embed=_e_ok("✅  Rôle staff mis à jour", "**" + (r.name if r else "?") + "**"), ephemeral=True)
@@ -1622,7 +1661,7 @@ class RoleSearchModal(discord.ui.Modal, title="🔍  Chercher un rôle par nom")
             await inter.response.send_message(embed=_e_err("❌  Aucun rôle trouvé", "Essaie avec un autre nom."), ephemeral=True); return
         if len(matches) == 1:
             self.cfg["staff_role_id"] = matches[0].id
-            save_data()
+            await save_data()
             await inter.response.send_message(embed=_e_ok("✅  Rôle staff mis à jour", "**" + matches[0].name + "**"), ephemeral=True)
             return
         # Plusieurs correspondances → proposer un select
@@ -1633,7 +1672,7 @@ class RoleSearchModal(discord.ui.Modal, title="🔍  Chercher un rôle par nom")
         guild_ref = self.guild
         async def _pick(i2):
             cfg_ref["staff_role_id"] = int(i2.data["values"][0])
-            save_data()
+            await save_data()
             r2 = guild_ref.get_role(cfg_ref["staff_role_id"])
             await i2.response.send_message(embed=_e_ok("✅  Rôle staff mis à jour", "**" + (r2.name if r2 else "?") + "**"), ephemeral=True)
         sel.callback = _pick
@@ -1689,7 +1728,7 @@ class TypesManagerView(discord.ui.View):
         async def _del(i2):
             key = i2.data["values"][0]
             label = cfg_ref["types"][key]["label"]
-            del cfg_ref["types"][key]; save_data()
+            del cfg_ref["types"][key]; await save_data()
             await i2.response.send_message(embed=_e_ok("🗑️  Type supprimé", "**" + label + "** supprimé."), ephemeral=True)
         sel.callback = _del
         v2 = discord.ui.View(timeout=60); v2.add_item(sel)
@@ -1716,7 +1755,7 @@ class TypeCreateModal(discord.ui.Modal, title="➕  Créer un type de ticket"):
         if not key or not label:
             await inter.response.send_message(embed=_e_err("❌  Clé et nom requis"), ephemeral=True); return
         self.cfg["types"][key] = {"label": label, "emoji": emoji, "questions": qs}
-        save_data()
+        await save_data()
         desc = emoji + " **" + label + "**  `[" + key + "]`\n" + str(len(qs)) + " question(s)"
         await inter.response.send_message(embed=_e_ok("✅  Type créé", desc), ephemeral=True)
 
@@ -1740,7 +1779,7 @@ class TypeEditModal(discord.ui.Modal, title="✏️  Modifier un type de ticket"
         emoji = self.t_emoji.value.strip() or self.cfg["types"][self.key]["emoji"]
         qs    = [q.strip() for q in self.t_qs.value.splitlines() if q.strip()]
         self.cfg["types"][self.key] = {"label": label, "emoji": emoji, "questions": qs}
-        save_data()
+        await save_data()
         await inter.response.send_message(embed=_e_ok("✅  Type mis à jour", emoji + " **" + label + "**  — " + str(len(qs)) + " question(s)"), ephemeral=True)
 
 
@@ -1913,18 +1952,18 @@ async def dispatch(action, p):
     elif action == "maintenance":
         val = p.get("enabled")
         maintenance_mode = bool(val) if val is not None else (not maintenance_mode)
-        save_data()
+        await save_data()
         print("[BOT] maintenance_mode =", maintenance_mode)
         return {"maintenance": maintenance_mode, "ok": True}
     elif action == "lockmenu":
         g = _g(p)
         if not g: return {"error": "Guild not found"}
-        tconf(g.id)["menu_locked"] = True; save_data()
+        tconf(g.id)["menu_locked"] = True; await save_data()
         return {"menu_locked": True, "guild": g.name}
     elif action == "unlockmenu":
         g = _g(p)
         if not g: return {"error": "Guild not found"}
-        tconf(g.id)["menu_locked"] = False; save_data()
+        tconf(g.id)["menu_locked"] = False; await save_data()
         return {"menu_locked": False, "guild": g.name}
 
     elif action == "basecfg":
@@ -1933,7 +1972,7 @@ async def dispatch(action, p):
         cfg = tconf(g.id)
         for k in ("category_id", "staff_channel_id", "staff_role_id"):
             if k in p: cfg[k] = p[k]
-        save_data(); return {"ok": True}
+        await save_data(); return {"ok": True}
 
     elif action == "ttype_list":
         g = _g(p)
@@ -1948,7 +1987,7 @@ async def dispatch(action, p):
         if not ok_cfg: return {"error": "Config incomplète : " + msg_cfg}
         cfg = tconf(g.id)
         cfg["types"][key] = {"label": p.get("label", key), "emoji": p.get("emoji", "🎫"), "questions": p.get("questions", [])}
-        save_data(); return {"ok": True, "key": key}
+        await save_data(); return {"ok": True, "key": key}
 
     elif action == "ttype_edit":
         g = _g(p); key = p.get("key", "").lower()
@@ -1957,14 +1996,14 @@ async def dispatch(action, p):
         if key not in cfg["types"]: return {"error": "Type '" + key + "' not found"}
         for f in ("label", "emoji", "questions"):
             if f in p: cfg["types"][key][f] = p[f]
-        save_data(); return {"ok": True}
+        await save_data(); return {"ok": True}
 
     elif action == "ttype_delete":
         g = _g(p); key = p.get("key", "").lower()
         if not g: return {"error": "Guild not found"}
         cfg = tconf(g.id)
         if key not in cfg["types"]: return {"error": "Type '" + key + "' not found"}
-        del cfg["types"][key]; save_data(); return {"ok": True}
+        del cfg["types"][key]; await save_data(); return {"ok": True}
 
     elif action == "topen":
         g = _g(p)
