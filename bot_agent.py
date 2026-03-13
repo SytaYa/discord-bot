@@ -91,9 +91,9 @@ def save_data():
             # Sessions de tickets
             conn.execute("DELETE FROM ticket_session")
             for ch_id, s in ticket_sessions.items():
-                safe = {k: v for k, v in s.items() if k not in ("staff_msg_id", "staff_chan_id")}
+                # Inclure staff_msg_id et staff_chan_id pour restaurer les views après redémarrage
                 conn.execute("INSERT OR REPLACE INTO ticket_session VALUES (?,?,?)",
-                             (ch_id, s["guild_id"], json.dumps(safe, ensure_ascii=False)))
+                             (ch_id, s["guild_id"], json.dumps(s, ensure_ascii=False)))
     except Exception as e:
         print("[SAVE]", e)
         # Fallback JSON
@@ -316,7 +316,10 @@ async def _notify_embed(guild, cfg, s, tt):
     e.add_field(name="Type",      value=tt["emoji"] + " " + tt["label"], inline=True)
     e.add_field(name="Demandeur", value="<@" + str(s["user_id"]) + ">",  inline=True)
     e.add_field(name="Salon",     value="<#" + str(s["channel_id"]) + ">", inline=True)
-    await sc.send(content=rm, embed=e, view=TicketActionView(guild, s))
+    msg = await sc.send(content=rm, embed=e, view=TicketActionView(guild, s))
+    s["staff_msg_id"] = msg.id
+    s["staff_chan_id"] = sc.id
+    save_data()
 
 async def _notify_reactions(guild, cfg, s, tt):
     if not cfg.get("staff_channel_id"): return
@@ -337,6 +340,22 @@ async def _notify_reactions(guild, cfg, s, tt):
     s["staff_chan_id"] = sc.id
     save_data()
 
+async def _disable_ticket_buttons(guild, s):
+    """
+    Supprime les boutons du message staff après décision.
+    view=None = boutons complètement retirés, embed reste visible.
+    """
+    msg_id  = s.get("staff_msg_id")
+    chan_id  = s.get("staff_chan_id")
+    if not msg_id or not chan_id: return
+    ch = guild.get_channel(chan_id)
+    if not ch: return
+    try:
+        msg = await ch.fetch_message(msg_id)
+        await msg.edit(view=None)   # retire tous les boutons, garde l'embed
+    except Exception as e:
+        print("[BUTTONS]", e)
+
 async def do_action(guild, s, action, raison="", actor=None):
     """
     Exécute une action sur un ticket.
@@ -350,6 +369,8 @@ async def do_action(guild, s, action, raison="", actor=None):
 
     if action == "accepted":
         s["status"] = "accepted"; save_data()
+        # Désactiver les boutons du message staff (persistant)
+        await _disable_ticket_buttons(guild, s)
         # Salon staff — embed complet
         if sc:
             e = discord.Embed(color=C_GREEN, timestamp=datetime.now(timezone.utc))
@@ -368,6 +389,8 @@ async def do_action(guild, s, action, raison="", actor=None):
 
     elif action == "refused":
         s["status"] = "refused"; save_data()
+        # Désactiver les boutons du message staff (persistant)
+        await _disable_ticket_buttons(guild, s)
         if sc:
             e = discord.Embed(color=C_RED, timestamp=datetime.now(timezone.utc))
             e.set_author(name="❌  Ticket #" + str(s["number"]).zfill(4) + " — Refusé")
@@ -384,6 +407,8 @@ async def do_action(guild, s, action, raison="", actor=None):
 
     elif action == "closed":
         s["status"] = "closed"; save_data()
+        # Désactiver les boutons du message staff (persistant)
+        await _disable_ticket_buttons(guild, s)
         if sc:
             e = discord.Embed(color=C_GREY, timestamp=datetime.now(timezone.utc))
             e.set_author(name="🔒  Ticket #" + str(s["number"]).zfill(4) + " — Fermé")
@@ -480,6 +505,21 @@ async def _delete_active_menu(guild_id: int, channel=None):
 async def on_ready():
     load_data()
     print("[BOT]", str(client.user), " | ", len(client.guilds), "guild(s)")
+    # Restaurer les views persistantes pour les tickets en attente
+    # On passe message_id= pour que discord.py rattache la view
+    # au bon message (sinon les boutons après redémarrage ne fonctionnent pas)
+    restored = 0
+    for s in ticket_sessions.values():
+        if s.get("status") not in ("open", "pending"): continue
+        g = client.get_guild(s["guild_id"])
+        if not g: continue
+        msg_id = s.get("staff_msg_id")
+        if msg_id:
+            client.add_view(TicketActionView(g, s), message_id=msg_id)
+        else:
+            client.add_view(TicketActionView(g, s))
+        restored += 1
+    if restored: print("[VIEWS]", restored, "view(s) persistante(s) restaurée(s)")
     # Synchronisation slash commands
     # Purge globale : vide toutes les commandes sur Discord puis re-sync proprement
     try:
@@ -1092,14 +1132,69 @@ class TicketListView(discord.ui.View):
 
 # ── Vue : actions sur ticket ─────────────────────────────────────
 class TicketActionView(discord.ui.View):
-    """Vue initiale : Accepter (modal) / Refuser (modal) / Fermer / Envoyer message."""
+    """Vue persistante : buttons always-on tant que le ticket est pending.
+    timeout=None + custom_id fixes = survie aux redémarrages bot.
+    """
     def __init__(self, guild, s):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)  # jamais d'expiration
         self.guild = guild
         self.s     = s
 
+    def _resolve_session(self, inter: discord.Interaction):
+        """
+        Retrouve la session ticket depuis l'interaction.
+        Priorité : staff_msg_id == message cliqué → channel_id de self.s
+        """
+        # 1. Lookup par message ID (le plus fiable)
+        s = next(
+            (x for x in ticket_sessions.values()
+             if x.get("staff_msg_id") == inter.message.id),
+            None
+        )
+        # 2. Fallback : retrouver via channel_id stocké dans self.s
+        if not s and self.s:
+            ch_id = self.s.get("channel_id")
+            s = ticket_sessions.get(ch_id) if ch_id else None
+        # 3. Fallback final : self.s lui-même
+        if not s:
+            s = self.s
+        if not s:
+            asyncio.create_task(
+                inter.response.send_message(
+                    embed=_e_err("❌  Session introuvable",
+                                "Ce ticket n'existe plus en mémoire."), ephemeral=True))
+            return None
+        # Vérifier que le ticket est encore actionnable
+        if s.get("status") not in ("open", "pending", None):
+            asyncio.create_task(self._disable_silently(inter))
+            return None
+        self.s = s  # mettre à jour la référence locale
+        return s
+
+    async def _disable_silently(self, inter: discord.Interaction):
+        """Désactive les boutons si le ticket est déjà traité."""
+        for item in self.children:
+            item.disabled = True
+        try:
+            if not inter.response.is_done():
+                await inter.response.edit_message(view=self)
+                await inter.followup.send(
+                    embed=_e_warn("⚠️  Déjà traité",
+                                  "Ce ticket a déjà été traité. Les boutons ont été désactivés."),
+                    ephemeral=True)
+            else:
+                await inter.message.edit(view=self)
+        except: pass
+        self.stop()
+
     def _guard(self, inter):
-        return is_staff(inter.user, self.guild.id)
+        if not is_staff(inter.user, self.guild.id):
+            if not inter.response.is_done():
+                asyncio.create_task(
+                    inter.response.send_message(
+                        embed=_e_err("🚫  Accès refusé", "Réservé au staff."), ephemeral=True))
+            return False
+        return True
 
     async def _lock_buttons(self, inter: discord.Interaction):
         """Désactive tous les boutons et met à jour le message original."""
@@ -1110,35 +1205,47 @@ class TicketActionView(discord.ui.View):
         except: pass
         self.stop()
 
-    @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, emoji="✅", row=0)
+    @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success,
+                        emoji="✅", row=0, custom_id="tkt_accept")
     async def accept(self, inter: discord.Interaction, btn: discord.ui.Button):
+        s = self._resolve_session(inter)
+        if not s: return
         if not self._guard(inter):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+            await inter.response.send_message(embed=_e_err("🚫", "Réservé au staff."), ephemeral=True); return
         await inter.response.send_modal(
-            ActionCommentModal(self.guild, self.s, "accepted", inter.message))
+            ActionCommentModal(self.guild, s, "accepted", inter.message))
 
-    @discord.ui.button(label="Refuser", style=discord.ButtonStyle.danger, emoji="❌", row=0)
+    @discord.ui.button(label="Refuser", style=discord.ButtonStyle.danger,
+                        emoji="❌", row=0, custom_id="tkt_refuse")
     async def refuse(self, inter: discord.Interaction, btn: discord.ui.Button):
+        s = self._resolve_session(inter)
+        if not s: return
         if not self._guard(inter):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+            await inter.response.send_message(embed=_e_err("🚫", "Réservé au staff."), ephemeral=True); return
         await inter.response.send_modal(
-            ActionCommentModal(self.guild, self.s, "refused", inter.message))
+            ActionCommentModal(self.guild, s, "refused", inter.message))
 
-    @discord.ui.button(label="Fermer", style=discord.ButtonStyle.secondary, emoji="🔒", row=0)
+    @discord.ui.button(label="Fermer", style=discord.ButtonStyle.secondary,
+                        emoji="🔒", row=0, custom_id="tkt_close")
     async def close(self, inter: discord.Interaction, btn: discord.ui.Button):
+        s = self._resolve_session(inter)
+        if not s: return
         if not self._guard(inter):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+            await inter.response.send_message(embed=_e_err("🚫", "Réservé au staff."), ephemeral=True); return
         for item in self.children: item.disabled = True
         await inter.response.edit_message(view=self)
         self.stop()
-        await do_action(self.guild, self.s, "closed", "", inter.user)
+        await do_action(self.guild, s, "closed", "", inter.user)
         await inter.followup.send(embed=_e_empty("🔒  Fermé", "Salon supprimé sous peu."), ephemeral=True)
 
-    @discord.ui.button(label="Message", style=discord.ButtonStyle.primary, emoji="💬", row=0)
+    @discord.ui.button(label="Message", style=discord.ButtonStyle.primary,
+                        emoji="💬", row=0, custom_id="tkt_msg")
     async def send_msg(self, inter: discord.Interaction, btn: discord.ui.Button):
+        s = self._resolve_session(inter)
+        if not s: return
         if not self._guard(inter):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        await inter.response.send_modal(SendMsgModal(self.guild, self.s))
+            await inter.response.send_message(embed=_e_err("🚫", "Réservé au staff."), ephemeral=True); return
+        await inter.response.send_modal(SendMsgModal(self.guild, s))
 
 
 class ActionCommentModal(discord.ui.Modal):
@@ -1164,11 +1271,9 @@ class ActionCommentModal(discord.ui.Modal):
         # Désactiver les boutons du message d'origine
         if self.origin_msg:
             try:
-                disabled_view = discord.ui.View()
-                for item in TicketActionView(self.guild, self.s).children:
-                    item.disabled = True
-                    disabled_view.add_item(item)
-                await self.origin_msg.edit(view=disabled_view)
+                # Passer view=None supprime complètement les boutons
+                # tout en conservant l'embed visible
+                await self.origin_msg.edit(view=None)
             except: pass
         if self.action == "accepted":
             desc = ("💬 " + commentaire) if commentaire else "Aucun commentaire."
