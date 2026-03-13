@@ -4,11 +4,22 @@
   BOT AGENT v5.0 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
-  v5 : /menu slash command, persistance SQLite, boutons désactivés
-       après action ticket, menu_locked console-only
+  v5.2 : /menu slash command, persistance PostgreSQL, boutons désactivés
+         après action ticket, menu_locked console-only, système musique complet
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
+try:
+    import yt_dlp as youtube_dl
+    YT_DLP_OK = True
+except ImportError:
+    YT_DLP_OK = False
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+    SPOTIPY_OK = True
+except ImportError:
+    SPOTIPY_OK = False
 from discord import app_commands
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -32,7 +43,20 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.1"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.2"  # version affichée dans le message de mise à jour
+
+# ── Spotify credentials (optionnel) ──────────────────────────
+SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+
+# ── État musique par serveur ──────────────────────────────────
+# music_state[guild_id] = {
+#   "queue":      [(title, url, duration, requester_name, thumbnail)],
+#   "current":    (title, url, duration, requester_name, thumbnail) | None,
+#   "volume":     0.5,          # 0.0 – 1.0
+#   "np_channel": channel_id,   # salon où envoyer le "now playing"
+# }
+music_state = {}  # guild_id → dict
 
 # ── État global ────────────────────────────────────────────────────
 maintenance_mode = False          # GLOBAL — touche tous les serveurs
@@ -183,7 +207,12 @@ async def save_data():
                     cfg.get("staff_role_id"),
                     cfg.get("counter", 0),
                     bool(cfg.get("menu_locked")),
-                    json.dumps(cfg.get("types", {}), ensure_ascii=False))
+                    json.dumps({
+                        "types":         cfg.get("types", {}),
+                        "music_enabled": cfg.get("music_enabled", True),
+                        "music_role_id": cfg.get("music_role_id"),
+                        "music_volume":  cfg.get("music_volume", 50),
+                    }, ensure_ascii=False))
                 await conn.execute("DELETE FROM ticket_session")
                 for ch_id, s in ticket_sessions.items():
                     await conn.execute(
@@ -213,13 +242,28 @@ async def load_data():
                 maintenance_mode = row["value"] == "1"
             rows = await conn.fetch("SELECT * FROM guild_config")
             for row in rows:
+                raw_json = json.loads(row["types_json"] or "{}")
+                # Compatibilité : ancien format = dict de types directement
+                if "types" in raw_json:
+                    types_data         = raw_json.get("types", {})
+                    music_enabled_data = raw_json.get("music_enabled", True)
+                    music_role_data    = raw_json.get("music_role_id")
+                    music_volume_data  = raw_json.get("music_volume", 50)
+                else:
+                    types_data         = raw_json   # ancien format
+                    music_enabled_data = True
+                    music_role_data    = None
+                    music_volume_data  = 50
                 ticket_config[row["guild_id"]] = {
                     "category_id":      row["category_id"],
                     "staff_channel_id": row["staff_channel_id"],
                     "staff_role_id":    row["staff_role_id"],
                     "counter":          row["counter"],
                     "menu_locked":      bool(row["menu_locked"]),
-                    "types":            json.loads(row["types_json"] or "{}"),
+                    "types":            types_data,
+                    "music_enabled":    music_enabled_data,
+                    "music_role_id":    music_role_data,
+                    "music_volume":     music_volume_data,
                 }
             rows = await conn.fetch("SELECT * FROM ticket_session")
             for row in rows:
@@ -275,9 +319,18 @@ def tconf(gid):
             "counter":          0,
             "types":            {},
             "menu_locked":      False,
+            # champs musique
+            "music_enabled":    True,   # True = tout le monde, False = rôle requis
+            "music_role_id":    None,   # rôle autorisé si music_enabled=False
+            "music_volume":     50,     # volume par défaut (0–100)
         }
     if "menu_locked" not in ticket_config[gid]:
         ticket_config[gid]["menu_locked"] = False
+    # Migrations des champs musique manquants (serveurs existants)
+    cfg = ticket_config[gid]
+    if "music_enabled" not in cfg: cfg["music_enabled"] = True
+    if "music_role_id" not in cfg: cfg["music_role_id"] = None
+    if "music_volume"  not in cfg: cfg["music_volume"]  = 50
     return ticket_config[gid]
 
 def is_configured(gid):
@@ -698,9 +751,15 @@ async def on_ready():
     try:
         # S'assurer que /menu est bien dans le tree local avant le sync
         existing = {c.name for c in tree.get_commands()}
-        if "menu" not in existing:
-            tree.add_command(slash_menu)
-            log("SLASH", "/menu ajouté au tree local")
+        music_cmds = {
+            "play": slash_play, "stop": slash_stop, "skip": slash_skip,
+            "pause": slash_pause, "resume": slash_resume,
+            "queue": slash_queue, "volume": slash_volume,
+        }
+        for name, fn in {"menu": slash_menu, **music_cmds}.items():
+            if name not in existing:
+                tree.add_command(fn)
+                log("SLASH", f"{name} ajouté au tree local")
         synced = await tree.sync()
         log("SLASH", f"Commandes sync : {[c.name for c in synced]}")
     except discord.errors.HTTPException as e:
@@ -777,6 +836,227 @@ async def on_raw_reaction_add(payload):
     elif e == "❌": await do_action(g, s, "refused",  "", m)
 
 # ── Commandes Discord ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+#  MOTEUR MUSIQUE
+#  Utilise yt_dlp + discord.py voice + FFmpeg
+# ══════════════════════════════════════════════════════════════════
+
+# Options yt_dlp — extraction audio uniquement, pas de téléchargement
+YTDL_OPTS = {
+    "format":          "bestaudio/best",
+    "noplaylist":      False,
+    "quiet":           True,
+    "no_warnings":     True,
+    "extract_flat":    "in_playlist",   # ne pré-charge pas toute la playlist
+    "default_search":  "ytsearch",
+    "source_address":  "0.0.0.0",
+}
+FFMPEG_OPTS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options":        "-vn",
+}
+
+def _mstate(gid: int) -> dict:
+    """Retourne (et initialise si besoin) l'état musique du serveur."""
+    if gid not in music_state:
+        music_state[gid] = {
+            "queue":      [],
+            "current":    None,
+            "volume":     0.5,
+            "np_channel": None,
+        }
+    return music_state[gid]
+
+def _can_use_music(member: discord.Member, gid: int) -> tuple[bool, str]:
+    """Vérifie si member peut utiliser les commandes musique."""
+    cfg = tconf(gid)
+    if cfg.get("music_enabled", True):
+        return True, ""
+    role_id = cfg.get("music_role_id")
+    if not role_id:
+        return True, ""   # pas de rôle configuré → accès libre
+    if any(r.id == role_id for r in member.roles):
+        return True, ""
+    role = member.guild.get_role(role_id)
+    rname = role.name if role else str(role_id)
+    return False, f"🔒 Accès musique réservé au rôle **{rname}**."
+
+async def _resolve_query(query: str) -> list[dict]:
+    """
+    Résout une requête (texte, URL YT, playlist Spotify) en liste de tracks.
+    Chaque track = {"title", "url", "duration", "thumbnail"}
+    """
+    tracks = []
+
+    # ── Playlist Spotify ────────────────────────────────────────
+    if "spotify.com/playlist/" in query and SPOTIPY_OK and SPOTIFY_CLIENT_ID:
+        try:
+            sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+                client_id=SPOTIFY_CLIENT_ID,
+                client_secret=SPOTIFY_CLIENT_SECRET))
+            results = sp.playlist_items(query, fields="items.track(name,artists)", limit=50)
+            for item in results["items"]:
+                t = item.get("track")
+                if not t: continue
+                artist = t["artists"][0]["name"] if t["artists"] else ""
+                title  = f"{t['name']} {artist}".strip()
+                tracks.append({"title": title, "url": None, "duration": 0, "thumbnail": None})
+            return tracks
+        except Exception as e:
+            log("MUSIC", f"Erreur Spotify : {e}")
+            # Fallback vers recherche YT du nom de la playlist
+
+    # ── yt_dlp ──────────────────────────────────────────────────
+    if not YT_DLP_OK:
+        return []
+
+    loop = asyncio.get_event_loop()
+    def _extract():
+        with youtube_dl.YoutubeDL(YTDL_OPTS) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if not info:
+                return []
+            entries = info.get("entries", [info])
+            result = []
+            for e in entries:
+                if not e: continue
+                title     = e.get("title", "Titre inconnu")
+                webpage   = e.get("webpage_url") or e.get("url", "")
+                duration  = e.get("duration") or 0
+                thumbnail = e.get("thumbnail")
+                result.append({"title": title, "url": webpage, "duration": int(duration), "thumbnail": thumbnail})
+            return result
+
+    try:
+        tracks = await loop.run_in_executor(None, _extract)
+    except Exception as e:
+        log("MUSIC", f"Erreur yt_dlp resolve : {e}")
+        tracks = []
+    return tracks
+
+async def _get_stream_url(webpage_url: str) -> str | None:
+    """Résout l'URL de stream audio depuis l'URL de la page."""
+    if not YT_DLP_OK:
+        return None
+    stream_opts = dict(YTDL_OPTS)
+    stream_opts["extract_flat"] = False
+    loop = asyncio.get_event_loop()
+    def _fetch():
+        with youtube_dl.YoutubeDL(stream_opts) as ydl:
+            info = ydl.extract_info(webpage_url, download=False)
+            if not info: return None
+            return info.get("url") or info.get("webpage_url")
+    try:
+        return await loop.run_in_executor(None, _fetch)
+    except Exception as e:
+        log("MUSIC", f"Erreur stream URL : {e}")
+        return None
+
+def _fmt_duration(seconds: int) -> str:
+    if not seconds: return "?"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+async def _play_next(guild: discord.Guild):
+    """Lance le prochain morceau de la file, ou déconnecte si vide."""
+    st  = _mstate(guild.id)
+    vc  = guild.voice_client
+
+    if not vc or not vc.is_connected():
+        st["current"] = None
+        return
+
+    if not st["queue"]:
+        st["current"] = None
+        await asyncio.sleep(2)
+        if vc.is_connected() and not vc.is_playing():
+            await vc.disconnect()
+        return
+
+    track = st["queue"].pop(0)
+    st["current"] = track
+
+    # Résoudre l'URL de stream si pas encore résolue (cas Spotify / flat extract)
+    stream_url = track.get("stream_url")
+    if not stream_url:
+        stream_url = await _get_stream_url(track["url"]) if track.get("url") else None
+    if not stream_url:
+        log("MUSIC", f"[{guild.name}] URL stream introuvable pour '{track['title']}' — skip")
+        await _play_next(guild)
+        return
+    track["stream_url"] = stream_url
+
+    volume = st.get("volume", 0.5)
+    source  = discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS),
+        volume=volume)
+
+    def _after(error):
+        if error:
+            log("MUSIC", f"[{guild.name}] Erreur lecture : {error}")
+        asyncio.run_coroutine_threadsafe(_play_next(guild), client.loop)
+
+    try:
+        vc.play(source, after=_after)
+    except Exception as e:
+        log("MUSIC", f"[{guild.name}] vc.play erreur : {e}")
+        await _play_next(guild)
+        return
+
+    # Embed "Now Playing"
+    ch_id = st.get("np_channel")
+    ch    = guild.get_channel(ch_id) if ch_id else None
+    if ch:
+        try:
+            await ch.send(embed=_now_playing_embed(track, guild))
+        except Exception:
+            pass
+
+def _now_playing_embed(track: dict, guild: discord.Guild) -> discord.Embed:
+    e = discord.Embed(
+        title="🎵  Lecture en cours",
+        description=f"**{track['title']}**",
+        color=0x1DB954,
+        timestamp=datetime.now(timezone.utc)
+    )
+    if track.get("url"):
+        e.description = f"**[{track['title']}]({track['url']})**"
+    if track.get("thumbnail"):
+        e.set_thumbnail(url=track["thumbnail"])
+    e.add_field(name="⏱  Durée",        value=_fmt_duration(track.get("duration", 0)), inline=True)
+    e.add_field(name="👤  Demandé par", value=track.get("requester", "?"),              inline=True)
+    vc = guild.voice_client
+    if vc and vc.channel:
+        e.add_field(name="🔊  Vocal", value=vc.channel.name, inline=True)
+    st = _mstate(guild.id)
+    n  = len(st["queue"])
+    if n:
+        e.set_footer(text=f"{n} morceau(x) suivant(s) dans la file")
+    return e
+
+# ── Autocomplete pour /play ──────────────────────────────────────
+async def _autocomplete_play(inter: discord.Interaction, current: str):
+    if not current or len(current) < 2:
+        return []
+    if not YT_DLP_OK:
+        return []
+    loop = asyncio.get_event_loop()
+    def _search():
+        opts = dict(YTDL_OPTS)
+        opts["extract_flat"] = True
+        opts["playlistend"]  = 5
+        with youtube_dl.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch5:{current}", download=False)
+            if not info: return []
+            return [(e.get("title","?"), e.get("webpage_url","")) for e in info.get("entries", [])]
+    try:
+        results = await loop.run_in_executor(None, _search)
+        return [app_commands.Choice(name=t[:100], value=u) for t, u in results if u][:5]
+    except Exception:
+        return []
+
 async def handle_cmds(message):
     if not message.guild: return
     content = message.content.strip()
@@ -929,6 +1209,242 @@ async def slash_menu(inter: discord.Interaction):
                 await inter.response.send_message(msg, ephemeral=True)
         except Exception:
             pass
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SLASH COMMANDS MUSIQUE
+# ══════════════════════════════════════════════════════════════════
+
+def _music_check(inter: discord.Interaction) -> tuple[bool, str]:
+    """Vérifie : guild OK, vocal OK, accès OK. Retourne (ok, error_msg)."""
+    if not inter.guild:
+        return False, "Cette commande n'est disponible que sur un serveur."
+    ok_, msg = _can_use_music(inter.user, inter.guild.id)
+    if not ok_:
+        return False, msg
+    return True, ""
+
+@tree.command(name="play", description="Lancer de la musique (titre, lien ou playlist Spotify)")
+@app_commands.describe(query="Titre, lien YouTube ou lien de playlist Spotify")
+@app_commands.autocomplete(query=_autocomplete_play)
+async def slash_play(inter: discord.Interaction, query: str):
+    try:
+        ok_, msg = _music_check(inter)
+        if not ok_:
+            await inter.response.send_message(msg, ephemeral=True); return
+        if not inter.user.voice or not inter.user.voice.channel:
+            await inter.response.send_message("🔇 Tu dois être dans un salon vocal.", ephemeral=True); return
+        if not YT_DLP_OK:
+            await inter.response.send_message(
+                "❌ `yt_dlp` n'est pas installé sur le serveur. Ajoute `yt_dlp` à `requirements.txt`.",
+                ephemeral=True); return
+
+        await inter.response.defer()
+
+        # Résoudre la requête
+        tracks = await _resolve_query(query)
+        if not tracks:
+            await inter.followup.send("❌ Aucun résultat pour cette recherche.", ephemeral=True); return
+
+        # Renseigner le demandeur
+        for t in tracks:
+            t["requester"] = inter.user.display_name
+
+        guild = inter.guild
+        st    = _mstate(guild.id)
+        st["np_channel"] = inter.channel_id
+
+        # Rejoindre le vocal si pas connecté
+        vc = guild.voice_client
+        target_channel = inter.user.voice.channel
+        if vc and vc.is_connected():
+            if vc.channel != target_channel:
+                await vc.move_to(target_channel)
+        else:
+            try:
+                vc = await target_channel.connect()
+            except Exception as e:
+                await inter.followup.send(f"❌ Impossible de rejoindre le salon vocal : {e}"); return
+
+        # Synchroniser le volume
+        vol_pct = tconf(guild.id).get("music_volume", 50)
+        st["volume"] = vol_pct / 100
+
+        # Ajouter les tracks à la file
+        was_empty = not st["queue"] and st["current"] is None
+        st["queue"].extend(tracks)
+
+        if len(tracks) == 1:
+            title = tracks[0]["title"]
+            msg   = f"✅ **{title}** ajouté à la file."
+        else:
+            msg = f"✅ **{len(tracks)} morceaux** ajoutés à la file."
+
+        await inter.followup.send(msg)
+
+        # Lancer la lecture si rien ne joue
+        if was_empty and not (vc.is_playing() or vc.is_paused()):
+            await _play_next(guild)
+
+    except discord.errors.InteractionResponded:
+        pass
+    except Exception as e:
+        import traceback
+        log("SLASH", f"/play exception : {e}"); log("SLASH", traceback.format_exc())
+        try:
+            m = "❌ Erreur lors de la lecture. Réessaie."
+            if inter.response.is_done(): await inter.followup.send(m, ephemeral=True)
+            else: await inter.response.send_message(m, ephemeral=True)
+        except Exception: pass
+
+
+@tree.command(name="stop", description="Arrêter la musique et déconnecter le bot du vocal")
+async def slash_stop(inter: discord.Interaction):
+    try:
+        ok_, msg = _music_check(inter)
+        if not ok_:
+            await inter.response.send_message(msg, ephemeral=True); return
+        guild = inter.guild
+        vc    = guild.voice_client if guild else None
+        if not vc or not vc.is_connected():
+            await inter.response.send_message("🔇 Le bot n'est pas dans un salon vocal.", ephemeral=True); return
+        st = _mstate(guild.id)
+        st["queue"].clear()
+        st["current"] = None
+        await vc.disconnect()
+        await inter.response.send_message("⏹  Musique arrêtée et bot déconnecté.")
+    except Exception as e:
+        log("SLASH", f"/stop : {e}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+@tree.command(name="skip", description="Passer au morceau suivant")
+async def slash_skip(inter: discord.Interaction):
+    try:
+        ok_, msg = _music_check(inter)
+        if not ok_:
+            await inter.response.send_message(msg, ephemeral=True); return
+        guild = inter.guild
+        vc    = guild.voice_client if guild else None
+        if not vc or not vc.is_playing():
+            await inter.response.send_message("🔇 Rien n'est en lecture.", ephemeral=True); return
+        st = _mstate(guild.id)
+        cur = st.get("current")
+        title = cur["title"] if cur else "?"
+        vc.stop()   # déclenche _play_next via after callback
+        n = len(st["queue"])
+        msg = f"⏭  **{title}** skippé."
+        if n: msg += f" {n} morceau(x) restant(s)."
+        else: msg += " File vide."
+        await inter.response.send_message(msg)
+    except Exception as e:
+        log("SLASH", f"/skip : {e}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+@tree.command(name="pause", description="Mettre la musique en pause")
+async def slash_pause(inter: discord.Interaction):
+    try:
+        ok_, msg = _music_check(inter)
+        if not ok_:
+            await inter.response.send_message(msg, ephemeral=True); return
+        guild = inter.guild
+        vc    = guild.voice_client if guild else None
+        if not vc or not vc.is_playing():
+            await inter.response.send_message("🔇 Rien n'est en lecture.", ephemeral=True); return
+        vc.pause()
+        await inter.response.send_message("⏸  Lecture mise en pause.")
+    except Exception as e:
+        log("SLASH", f"/pause : {e}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+@tree.command(name="resume", description="Reprendre la lecture")
+async def slash_resume(inter: discord.Interaction):
+    try:
+        ok_, msg = _music_check(inter)
+        if not ok_:
+            await inter.response.send_message(msg, ephemeral=True); return
+        guild = inter.guild
+        vc    = guild.voice_client if guild else None
+        if not vc or not vc.is_paused():
+            await inter.response.send_message("▶️  La lecture n'est pas en pause.", ephemeral=True); return
+        vc.resume()
+        await inter.response.send_message("▶️  Lecture reprise.")
+    except Exception as e:
+        log("SLASH", f"/resume : {e}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+@tree.command(name="queue", description="Afficher la file d'attente")
+async def slash_queue(inter: discord.Interaction):
+    try:
+        if not inter.guild:
+            await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True); return
+        await inter.response.defer(ephemeral=True)
+        st  = _mstate(inter.guild.id)
+        cur = st.get("current")
+        q   = st.get("queue", [])
+        vc  = inter.guild.voice_client
+
+        e = discord.Embed(title="🎶  File d'attente", color=0x1DB954,
+                          timestamp=datetime.now(timezone.utc))
+
+        if cur:
+            status = "▶️  En lecture" if (vc and vc.is_playing()) else "⏸  En pause"
+            e.add_field(
+                name=f"{status}",
+                value="**" + cur["title"] + "**\n⏱ " + _fmt_duration(cur.get("duration",0)) + "  •  👤 " + cur.get("requester","?"),
+                inline=False)
+        else:
+            e.add_field(name="Aucune lecture en cours", value="File vide.", inline=False)
+
+        if q:
+            lines = []
+            for i, t in enumerate(q[:10], 1):
+                lines.append(f"`{i}.` {t['title']}  `{_fmt_duration(t.get('duration',0))}`")
+            if len(q) > 10:
+                lines.append(f"… et {len(q)-10} autre(s)")
+            e.add_field(name=f"📋  Suivants ({len(q)})", value="\n".join(lines), inline=False)
+
+        await inter.followup.send(embed=e, ephemeral=True)
+    except Exception as e:
+        log("SLASH", f"/queue : {e}")
+        try:
+            if inter.response.is_done(): await inter.followup.send("❌ Erreur.", ephemeral=True)
+            else: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+@tree.command(name="volume", description="Régler le volume (0–100)")
+@app_commands.describe(level="Volume de 0 à 100")
+async def slash_volume(inter: discord.Interaction, level: int):
+    try:
+        ok_, msg = _music_check(inter)
+        if not ok_:
+            await inter.response.send_message(msg, ephemeral=True); return
+        if not 0 <= level <= 100:
+            await inter.response.send_message("❌ Le volume doit être entre 0 et 100.", ephemeral=True); return
+        guild = inter.guild
+        st    = _mstate(guild.id)
+        st["volume"] = level / 100
+        # Appliquer immédiatement si en cours de lecture
+        vc = guild.voice_client
+        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = level / 100
+        # Sauvegarder dans la config serveur
+        tconf(guild.id)["music_volume"] = level
+        await save_data()
+        bar = "█" * (level // 10) + "░" * (10 - level // 10)
+        await inter.response.send_message(f"🔊  Volume : `{bar}` **{level}%**")
+    except Exception as e:
+        log("SLASH", f"/volume : {e}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
 
 # ══════════════════════════════════════════════════════════════════
 #  MENU DISCORD STAFF — DESIGN MODERNE
@@ -2375,6 +2891,123 @@ async def _dispatch_inner(action, p):
         m = find_member(str(p.get("member", "")), g)
         if not m: return {"error": "Member not found"}
         await m.ban(reason=p.get("reason", "Console"), delete_message_days=0); return {"ok": True, "banned": m.display_name}
+
+
+    # ── Musique ──────────────────────────────────────────────────
+    elif action == "music_join":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        ch_id = p.get("channel_id")
+        ch    = g.get_channel(ch_id) if ch_id else None
+        if not ch or not isinstance(ch, discord.VoiceChannel):
+            return {"error": "Salon vocal introuvable"}
+        vc = g.voice_client
+        if vc and vc.is_connected():
+            await vc.move_to(ch)
+        else:
+            await ch.connect()
+        return {"ok": True, "channel": ch.name}
+
+    elif action == "music_play":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        if not YT_DLP_OK:
+            return {"error": "yt_dlp non installé"}
+        query     = p.get("query", "")
+        ch_id     = p.get("np_channel_id")
+        requester = p.get("requester", "Console")
+        if not query: return {"error": "query requis"}
+        tracks = await _resolve_query(query)
+        if not tracks: return {"error": "Aucun résultat"}
+        for t in tracks: t["requester"] = requester
+        st = _mstate(g.id)
+        st["np_channel"] = ch_id
+        was_empty = not st["queue"] and st["current"] is None
+        st["queue"].extend(tracks)
+        if was_empty:
+            vc = g.voice_client
+            if vc and vc.is_connected() and not vc.is_playing():
+                await _play_next(g)
+        return {"ok": True, "added": len(tracks), "titles": [t["title"] for t in tracks[:5]]}
+
+    elif action == "music_stop":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        vc = g.voice_client
+        if vc and vc.is_connected():
+            _mstate(g.id)["queue"].clear()
+            _mstate(g.id)["current"] = None
+            await vc.disconnect()
+        return {"ok": True}
+
+    elif action == "music_skip":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        vc = g.voice_client
+        if not vc or not vc.is_playing(): return {"error": "Rien en lecture"}
+        cur = _mstate(g.id).get("current", {})
+        vc.stop()
+        return {"ok": True, "skipped": cur.get("title", "?")}
+
+    elif action == "music_pause":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        vc = g.voice_client
+        if not vc or not vc.is_playing(): return {"error": "Rien en lecture"}
+        vc.pause()
+        return {"ok": True}
+
+    elif action == "music_resume":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        vc = g.voice_client
+        if not vc or not vc.is_paused(): return {"error": "Pas en pause"}
+        vc.resume()
+        return {"ok": True}
+
+    elif action == "music_queue":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        st  = _mstate(g.id)
+        return {
+            "current": st.get("current"),
+            "queue":   st.get("queue", []),
+            "volume":  int(st.get("volume", 0.5) * 100),
+        }
+
+    elif action == "music_volume":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        level = int(p.get("level", 50))
+        level = max(0, min(100, level))
+        st    = _mstate(g.id)
+        st["volume"] = level / 100
+        vc = g.voice_client
+        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = level / 100
+        tconf(g.id)["music_volume"] = level
+        await save_data()
+        return {"ok": True, "volume": level}
+
+    elif action == "music_cfg":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        if "music_enabled" in p:
+            cfg["music_enabled"] = bool(p["music_enabled"])
+        if "music_role_id" in p:
+            cfg["music_role_id"] = p["music_role_id"]
+        if "music_volume" in p:
+            cfg["music_volume"]  = int(p["music_volume"])
+        await save_data()
+        return {"ok": True}
+
+    elif action == "music_vclist":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        vcs = [{"id": c.id, "name": c.name, "members": len(c.members)}
+               for c in g.channels if isinstance(c, discord.VoiceChannel)]
+        return {"voice_channels": vcs}
 
     return {"error": "Unknown action: " + action}
 
