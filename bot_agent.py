@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.0 — hébergé sur Render
+  BOT AGENT v5.3 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
-  v5.2 : /menu slash command, persistance PostgreSQL, boutons désactivés
-         après action ticket, menu_locked console-only, système musique complet
+  v5.0 : architecture initiale
+  v5.2 : /menu slash, PostgreSQL, musique (yt_dlp + FFmpeg + Spotify)
+  v5.3 : fix pipeline musique (timeout autocomplete, blocage silencieux,
+         was_empty, global menu_locked, logs debug complets)
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -45,7 +47,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.2"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.3"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -1070,18 +1072,29 @@ def _resolve_yt_playlist_sync(url: str) -> list[dict]:
 
 # ── Résolution URL YT directe (synchrone) ────────────────────────
 def _resolve_yt_url_sync(url: str) -> list[dict]:
-    try:
-        with youtube_dl.YoutubeDL(YTDL_FLAT) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info: return []
-            webpage = info.get("webpage_url") or url
-            return [{"title":     info.get("title") or "Titre inconnu",
-                     "url":       webpage,
-                     "duration":  int(info.get("duration") or 0),
-                     "thumbnail": info.get("thumbnail")}]
-    except Exception as e:
-        log("MUSIC", f"Erreur URL YT directe : {e}", flush=True)
-        return []
+    """
+    Pour une URL YT directe (venant de l'autocomplete ou saisie manuelle) :
+    on NE refait PAS un appel yt_dlp extract_flat ici — c'est inutile et coûteux
+    (5-20s) et ça fait dépasser le timeout de l'interaction Discord.
+    On construit le track directement avec l'URL fournie.
+    Le titre exact sera récupéré par YTDL_STREAM lors de la résolution du stream.
+    """
+    # Normaliser l'URL : s'assurer qu'on a bien une URL watch?v= propre
+    url = url.strip()
+    # Extraire le video_id pour avoir une URL canonique
+    vid_id = ""
+    if "watch?v=" in url:
+        import re as _re
+        m = _re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
+        if m: vid_id = m.group(1)
+    elif "youtu.be/" in url:
+        import re as _re
+        m = _re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
+        if m: vid_id = m.group(1)
+
+    canonical = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else url
+    log("MUSIC", f"URL directe → track immédiat (pas d'appel yt_dlp) : {canonical}", flush=True)
+    return [{"title": None, "url": canonical, "duration": 0, "thumbnail": None}]
 
 
 # ── Point d'entrée ────────────────────────────────────────────────
@@ -1112,16 +1125,18 @@ async def _resolve_query(query: str) -> list[dict]:
     return await loop.run_in_executor(None, _search_yt_sync, query)
 
 
-# ── Résolution stream CDN audio ───────────────────────────────────
-async def _get_stream_url(webpage_url: str) -> str | None:
+# ── Résolution stream CDN audio + métadonnées ────────────────────
+async def _get_stream_info(webpage_url: str) -> dict | None:
     """
-    webpage_url YT → URL CDN audio (googlevideo.com).
-    YTDL_STREAM avec extract_flat=False : OBLIGATOIRE.
-    Avec True, yt_dlp retourne la webpage_url inchangée → FFmpeg lit du HTML → silence.
+    webpage_url YT → dict { "stream_url", "title", "duration", "thumbnail" }
+    Un seul appel YTDL_STREAM (extract_flat=False) fait tout en une fois :
+    - résout le CDN audio (obligatoire, extract_flat=False)
+    - récupère titre, durée, thumbnail (utile pour les URLs venant d'autocomplete)
+    Retourne None si échec.
     """
     if not YT_DLP_OK:
         return None
-    log("MUSIC", f"Résolution CDN pour : {webpage_url[:70]}", flush=True)
+    log("MUSIC", f"Résolution stream+métadonnées : {webpage_url[:70]}", flush=True)
     loop = asyncio.get_running_loop()
 
     def _fetch():
@@ -1131,14 +1146,20 @@ async def _get_stream_url(webpage_url: str) -> str | None:
             except Exception as ex:
                 log("MUSIC", f"yt_dlp extract_info erreur : {ex}", flush=True)
                 return None
-            if not info: return None
+            if not info:
+                return None
+
+            title     = info.get("title") or None
+            duration  = int(info.get("duration") or 0)
+            thumbnail = info.get("thumbnail")
 
             # Chemin 1 : info["url"] = CDN direct
             stream = info.get("url")
             if stream and stream.startswith("http"):
-                return stream
+                return {"stream_url": stream, "title": title,
+                        "duration": duration, "thumbnail": thumbnail}
 
-            # Chemin 2 : chercher dans formats
+            # Chemin 2 : formats audio-only
             fmts = info.get("formats") or []
             audio_only = [f for f in fmts
                           if f.get("acodec") not in (None, "none")
@@ -1147,27 +1168,35 @@ async def _get_stream_url(webpage_url: str) -> str | None:
             if audio_only:
                 audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
                 log("MUSIC", f"{len(audio_only)} formats audio-only disponibles", flush=True)
-                return audio_only[0]["url"]
+                return {"stream_url": audio_only[0]["url"], "title": title,
+                        "duration": duration, "thumbnail": thumbnail}
 
             # Chemin 3 : premier format avec URL HTTP
             for f in reversed(fmts):
                 u = f.get("url") or ""
                 if u.startswith("http"):
-                    return u
+                    return {"stream_url": u, "title": title,
+                            "duration": duration, "thumbnail": thumbnail}
 
             log("MUSIC", "Aucun format audio valide dans info[formats]", flush=True)
             return None
 
     try:
-        url = await loop.run_in_executor(None, _fetch)
-        if url:
-            log("MUSIC", "CDN résolu ✔", flush=True)
+        result = await loop.run_in_executor(None, _fetch)
+        if result:
+            log("MUSIC", f"Stream+méta résolu ✔ — titre='{result['title'] or '?'}' dur={result['duration']}s", flush=True)
         else:
-            log("MUSIC", "CDN introuvable — aucun format utilisable", flush=True)
-        return url
+            log("MUSIC", "Stream introuvable — aucun format utilisable", flush=True)
+        return result
     except Exception as e:
-        log("MUSIC", f"Exception _get_stream_url : {e}", flush=True)
+        log("MUSIC", f"Exception _get_stream_info : {e}", flush=True)
         return None
+
+
+# Alias rétrocompatible pour les appels qui utilisent encore _get_stream_url
+async def _get_stream_url(webpage_url: str) -> str | None:
+    result = await _get_stream_info(webpage_url)
+    return result["stream_url"] if result else None
 
 
 # ── Utilitaires ───────────────────────────────────────────────────
@@ -1227,19 +1256,28 @@ async def _play_next(guild: discord.Guild):
         track["thumbnail"] = track["thumbnail"] or results[0].get("thumbnail")
         log("MUSIC", f"[{guild.name}] URL YT trouvée : {track['url']}", flush=True)
 
-    # Étape 2 : résoudre le CDN audio
+    # Étape 2 : résoudre le CDN audio (+ récupération titre si manquant)
     stream_url = track.get("stream_url")
     if not stream_url:
-        stream_url = await _get_stream_url(track["url"])
-    if not stream_url:
-        log("MUSIC", f"[{guild.name}] CDN introuvable pour '{track['title']}' — skip", flush=True)
-        ch_id = st.get("np_channel")
-        ch    = guild.get_channel(ch_id) if ch_id else None
-        if ch:
-            try: await ch.send(f"⚠️ Stream audio indisponible pour **{track['title']}** — skippé.")
-            except Exception: pass
-        await _play_next(guild)
-        return
+        stream_info = await _get_stream_info(track["url"])
+        if not stream_info:
+            log("MUSIC", f"[{guild.name}] CDN introuvable pour '{track.get('title') or track['url'][:50]}' — skip", flush=True)
+            ch_id = st.get("np_channel")
+            ch    = guild.get_channel(ch_id) if ch_id else None
+            title_disp = track.get("title") or track["url"][:60]
+            if ch:
+                try: await ch.send(f"⚠️ Stream audio indisponible pour **{title_disp}** — skippé.")
+                except Exception: pass
+            await _play_next(guild)
+            return
+        stream_url = stream_info["stream_url"]
+        # Enrichir le track avec les métadonnées récupérées par YTDL_STREAM
+        if not track.get("title")    and stream_info.get("title"):
+            track["title"]     = stream_info["title"]
+        if not track.get("duration") and stream_info.get("duration"):
+            track["duration"]  = stream_info["duration"]
+        if not track.get("thumbnail") and stream_info.get("thumbnail"):
+            track["thumbnail"] = stream_info["thumbnail"]
     track["stream_url"] = stream_url
     log("MUSIC", f"[{guild.name}] Stream : {stream_url[:80]}", flush=True)
 
@@ -1313,7 +1351,12 @@ def _now_playing_embed(track: dict, guild: discord.Guild) -> discord.Embed:
 
 # ── Autocomplete /play ────────────────────────────────────────────
 async def _autocomplete_play(inter: discord.Interaction, current: str):
-    """5 suggestions YouTube en temps réel."""
+    """
+    5 suggestions YouTube en temps réel (pendant la saisie de /play).
+    Retourne des Choice(name=titre, value=URL_canonique_youtube).
+    La value URL est utilisée directement par slash_play sans appel yt_dlp
+    supplémentaire — cohérence garantie autocomplete ↔ lecture.
+    """
     if not current or len(current) < 2:
         return []
     if not YT_DLP_OK:
@@ -1325,25 +1368,31 @@ async def _autocomplete_play(inter: discord.Interaction, current: str):
         try:
             with youtube_dl.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"ytsearch5:{current}", download=False)
-                if not info: return []
+                if not info:
+                    log("MUSIC", f"Autocomplete '{current[:30]}' : yt_dlp info=None", flush=True)
+                    return []
                 results = []
                 for e in (info.get("entries") or []):
                     if not e: continue
-                    title   = (e.get("title") or "?")[:100]
-                    vid_id  = e.get("id") or ""
-                    webpage = e.get("webpage_url") or e.get("url") or ""
-                    if vid_id and not webpage.startswith("http"):
-                        webpage = f"https://www.youtube.com/watch?v={vid_id}"
-                    if webpage:
-                        results.append((title, webpage))
+                    title  = (e.get("title") or "?")[:100]
+                    vid_id = e.get("id") or ""
+                    if not vid_id:
+                        continue  # sans id on ne peut pas construire une URL fiable
+                    # Toujours construire une URL canonique depuis l'id
+                    # (évite les URLs malformées ou manquantes selon la version yt_dlp)
+                    webpage = f"https://www.youtube.com/watch?v={vid_id}"
+                    results.append((title, webpage))
+                log("MUSIC", f"Autocomplete '{current[:30]}' → {len(results)} suggestions", flush=True)
                 return results
-        except Exception:
+        except Exception as ex:
+            log("MUSIC", f"Autocomplete erreur : {ex}", flush=True)
             return []
 
     try:
         results = await loop.run_in_executor(None, _search)
         return [app_commands.Choice(name=t, value=u) for t, u in results if u][:5]
-    except Exception:
+    except Exception as ex:
+        log("MUSIC", f"Autocomplete exception executor : {ex}", flush=True)
         return []
 
 async def handle_cmds(message):
@@ -1530,8 +1579,18 @@ async def slash_play(inter: discord.Interaction, query: str):
 
         await inter.response.defer()
 
-        # Résoudre la requête
-        tracks = await _resolve_query(query)
+        qtype = _classify_query(query)
+        log("MUSIC", f"/play reçu — query='{query[:60]}' type={qtype} user={inter.user}", flush=True)
+
+        # Résoudre la requête avec timeout de sécurité
+        # Discord donne 15 min pour followup après defer(), mais yt_dlp peut bloquer
+        try:
+            tracks = await asyncio.wait_for(_resolve_query(query), timeout=30.0)
+        except asyncio.TimeoutError:
+            log("MUSIC", f"/play TIMEOUT 30s pour query='{query[:60]}'", flush=True)
+            await inter.followup.send("⏱ Recherche trop longue (timeout 30s). Réessaie.", ephemeral=True)
+            return
+        log("MUSIC", f"/play résolu : {len(tracks)} track(s)", flush=True)
         if not tracks:
             await inter.followup.send("❌ Aucun résultat pour cette recherche.", ephemeral=True); return
 
@@ -1548,11 +1607,17 @@ async def slash_play(inter: discord.Interaction, query: str):
         target_channel = inter.user.voice.channel
         if vc and vc.is_connected():
             if vc.channel != target_channel:
+                log("MUSIC", f"Déplacement vocal → {target_channel.name}", flush=True)
                 await vc.move_to(target_channel)
+            else:
+                log("MUSIC", f"Déjà connecté à {target_channel.name}", flush=True)
         else:
             try:
+                log("MUSIC", f"Connexion au vocal : {target_channel.name}", flush=True)
                 vc = await target_channel.connect()
+                log("MUSIC", "Connexion vocale OK ✔", flush=True)
             except Exception as e:
+                log("MUSIC", f"Erreur connexion vocal : {e}", flush=True)
                 await inter.followup.send(f"❌ Impossible de rejoindre le salon vocal : {e}"); return
 
         # Synchroniser le volume
@@ -1560,7 +1625,9 @@ async def slash_play(inter: discord.Interaction, query: str):
         st["volume"] = vol_pct / 100
 
         # Ajouter les tracks à la file
-        was_empty = not st["queue"] and st["current"] is None
+        # was_empty : on vérifie aussi vc.is_playing() car current peut être orphelin
+        # (morceau précédent planté → current != None mais rien ne joue)
+        was_empty = not st["queue"] and not (vc.is_playing() or vc.is_paused())
         st["queue"].extend(tracks)
 
         if len(tracks) == 1:
@@ -1572,8 +1639,12 @@ async def slash_play(inter: discord.Interaction, query: str):
         await inter.followup.send(msg)
 
         # Lancer la lecture si rien ne joue
+        log("MUSIC", f"was_empty={was_empty} is_playing={vc.is_playing()} is_paused={vc.is_paused()}", flush=True)
         if was_empty and not (vc.is_playing() or vc.is_paused()):
+            log("MUSIC", "Lancement _play_next ✔", flush=True)
             await _play_next(guild)
+        else:
+            log("MUSIC", f"Lecture déjà en cours — {len(st['queue'])} en file", flush=True)
 
     except discord.errors.InteractionResponded:
         pass
@@ -2924,7 +2995,6 @@ def _g(p):
     return client.guilds[0] if client.guilds else None
 
 async def dispatch(action, p):
-    global maintenance_mode, menu_locked
     try:
         return await _dispatch_inner(action, p)
     except Exception as e:
@@ -2934,7 +3004,7 @@ async def dispatch(action, p):
         return {"error": f"Dispatch error: {e}"}
 
 async def _dispatch_inner(action, p):
-    global maintenance_mode, menu_locked
+    global maintenance_mode
 
     if action == "status":
         guilds = []
