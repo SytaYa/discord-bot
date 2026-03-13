@@ -875,28 +875,44 @@ async def handle_cmds(message):
 # ════════════════════════════════════════════════════════════════
 @tree.command(name="menu", description="Ouvrir le panel de gestion staff")
 async def slash_menu(inter: discord.Interaction):
-    # defer() immédiat — répond à Discord en < 1s pour éviter l'expiration
-    # Le vrai contenu est envoyé via followup juste après
-    if not inter.guild:
-        await inter.response.send_message(
-            "Cette commande n'est disponible que sur un serveur.", ephemeral=True)
-        return
-    guild = inter.guild
-    cfg   = tconf(guild.id)
-    if maintenance_mode:
-        await inter.response.send_message(
-            "🔧 Le bot est actuellement en maintenance. Réessaie plus tard.", ephemeral=True)
-        return
-    if cfg.get("menu_locked"):
-        await inter.response.send_message(
-            "🔒 Le menu est actuellement désactivé par l'administration.", ephemeral=True)
-        return
-    if not is_staff(inter.user, guild.id):
-        await inter.response.send_message("🚫 Accès réservé au staff.", ephemeral=True)
-        return
-    # defer() public — Discord reçoit la réponse immédiate, on a 15 min pour le followup
-    await inter.response.defer(ephemeral=False)
-    await send_staff_menu_inter(inter, guild)
+    try:
+        # Vérifications rapides (< 1 ms) — répondent avant tout traitement lent
+        if not inter.guild:
+            await inter.response.send_message(
+                "Cette commande n'est disponible que sur un serveur.", ephemeral=True)
+            return
+        guild = inter.guild
+        cfg   = tconf(guild.id)
+        if maintenance_mode:
+            await inter.response.send_message(
+                "🔧 Le bot est actuellement en maintenance. Réessaie plus tard.", ephemeral=True)
+            return
+        if cfg.get("menu_locked"):
+            await inter.response.send_message(
+                "🔒 Le menu est actuellement désactivé par l'administration.", ephemeral=True)
+            return
+        if not is_staff(inter.user, guild.id):
+            await inter.response.send_message("🚫 Accès réservé au staff.", ephemeral=True)
+            return
+        # defer() immédiat — Discord reçoit la réponse en < 1s, on a 15 min pour le followup
+        await inter.response.defer(ephemeral=False)
+        await send_staff_menu_inter(inter, guild)
+    except discord.errors.InteractionResponded:
+        # L'interaction a déjà été répondue (cas de double-clic rapide)
+        pass
+    except Exception as e:
+        import traceback
+        log("SLASH", f"/menu exception : {e}")
+        log("SLASH", traceback.format_exc())
+        # Tenter de notifier l'utilisateur si possible
+        try:
+            msg = "❌ Une erreur interne s'est produite. Réessaie dans quelques secondes."
+            if inter.response.is_done():
+                await inter.followup.send(msg, ephemeral=True)
+            else:
+                await inter.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 # ══════════════════════════════════════════════════════════════════
 #  MENU DISCORD STAFF — DESIGN MODERNE
@@ -2050,12 +2066,36 @@ def _vsig(body, sig):
 async def handle_health(req): return web.Response(text="ok")
 
 async def handle_remote(req):
-    if not REMOTE_ENABLED: return web.json_response({"error": "Remote disabled"}, status=403)
+    if not REMOTE_ENABLED:
+        return web.json_response({"error": "Remote disabled"}, status=403)
     body = await req.read()
-    if not _vsig(body, req.headers.get("X-Signature", "")): return web.json_response({"error": "Unauthorized"}, status=401)
-    try:    p = json.loads(body)
-    except: return web.json_response({"error": "Invalid JSON"}, status=400)
-    return web.json_response(await dispatch(p.get("action", ""), p))
+    if not _vsig(body, req.headers.get("X-Signature", "")):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    # Parse du payload entrant
+    try:
+        p = json.loads(body)
+    except json.JSONDecodeError as e:
+        log("API", f"Payload JSON invalide : {e} — body brut : {body[:200]}")
+        return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+    action = p.get("action", "")
+    log("API", f"Action reçue : '{action}' — guild_id={p.get('guild_id')}")
+    # Dispatch protégé — toujours renvoyer du JSON valide
+    try:
+        result = await dispatch(action, p)
+        # Sérialiser pour détecter les objets non-sérialisables avant d'envoyer
+        raw = json.dumps(result)
+        return web.Response(
+            text=raw,
+            content_type="application/json"
+        )
+    except (TypeError, ValueError) as e:
+        log("API", f"Erreur sérialisation réponse action='{action}' : {e}")
+        return web.json_response({"error": f"Serialization error: {e}"}, status=500)
+    except Exception as e:
+        import traceback
+        log("API", f"Exception non gérée action='{action}' : {e}")
+        log("API", traceback.format_exc())
+        return web.json_response({"error": f"Internal error: {e}"}, status=500)
 
 def _g(p):
     gid = p.get("guild_id")
@@ -2063,6 +2103,16 @@ def _g(p):
     return client.guilds[0] if client.guilds else None
 
 async def dispatch(action, p):
+    global maintenance_mode, menu_locked
+    try:
+        return await _dispatch_inner(action, p)
+    except Exception as e:
+        import traceback
+        log("API", f"Exception dans dispatch action='{action}' : {e}")
+        log("API", traceback.format_exc())
+        return {"error": f"Dispatch error: {e}"}
+
+async def _dispatch_inner(action, p):
     global maintenance_mode, menu_locked
 
     if action == "status":
