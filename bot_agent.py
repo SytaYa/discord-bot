@@ -16,6 +16,14 @@ from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
+
+def log(tag: str, *args):
+    """Log horodate avec flush immediat — visible dans Render sans buffer."""
+    from datetime import datetime
+    ts  = datetime.now().strftime("%H:%M:%S")
+    msg = " ".join(str(a) for a in args)
+    print(f"[{ts}] [{tag}] {msg}", flush=True)
+
 TOKEN          = os.getenv("DISCORD_TOKEN", "")
 REMOTE_SECRET  = os.getenv("BOT_REMOTE_SECRET", "changeme")
 REMOTE_ENABLED = os.getenv("BOT_REMOTE_ENABLED", "true").lower() == "true"
@@ -35,76 +43,124 @@ pending_channels = {}
 active_menu_msgs = {}
 
 # ════════════════════════════════════════════════════════════════
-#  PERSISTANCE SQLITE
-#  Toutes les données survivent aux redémarrages / redéploiements
-# ════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════
 #  PERSISTANCE POSTGRESQL (Supabase)
-#  Toutes les données survivent aux redémarrages et redéploiements.
 #  Variable d'env requise : DATABASE_URL
-#  Format : postgresql://user:password@host:5432/dbname
+#  Format : postgresql://user:password@host:5432/postgres
 # ════════════════════════════════════════════════════════════════
 
 async def init_db():
-    """Crée le pool de connexions et les tables si nécessaire."""
+    """Initialise le pool PostgreSQL. Appele au demarrage dans load_data()."""
     global _db_pool
+
+    log("DB", ">>> Entree dans init_db()")
+
+    # Verification DATABASE_URL
     if not DATABASE_URL:
-        print("[DB] ⚠  DATABASE_URL non définie — persistance désactivée (données en mémoire seulement)")
+        log("DB", "DATABASE_URL est VIDE ou non definie dans les variables d'env")
+        log("DB", "-> Mode memoire uniquement (donnees perdues au redemarrage)")
         return
+
+    safe_url = DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL
+    log("DB", f"DATABASE_URL detectee -> hote : {safe_url}")
+    log("DB", "Tentative de connexion PostgreSQL (SSL=require)...")
+
     try:
-        _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        _db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            ssl="require",
+            command_timeout=30,
+            server_settings={"application_name": "discord_bot"}
+        )
+        log("DB", "Pool de connexions cree OK")
+    except Exception as e:
+        log("DB", f"ECHEC connexion PostgreSQL : {e}")
+        log("DB", "-> Fallback JSON active")
+        _load_from_json()
+        return
+
+    # Creation des tables — requetes separees pour isoler les erreurs
+    log("DB", "Creation / verification des tables...")
+    try:
         async with _db_pool.acquire() as conn:
+            log("DB", "  -> CREATE TABLE kv")
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS kv (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
-                );
+                )
+            """)
+            log("DB", "  -> CREATE TABLE guild_config")
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS guild_config (
-                    guild_id         BIGINT PRIMARY KEY,
+                    guild_id         BIGINT  PRIMARY KEY,
                     category_id      BIGINT,
                     staff_channel_id BIGINT,
                     staff_role_id    BIGINT,
                     counter          INTEGER DEFAULT 0,
                     menu_locked      BOOLEAN DEFAULT FALSE,
                     types_json       TEXT    DEFAULT '{}'
-                );
+                )
+            """)
+            log("DB", "  -> CREATE TABLE ticket_session")
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ticket_session (
                     channel_id  BIGINT PRIMARY KEY,
                     guild_id    BIGINT NOT NULL,
                     data_json   TEXT   NOT NULL
-                );
+                )
             """)
-        print("[DB] PostgreSQL connecté et tables vérifiées ✔")
-        # Migration depuis JSON si la DB est vide
-        await _maybe_migrate_json()
+        log("DB", "Tables OK")
     except Exception as e:
-        print("[DB] Erreur connexion :", e)
-        print("[DB] Fallback → chargement JSON")
+        log("DB", f"ECHEC creation tables : {e}")
+        await _db_pool.close()
+        _db_pool = None
+        log("DB", "-> Fallback JSON active")
         _load_from_json()
+        return
+
+    # Test de lecture pour confirmer que la DB repond vraiment
+    try:
+        async with _db_pool.acquire() as conn:
+            n_cfg = await conn.fetchval("SELECT COUNT(*) FROM guild_config")
+            n_tkt = await conn.fetchval("SELECT COUNT(*) FROM ticket_session")
+        log("DB", f"Connexion confirmee : {n_cfg} config(s), {n_tkt} session(s) en base")
+    except Exception as e:
+        log("DB", f"ECHEC test lecture : {e}")
+
+    await _maybe_migrate_json()
+
 
 async def _maybe_migrate_json():
-    """Migration unique bot_data.json → PostgreSQL si la DB est vide."""
-    if not _db_pool: return
-    async with _db_pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM guild_config")
-    if count == 0 and os.path.exists(DATA_FILE):
-        _load_from_json()
-        if ticket_config or ticket_sessions:
-            await save_data()
-            print("[MIGRATE] bot_data.json → PostgreSQL terminé.")
+    """Migration unique bot_data.json -> PostgreSQL si la DB est vide."""
+    if not _db_pool:
+        return
+    try:
+        async with _db_pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM guild_config")
+        if count == 0 and os.path.exists(DATA_FILE):
+            log("DB", "DB vide + bot_data.json trouve -> migration en cours...")
+            _load_from_json()
+            if ticket_config or ticket_sessions:
+                await save_data()
+                log("DB", "Migration bot_data.json -> PostgreSQL terminee")
+    except Exception as e:
+        log("DB", f"Erreur migration : {e}")
+
 
 async def save_data():
-    """Sauvegarde toutes les configs et sessions en base."""
+    """Sauvegarde configs et sessions en base (fallback JSON si DB indispo)."""
     if not _db_pool:
-        _save_json_fallback(); return
+        _save_json_fallback()
+        return
     try:
         async with _db_pool.acquire() as conn:
             async with conn.transaction():
-                # Maintenance globale
                 await conn.execute(
-                    "INSERT INTO kv VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2",
+                    "INSERT INTO kv VALUES($1,$2) "
+                    "ON CONFLICT(key) DO UPDATE SET value=$2",
                     "maintenance_mode", "1" if maintenance_mode else "0")
-                # Configs par serveur
                 for gid, cfg in ticket_config.items():
                     await conn.execute("""
                         INSERT INTO guild_config
@@ -126,7 +182,6 @@ async def save_data():
                     cfg.get("counter", 0),
                     bool(cfg.get("menu_locked")),
                     json.dumps(cfg.get("types", {}), ensure_ascii=False))
-                # Sessions tickets — suppression + réinsertion complète
                 await conn.execute("DELETE FROM ticket_session")
                 for ch_id, s in ticket_sessions.items():
                     await conn.execute(
@@ -134,21 +189,26 @@ async def save_data():
                         ch_id, s["guild_id"],
                         json.dumps(s, ensure_ascii=False))
     except Exception as e:
-        print("[SAVE]", e)
+        log("DB", f"Erreur save_data : {e} -> fallback JSON")
         _save_json_fallback()
 
+
 async def load_data():
-    """Charge toutes les données depuis PostgreSQL au démarrage."""
+    """Charge toutes les donnees depuis PostgreSQL au demarrage."""
     global ticket_config, ticket_sessions, maintenance_mode
+
+    log("DB", "Chargement des donnees...")
     await init_db()
+
     if not _db_pool:
-        return  # init_db a déjà fait le fallback JSON si nécessaire
+        log("DB", "Pool indisponible — donnees depuis JSON (ou memoire vide)")
+        return
+
     try:
         async with _db_pool.acquire() as conn:
-            # Maintenance
             row = await conn.fetchrow("SELECT value FROM kv WHERE key='maintenance_mode'")
-            if row: maintenance_mode = row["value"] == "1"
-            # Configs serveurs
+            if row:
+                maintenance_mode = row["value"] == "1"
             rows = await conn.fetch("SELECT * FROM guild_config")
             for row in rows:
                 ticket_config[row["guild_id"]] = {
@@ -159,42 +219,48 @@ async def load_data():
                     "menu_locked":      bool(row["menu_locked"]),
                     "types":            json.loads(row["types_json"] or "{}"),
                 }
-            # Sessions tickets
             rows = await conn.fetch("SELECT * FROM ticket_session")
             for row in rows:
                 ticket_sessions[row["channel_id"]] = json.loads(row["data_json"])
-        print("[DB]", len(ticket_config), "guild(s),", len(ticket_sessions), "ticket(s)",
-              "| maintenance=" + str(maintenance_mode))
+        log("DB", f"Charge : {len(ticket_config)} guild(s), {len(ticket_sessions)} ticket(s)"
+            f" | maintenance={'ON' if maintenance_mode else 'OFF'}")
     except Exception as e:
-        print("[LOAD]", e)
+        log("DB", f"Erreur load_data : {e} -> fallback JSON")
         _load_from_json()
 
+
 def _save_json_fallback():
-    """Fallback JSON si PostgreSQL inaccessible."""
+    """Sauvegarde JSON d'urgence si PostgreSQL est inaccessible."""
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump({
-                "ticket_config":  {str(k): v for k, v in ticket_config.items()},
+                "ticket_config":   {str(k): v for k, v in ticket_config.items()},
                 "ticket_sessions": {str(k): v for k, v in ticket_sessions.items()},
                 "maintenance_mode": maintenance_mode
             }, f, ensure_ascii=False, indent=2)
+        log("DB", "Fallback JSON sauvegarde")
     except Exception as e:
-        print("[JSON-SAVE]", e)
+        log("DB", f"Erreur JSON fallback : {e}")
+
 
 def _load_from_json():
-    """Fallback : charge depuis bot_data.json."""
+    """Charge depuis bot_data.json (fallback ou migration)."""
     global ticket_config, ticket_sessions, maintenance_mode
-    if not os.path.exists(DATA_FILE): return
+    if not os.path.exists(DATA_FILE):
+        log("DB", "bot_data.json introuvable — demarrage avec donnees vides")
+        return
     try:
-        with open(DATA_FILE, encoding="utf-8") as f: d = json.load(f)
-        for k, v in d.get("ticket_config", {}).items():   ticket_config[int(k)]   = v
-        for k, v in d.get("ticket_sessions", {}).items(): ticket_sessions[int(k)] = v
+        with open(DATA_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        for k, v in d.get("ticket_config", {}).items():
+            ticket_config[int(k)] = v
+        for k, v in d.get("ticket_sessions", {}).items():
+            ticket_sessions[int(k)] = v
         maintenance_mode = d.get("maintenance_mode", False)
-        print("[JSON] Chargé —", len(ticket_config), "guild(s)")
+        log("DB", f"JSON charge : {len(ticket_config)} guild(s), {len(ticket_sessions)} ticket(s)")
     except Exception as e:
-        print("[JSON-LOAD]", e)
+        log("DB", f"Erreur lecture JSON : {e}")
 
-def tconf(gid):
     if gid not in ticket_config:
         ticket_config[gid] = {"category_id": None, "staff_channel_id": None,
                                "staff_role_id": None, "counter": 0, "types": {},
@@ -393,7 +459,7 @@ async def _disable_ticket_buttons(guild, s):
         msg = await ch.fetch_message(msg_id)
         await msg.edit(view=None)   # retire tous les boutons, garde l'embed
     except Exception as e:
-        print("[BUTTONS]", e)
+        log("BUTTONS", str(e))
 
 async def do_action(guild, s, action, raison="", actor=None):
     """
@@ -542,8 +608,9 @@ async def _delete_active_menu(guild_id: int, channel=None):
 # ── Événements Discord ─────────────────────────────────────────────
 @client.event
 async def on_ready():
+    log("BOT", "Connecte en tant que", str(client.user))
+    log("BOT", f"{len(client.guilds)} serveur(s) visibles")
     await load_data()
-    print("[BOT]", str(client.user), " | ", len(client.guilds), "guild(s)")
     # Restaurer les views persistantes pour les tickets en attente
     # On passe message_id= pour que discord.py rattache la view
     # au bon message (sinon les boutons après redémarrage ne fonctionnent pas)
@@ -558,7 +625,7 @@ async def on_ready():
         else:
             client.add_view(TicketActionView(g, s))
         restored += 1
-    if restored: print("[VIEWS]", restored, "view(s) persistante(s) restaurée(s)")
+    if restored: log("VIEWS", str(restored) + " view(s) persistante(s) restauree(s)")
     # Synchronisation slash commands
     # Purge globale : vide toutes les commandes sur Discord puis re-sync proprement
     try:
@@ -566,9 +633,9 @@ async def on_ready():
         await tree.sync()                 # envoie liste vide → supprime tout sur Discord
         tree.add_command(slash_menu)      # réenregistre uniquement /menu
         synced = await tree.sync()        # pousse la liste finale
-        print("[SLASH] Commandes actives :", [c.name for c in synced])
+        log("SLASH", "Commandes actives :", [c.name for c in synced])
     except Exception as e:
-        print("[SLASH] Erreur sync :", e)
+        log("SLASH", "Erreur sync :", e)
     total = 0
     for g in client.guilds:
         cfg = ticket_config.get(g.id)
@@ -585,7 +652,7 @@ async def on_ready():
                                        "detected_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                                        "owner_id": owner_id}
             total += 1
-    if total: print("[BOT]", total, "salon(s) existant(s) détecté(s)")
+    if total: log("BOT", str(total) + " salon(s) existant(s) detecte(s)")
 
 @client.event
 async def on_guild_channel_create(channel):
@@ -601,18 +668,18 @@ async def on_guild_channel_create(channel):
     pending_channels[channel.id] = {"guild_id": channel.guild.id, "channel": channel,
                                     "detected_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                                     "owner_id": owner_id}
-    print("[BOT] Salon détecté : #" + channel.name + (" — owner: " + str(owner_id) if owner_id else ""))
+    log("BOT", "Salon detecte : #" + channel.name + (" — owner: " + str(owner_id) if owner_id else ""))
 
 @client.event
 async def on_guild_channel_delete(channel):
     """Nettoie les sessions et pending quand un salon ticket est supprimé manuellement."""
     if channel.id in ticket_sessions:
         s = ticket_sessions.pop(channel.id)
-        print("[BOT] Salon #" + channel.name + " supprimé → session ticket #" + str(s.get("number", "?")) + " retirée.")
+        log("BOT", "Salon #" + channel.name + " supprime -> session ticket #" + str(s.get("number", "?")) + " retiree.")
         await save_data()
     if channel.id in pending_channels:
         pending_channels.pop(channel.id)
-        print("[BOT] Salon #" + channel.name + " supprimé → pending retiré.")
+        log("BOT", "Salon #" + channel.name + " supprime -> pending retire.")
 
 @client.event
 async def on_message(message):
@@ -1953,7 +2020,7 @@ async def dispatch(action, p):
         val = p.get("enabled")
         maintenance_mode = bool(val) if val is not None else (not maintenance_mode)
         await save_data()
-        print("[BOT] maintenance_mode =", maintenance_mode)
+        log("BOT", "maintenance_mode =", maintenance_mode)
         return {"maintenance": maintenance_mode, "ok": True}
     elif action == "lockmenu":
         g = _g(p)
@@ -2181,14 +2248,26 @@ async def dispatch(action, p):
 
 # ── Lancement ──────────────────────────────────────────────────────
 async def main():
-    if not TOKEN: print("[ERROR] DISCORD_TOKEN manquant."); sys.exit(1)
+    log("BOOT", "=" * 52)
+    log("BOOT", "Demarrage bot_agent.py")
+    log("BOOT", "=" * 52)
+    log("BOOT", f"PORT           = {PORT}")
+    log("BOOT", f"REMOTE_ENABLED = {REMOTE_ENABLED}")
+    log("BOOT", "DISCORD_TOKEN  = " + ("OK" if TOKEN else "MANQUANT"))
+    log("BOOT", "DATABASE_URL   = " + ("OK (" + DATABASE_URL.split('@')[-1] + ")" if DATABASE_URL else "NON DEFINIE — persistance desactivee"))
+    log("BOOT", "BOT_REMOTE_SECRET = " + ("OK" if REMOTE_SECRET != 'changeme' else "valeur par defaut (changeme)"))
+    if not TOKEN:
+        log("BOOT", "DISCORD_TOKEN manquant — arret.")
+        sys.exit(1)
+    log("HTTP", "Demarrage serveur HTTP...")
     app = web.Application()
     app.router.add_get("/health", handle_health)
     app.router.add_post("/remote", handle_remote)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    print("[HTTP] 0.0.0.0:" + str(PORT))
+    log("HTTP", f"Serveur HTTP actif sur 0.0.0.0:{PORT}")
+    log("BOT", "Connexion a Discord...")
     await client.start(TOKEN)
 
 if __name__ == "__main__":
