@@ -263,10 +263,19 @@ def _load_from_json():
     except Exception as e:
         log("DB", f"Erreur lecture JSON : {e}")
 
+
+
+def tconf(gid):
+    """Retourne la config du serveur gid, en l'initialisant si absente."""
     if gid not in ticket_config:
-        ticket_config[gid] = {"category_id": None, "staff_channel_id": None,
-                               "staff_role_id": None, "counter": 0, "types": {},
-                               "menu_locked": False}
+        ticket_config[gid] = {
+            "category_id":      None,
+            "staff_channel_id": None,
+            "staff_role_id":    None,
+            "counter":          0,
+            "types":            {},
+            "menu_locked":      False,
+        }
     if "menu_locked" not in ticket_config[gid]:
         ticket_config[gid]["menu_locked"] = False
     return ticket_config[gid]
@@ -682,15 +691,22 @@ async def on_ready():
         restored += 1
     if restored: log("VIEWS", str(restored) + " view(s) persistante(s) restauree(s)")
     # Synchronisation slash commands
-    # Purge globale : vide toutes les commandes sur Discord puis re-sync proprement
+    # On ne fait PAS de purge globale à chaque redémarrage : ça génère
+    # "Intégration inconnue" sur Discord car la commande est supprimée puis
+    # recréée avec un nouvel ID à chaque boot.
+    # Stratégie : sync directe sans effacer — Discord ne recrée que si nécessaire.
     try:
-        tree.clear_commands(guild=None)   # vide le cache local
-        await tree.sync()                 # envoie liste vide → supprime tout sur Discord
-        tree.add_command(slash_menu)      # réenregistre uniquement /menu
-        synced = await tree.sync()        # pousse la liste finale
-        log("SLASH", "Commandes actives :", [c.name for c in synced])
+        # S'assurer que /menu est bien dans le tree local avant le sync
+        existing = {c.name for c in tree.get_commands()}
+        if "menu" not in existing:
+            tree.add_command(slash_menu)
+            log("SLASH", "/menu ajouté au tree local")
+        synced = await tree.sync()
+        log("SLASH", f"Commandes sync : {[c.name for c in synced]}")
+    except discord.errors.HTTPException as e:
+        log("SLASH", f"Erreur HTTP sync : {e.status} {e.text}")
     except Exception as e:
-        log("SLASH", "Erreur sync :", e)
+        log("SLASH", f"Erreur sync : {e}")
     total = 0
     for g in client.guilds:
         cfg = ticket_config.get(g.id)
