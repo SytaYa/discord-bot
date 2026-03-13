@@ -838,30 +838,25 @@ async def on_raw_reaction_add(payload):
 # ── Commandes Discord ──────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════
-#  MOTEUR MUSIQUE  v2 — pipeline entièrement revu
+#  MOTEUR MUSIQUE  v3 — pipeline robuste
 #  Utilise yt_dlp + discord.py voice + FFmpeg
 #
-#  BUGS CORRIGÉS vs v1 :
-#  1. extract_flat="in_playlist" dans YTDL_OPTS héritait dans _get_stream_url
-#     → yt_dlp retournait une URL de page HTML au lieu d'un stream CDN audio
-#     → FFmpegPCMAudio échouait silencieusement → after() → _play_next → queue
-#     vide → asyncio.sleep(2) → disconnect  [cause du "rejoint puis quitte"]
-#  2. asyncio.get_event_loop() deprecated Python 3.10+ → get_running_loop()
-#  3. autocomplete copiait YTDL_OPTS → extract_flat → webpage_url absente
-#     → 0 suggestions retournées
-#  4. Recherche texte via YTDL_OPTS → extract_flat → pas de stream résolvable
-#
 #  ARCHITECTURE :
-#  - YTDL_SEARCH_OPTS  : recherche rapide (titre + webpage_url seulement)
-#  - YTDL_STREAM_OPTS  : résolution d'une URL → stream CDN audio (extract_flat=False OBLIGATOIRE)
-#  - YTDL_FLAT_OPTS    : listing de playlist (flat, sans résoudre chaque vidéo)
+#  /play → _classify_query() → _resolve_query() → tracks[]
+#    Spotify track/album/playlist → spotipy → titre+artiste → url=None
+#    URL YT playlist → YTDL_FLAT_PLAYLIST → webpage_url par vidéo
+#    URL YT directe  → YTDL_FLAT → webpage_url
+#    Texte libre     → ytsearch1 → webpage_url
+#  → _play_next() → si url=None: _search_yt_sync() → webpage_url
+#  → _get_stream_url(webpage_url) → YTDL_STREAM (extract_flat=False!) → CDN audio
+#  → FFmpegPCMAudio(cdn_url) → PCMVolumeTransformer → vc.play()
 # ══════════════════════════════════════════════════════════════════
 
 import shutil as _shutil
 
 # ── Chemin FFmpeg ─────────────────────────────────────────────────
 FFMPEG_EXECUTABLE = _shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-log("MUSIC", f"FFmpeg : {FFMPEG_EXECUTABLE}")
+log("MUSIC", f"FFmpeg : {FFMPEG_EXECUTABLE}", flush=True)
 
 FFMPEG_OPTS = {
     "executable":     FFMPEG_EXECUTABLE,
@@ -869,50 +864,46 @@ FFMPEG_OPTS = {
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
         "-loglevel warning"
     ),
-    "options": "-vn -bufsize 128k",
+    "options": "-vn",
 }
 
 # ── Options yt_dlp séparées par usage ────────────────────────────
-#
-# YTDL_SEARCH_OPTS — autocomplete & résolution texte/URL directe
-#   extract_flat=True → rapide, retourne titre + webpage_url + id
-#   NE PAS utiliser pour obtenir un stream audio
-#
+# YTDL_FLAT         : recherche et métadonnées rapides (PAS de stream audio)
+# YTDL_FLAT_PLAYLIST: listing playlist (PAS de stream audio)
+# YTDL_STREAM       : résolution d'une URL en stream CDN audio
+#                     extract_flat=False OBLIGATOIRE — sans ça yt_dlp renvoie
+#                     la webpage_url HTML au lieu du CDN → FFmpeg lit du HTML → silence
+
 _YTDL_BASE = {
-    "format":         "bestaudio/best",
     "quiet":          True,
     "no_warnings":    True,
-    "source_address": "0.0.0.0",
-    "socket_timeout": 15,
+    "socket_timeout": 20,
 }
 
-YTDL_SEARCH_OPTS = {
+YTDL_FLAT = {
     **_YTDL_BASE,
+    "format":       "bestaudio/best",
     "extract_flat": True,
     "noplaylist":   True,
 }
 
-# YTDL_STREAM_OPTS — résolution d'une webpage_url en vrai stream CDN audio
-#   extract_flat=False OBLIGATOIRE — c'est l'option qui débloque l'URL audio
-#   Sans ça, yt_dlp retourne la page web au lieu du stream → FFmpeg plante
-#
-YTDL_STREAM_OPTS = {
+YTDL_FLAT_PLAYLIST = {
     **_YTDL_BASE,
-    "extract_flat": False,   # ← FIX CRITIQUE
-    "noplaylist":   True,
-}
-
-# YTDL_FLAT_OPTS — listing de playlist YouTube (sans résoudre chaque vidéo)
-YTDL_FLAT_OPTS = {
-    **_YTDL_BASE,
+    "format":       "bestaudio/best",
     "extract_flat": "in_playlist",
     "noplaylist":   False,
+}
+
+YTDL_STREAM = {
+    **_YTDL_BASE,
+    "format":       "bestaudio/best",
+    "extract_flat": False,   # FIX CRITIQUE — obligatoire pour obtenir le CDN audio
+    "noplaylist":   True,
 }
 
 
 # ── État musique par serveur ──────────────────────────────────────
 def _mstate(gid: int) -> dict:
-    """Retourne (et initialise si besoin) l'état musique du serveur."""
     if gid not in music_state:
         music_state[gid] = {
             "queue":      [],
@@ -923,7 +914,6 @@ def _mstate(gid: int) -> dict:
     return music_state[gid]
 
 def _can_use_music(member: discord.Member, gid: int) -> tuple[bool, str]:
-    """Vérifie si member peut utiliser les commandes musique."""
     cfg = tconf(gid)
     if cfg.get("music_enabled", True):
         return True, ""
@@ -937,223 +927,250 @@ def _can_use_music(member: discord.Member, gid: int) -> tuple[bool, str]:
     return False, f"🔒 Accès musique réservé au rôle **{rname}**."
 
 
-# ── Résolution de requête → liste de tracks ───────────────────────
-async def _resolve_query(query: str) -> list[dict]:
+# ── Classification de la query ────────────────────────────────────
+def _classify_query(query: str) -> str:
     """
-    Résout une requête en liste de tracks.
-    Track = {"title", "url" (webpage_url), "duration", "thumbnail"}
-    L'URL audio stream est résolue plus tard par _get_stream_url().
+    Retourne le type :
+    'spotify_track' | 'spotify_album' | 'spotify_playlist' |
+    'yt_playlist'   | 'yt_url'        | 'text'
     """
-    log("MUSIC", f"Résolution query : {query[:80]}")
+    q = query.strip()
+    if "spotify.com/track/"    in q: return "spotify_track"
+    if "spotify.com/album/"    in q: return "spotify_album"
+    if "spotify.com/playlist/" in q: return "spotify_playlist"
+    if ("youtube.com" in q or "youtu.be" in q) and "list=" in q: return "yt_playlist"
+    if q.startswith(("http://", "https://")): return "yt_url"
+    return "text"
 
-    # ── Playlist Spotify ─────────────────────────────────────────
-    if "spotify.com/playlist/" in query and SPOTIPY_OK and SPOTIFY_CLIENT_ID:
-        try:
-            sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-                client_id=SPOTIFY_CLIENT_ID,
-                client_secret=SPOTIFY_CLIENT_SECRET))
-            results = sp.playlist_items(query, fields="items.track(name,artists)", limit=50)
-            tracks = []
-            for item in results.get("items", []):
+
+# ── Helpers Spotify ───────────────────────────────────────────────
+def _sp_client():
+    if not SPOTIPY_OK or not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    try:
+        return spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET))
+    except Exception as e:
+        log("MUSIC", f"Erreur client Spotify : {e}", flush=True)
+        return None
+
+def _sp_track_to_search(t: dict) -> str:
+    """Track Spotify → requête de recherche YT : 'Titre Artiste'."""
+    name   = t.get("name") or ""
+    artists = t.get("artists") or []
+    artist  = artists[0].get("name", "") if artists else ""
+    return f"{name} {artist}".strip()
+
+
+# ── Résolution Spotify (synchrone, pour executor) ────────────────
+def _resolve_spotify_sync(query: str, qtype: str) -> list[dict]:
+    """
+    Retourne une liste de tracks avec title=<recherche YT> et url=None.
+    url=None = pas encore d'URL YT → sera recherchée dans _play_next.
+    """
+    sp = _sp_client()
+    if not sp:
+        log("MUSIC", "Spotify : credentials manquants", flush=True)
+        return []
+    tracks = []
+    try:
+        if qtype == "spotify_track":
+            t        = sp.track(query)
+            search_q = _sp_track_to_search(t)
+            log("MUSIC", f"Spotify track → recherche : '{search_q}'", flush=True)
+            tracks = [{"title": search_q, "url": None,
+                       "duration": int((t.get("duration_ms") or 0) / 1000),
+                       "thumbnail": None}]
+
+        elif qtype == "spotify_album":
+            album  = sp.album(query)
+            items  = (sp.album_tracks(query, limit=50) or {}).get("items") or []
+            thumb  = ((album.get("images") or [{}])[0]).get("url")
+            for item in items:
+                sq = _sp_track_to_search(item)
+                tracks.append({"title": sq, "url": None,
+                               "duration": int((item.get("duration_ms") or 0) / 1000),
+                               "thumbnail": thumb})
+            log("MUSIC", f"Spotify album : {len(tracks)} tracks", flush=True)
+
+        elif qtype == "spotify_playlist":
+            results = sp.playlist_items(
+                query,
+                fields="items.track(name,artists,duration_ms)",
+                limit=50) or {}
+            for item in (results.get("items") or []):
                 t = item.get("track")
                 if not t: continue
-                artist = t["artists"][0]["name"] if t.get("artists") else ""
-                title  = f"{t['name']} {artist}".strip()
-                # url=None → _get_stream_url fera une recherche YT au moment de jouer
-                tracks.append({"title": title, "url": None, "duration": 0, "thumbnail": None})
-            log("MUSIC", f"Spotify playlist : {len(tracks)} tracks")
-            return tracks
-        except Exception as e:
-            log("MUSIC", f"Erreur Spotify : {e} — fallback YT")
+                sq = _sp_track_to_search(t)
+                tracks.append({"title": sq, "url": None,
+                               "duration": int((t.get("duration_ms") or 0) / 1000),
+                               "thumbnail": None})
+            log("MUSIC", f"Spotify playlist : {len(tracks)} tracks", flush=True)
+    except Exception as e:
+        log("MUSIC", f"Erreur Spotify ({qtype}) : {e}", flush=True)
+    return tracks
 
-    if not YT_DLP_OK:
-        log("MUSIC", "yt_dlp non disponible — impossible de résoudre")
-        return []
 
-    loop = asyncio.get_running_loop()   # FIX : get_running_loop() pas get_event_loop()
-
-    # ── Playlist YouTube ──────────────────────────────────────────
-    is_yt_playlist = "list=" in query and ("youtube.com" in query or "youtu.be" in query)
-    if is_yt_playlist:
-        def _extract_playlist():
-            with youtube_dl.YoutubeDL(YTDL_FLAT_OPTS) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if not info:
-                    return []
-                result = []
-                for e in (info.get("entries") or []):
-                    if not e:
-                        continue
-                    title = e.get("title") or "Titre inconnu"
-                    vid_id = e.get("id") or ""
-                    # Reconstruire une URL propre depuis l'id
-                    webpage = e.get("url") or e.get("webpage_url") or ""
-                    if vid_id and (not webpage.startswith("http")):
-                        webpage = f"https://www.youtube.com/watch?v={vid_id}"
-                    if not webpage:
-                        continue
-                    result.append({
-                        "title":     title,
-                        "url":       webpage,
-                        "duration":  int(e.get("duration") or 0),
-                        "thumbnail": e.get("thumbnail"),
-                    })
-                return result
-        try:
-            tracks = await loop.run_in_executor(None, _extract_playlist)
-            log("MUSIC", f"Playlist YT : {len(tracks)} tracks")
-            return tracks
-        except Exception as e:
-            log("MUSIC", f"Erreur playlist YT : {e}")
-            return []
-
-    # ── URL directe (YouTube ou autre) ───────────────────────────
-    is_url = query.startswith(("http://", "https://"))
-    if is_url:
-        def _extract_url():
-            # extract_flat=True ici est OK car on veut juste titre/durée/thumbnail
-            # L'URL de stream sera résolue séparément par _get_stream_url
-            with youtube_dl.YoutubeDL(YTDL_SEARCH_OPTS) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if not info:
-                    return []
-                title     = info.get("title") or "Titre inconnu"
-                duration  = int(info.get("duration") or 0)
-                thumbnail = info.get("thumbnail")
-                webpage   = info.get("webpage_url") or query
-                return [{"title": title, "url": webpage,
-                         "duration": duration, "thumbnail": thumbnail}]
-        try:
-            tracks = await loop.run_in_executor(None, _extract_url)
-            if tracks:
-                log("MUSIC", f"URL directe : '{tracks[0]['title']}'")
-            else:
-                log("MUSIC", "URL directe : aucun résultat")
-            return tracks
-        except Exception as e:
-            log("MUSIC", f"Erreur URL directe : {e}")
-            return []
-
-    # ── Recherche texte libre ─────────────────────────────────────
-    # ytsearch1 = 1 résultat, extract_flat=True → rapide
-    # webpage_url est fiable sur une recherche ytsearch
-    def _extract_search():
-        with youtube_dl.YoutubeDL(YTDL_SEARCH_OPTS) as ydl:
+# ── Recherche YT texte → webpage_url (synchrone) ─────────────────
+def _search_yt_sync(query: str) -> list[dict]:
+    """
+    ytsearch1 → premier résultat YT.
+    Retourne webpage_url (PAS un stream CDN).
+    """
+    try:
+        with youtube_dl.YoutubeDL(YTDL_FLAT) as ydl:
             info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-            if not info:
-                return []
+            if not info: return []
             entries = info.get("entries") or []
-            if not entries:
-                return []
+            if not entries: return []
             e = entries[0]
-            if not e:
-                return []
-            title   = e.get("title") or "Titre inconnu"
+            if not e: return []
             vid_id  = e.get("id") or ""
             webpage = e.get("webpage_url") or e.get("url") or ""
-            # Si extract_flat retourne juste l'id sans URL complète, on reconstruit
             if vid_id and not webpage.startswith("http"):
                 webpage = f"https://www.youtube.com/watch?v={vid_id}"
-            if not webpage:
-                return []
-            return [{
-                "title":     title,
-                "url":       webpage,
-                "duration":  int(e.get("duration") or 0),
-                "thumbnail": e.get("thumbnail"),
-            }]
-    try:
-        tracks = await loop.run_in_executor(None, _extract_search)
-        if tracks:
-            log("MUSIC", f"Recherche texte : trouvé '{tracks[0]['title']}' ({tracks[0]['url']})")
-        else:
-            log("MUSIC", f"Recherche texte : aucun résultat pour '{query}'")
-        return tracks
+            if not webpage: return []
+            log("MUSIC", f"YT search '{query[:50]}' → '{e.get('title','?')}' {webpage}", flush=True)
+            return [{"title":     e.get("title") or query,
+                     "url":       webpage,
+                     "duration":  int(e.get("duration") or 0),
+                     "thumbnail": e.get("thumbnail")}]
     except Exception as e:
-        log("MUSIC", f"Erreur recherche texte : {e}")
+        log("MUSIC", f"Erreur _search_yt_sync '{query[:50]}' : {e}", flush=True)
         return []
 
 
-# ── Résolution URL de stream CDN audio ───────────────────────────
+# ── Résolution playlist YT (synchrone) ───────────────────────────
+def _resolve_yt_playlist_sync(url: str) -> list[dict]:
+    try:
+        with youtube_dl.YoutubeDL(YTDL_FLAT_PLAYLIST) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info: return []
+            result = []
+            for e in (info.get("entries") or []):
+                if not e: continue
+                vid_id  = e.get("id") or ""
+                webpage = e.get("url") or e.get("webpage_url") or ""
+                if vid_id and not webpage.startswith("http"):
+                    webpage = f"https://www.youtube.com/watch?v={vid_id}"
+                if not webpage: continue
+                result.append({"title":     e.get("title") or "Titre inconnu",
+                               "url":       webpage,
+                               "duration":  int(e.get("duration") or 0),
+                               "thumbnail": e.get("thumbnail")})
+            log("MUSIC", f"Playlist YT : {len(result)} tracks", flush=True)
+            return result
+    except Exception as e:
+        log("MUSIC", f"Erreur playlist YT : {e}", flush=True)
+        return []
+
+
+# ── Résolution URL YT directe (synchrone) ────────────────────────
+def _resolve_yt_url_sync(url: str) -> list[dict]:
+    try:
+        with youtube_dl.YoutubeDL(YTDL_FLAT) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info: return []
+            webpage = info.get("webpage_url") or url
+            return [{"title":     info.get("title") or "Titre inconnu",
+                     "url":       webpage,
+                     "duration":  int(info.get("duration") or 0),
+                     "thumbnail": info.get("thumbnail")}]
+    except Exception as e:
+        log("MUSIC", f"Erreur URL YT directe : {e}", flush=True)
+        return []
+
+
+# ── Point d'entrée ────────────────────────────────────────────────
+async def _resolve_query(query: str) -> list[dict]:
+    """
+    Résout une query en liste de tracks.
+    track["url"] = webpage_url YT, ou None pour les tracks Spotify
+    (l'URL YT sera cherchée dans _play_next au moment de jouer).
+    """
+    qtype = _classify_query(query)
+    log("MUSIC", f"Query='{query[:60]}' type={qtype}", flush=True)
+    loop = asyncio.get_running_loop()
+
+    if qtype in ("spotify_track", "spotify_album", "spotify_playlist"):
+        tracks = await loop.run_in_executor(None, _resolve_spotify_sync, query, qtype)
+        if not tracks:
+            log("MUSIC", "Spotify échoué — fallback recherche YT texte brut", flush=True)
+            tracks = await loop.run_in_executor(None, _search_yt_sync, query)
+        return tracks
+
+    if qtype == "yt_playlist":
+        return await loop.run_in_executor(None, _resolve_yt_playlist_sync, query)
+
+    if qtype == "yt_url":
+        return await loop.run_in_executor(None, _resolve_yt_url_sync, query)
+
+    # text
+    return await loop.run_in_executor(None, _search_yt_sync, query)
+
+
+# ── Résolution stream CDN audio ───────────────────────────────────
 async def _get_stream_url(webpage_url: str) -> str | None:
     """
-    Résout une webpage_url YouTube en URL de stream CDN audio.
-
-    FIX CRITIQUE : utilise YTDL_STREAM_OPTS avec extract_flat=False.
-    Sans ça, yt_dlp retourne la webpage_url inchangée au lieu du CDN audio,
-    et FFmpegPCMAudio reçoit une URL HTML → erreur → déconnexion immédiate.
+    webpage_url YT → URL CDN audio (googlevideo.com).
+    YTDL_STREAM avec extract_flat=False : OBLIGATOIRE.
+    Avec True, yt_dlp retourne la webpage_url inchangée → FFmpeg lit du HTML → silence.
     """
     if not YT_DLP_OK:
         return None
-
-    log("MUSIC", f"Résolution stream pour : {webpage_url[:70]}")
-    loop = asyncio.get_running_loop()   # FIX : get_running_loop()
+    log("MUSIC", f"Résolution CDN pour : {webpage_url[:70]}", flush=True)
+    loop = asyncio.get_running_loop()
 
     def _fetch():
-        with youtube_dl.YoutubeDL(YTDL_STREAM_OPTS) as ydl:
-            info = ydl.extract_info(webpage_url, download=False)
-            if not info:
+        with youtube_dl.YoutubeDL(YTDL_STREAM) as ydl:
+            try:
+                info = ydl.extract_info(webpage_url, download=False)
+            except Exception as ex:
+                log("MUSIC", f"yt_dlp extract_info erreur : {ex}", flush=True)
                 return None
-            # "url" = URL du stream audio CDN (googlevideo.com ou équivalent)
+            if not info: return None
+
+            # Chemin 1 : info["url"] = CDN direct
             stream = info.get("url")
-            if not stream:
-                # Fallback : chercher dans les formats le meilleur audio
-                fmts = info.get("formats") or []
-                # Préférer audio-only (vcodec=none)
-                audio_only = [f for f in fmts
-                              if f.get("acodec") not in (None, "none")
-                              and f.get("vcodec") in (None, "none")]
-                if audio_only:
-                    # Prendre le meilleur bitrate
-                    audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
-                    stream = audio_only[0].get("url")
-                elif fmts:
-                    stream = fmts[-1].get("url")
-            return stream
+            if stream and stream.startswith("http"):
+                return stream
+
+            # Chemin 2 : chercher dans formats
+            fmts = info.get("formats") or []
+            audio_only = [f for f in fmts
+                          if f.get("acodec") not in (None, "none")
+                          and f.get("vcodec") in (None, "none")
+                          and (f.get("url") or "").startswith("http")]
+            if audio_only:
+                audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+                log("MUSIC", f"{len(audio_only)} formats audio-only disponibles", flush=True)
+                return audio_only[0]["url"]
+
+            # Chemin 3 : premier format avec URL HTTP
+            for f in reversed(fmts):
+                u = f.get("url") or ""
+                if u.startswith("http"):
+                    return u
+
+            log("MUSIC", "Aucun format audio valide dans info[formats]", flush=True)
+            return None
 
     try:
         url = await loop.run_in_executor(None, _fetch)
         if url:
-            log("MUSIC", "Stream URL résolu ✔")
+            log("MUSIC", "CDN résolu ✔", flush=True)
         else:
-            log("MUSIC", "Stream URL introuvable — aucun format audio disponible")
+            log("MUSIC", "CDN introuvable — aucun format utilisable", flush=True)
         return url
     except Exception as e:
-        log("MUSIC", f"Erreur _get_stream_url : {e}")
-        return None
-
-
-# ── Cas Spotify : recherche YT sur titre seul ─────────────────────
-async def _resolve_spotify_track_url(title: str) -> str | None:
-    """Pour les tracks Spotify (url=None), cherche l'URL YT correspondante."""
-    if not YT_DLP_OK:
-        return None
-    loop = asyncio.get_running_loop()
-    def _search():
-        with youtube_dl.YoutubeDL(YTDL_SEARCH_OPTS) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{title}", download=False)
-            if not info:
-                return None
-            entries = info.get("entries") or []
-            if not entries:
-                return None
-            e = entries[0]
-            vid_id  = e.get("id") or ""
-            webpage = e.get("webpage_url") or e.get("url") or ""
-            if vid_id and not webpage.startswith("http"):
-                webpage = f"https://www.youtube.com/watch?v={vid_id}"
-            return webpage or None
-    try:
-        return await loop.run_in_executor(None, _search)
-    except Exception as e:
-        log("MUSIC", f"Erreur recherche YT pour Spotify track '{title}' : {e}")
+        log("MUSIC", f"Exception _get_stream_url : {e}", flush=True)
         return None
 
 
 # ── Utilitaires ───────────────────────────────────────────────────
 def _fmt_duration(seconds: int) -> str:
-    if not seconds:
-        return "?"
+    if not seconds: return "?"
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
@@ -1162,95 +1179,112 @@ def _fmt_duration(seconds: int) -> str:
 # ── Player ────────────────────────────────────────────────────────
 async def _play_next(guild: discord.Guild):
     """
-    Lance le prochain morceau de la file.
-    Si la file est vide, attend 60 s d'inactivité puis déconnecte.
+    Dépile et joue le prochain morceau.
+    Tracks Spotify (url=None) : recherche YT avant de résoudre le CDN.
+    File vide → attente 60 s → déco si inactif.
     """
     st = _mstate(guild.id)
     vc = guild.voice_client
 
     if not vc or not vc.is_connected():
-        log("MUSIC", f"[{guild.name}] _play_next : vc déconnecté — abandon")
+        log("MUSIC", f"[{guild.name}] _play_next : bot non connecté — abandon", flush=True)
         st["current"] = None
         return
 
     if not st["queue"]:
-        log("MUSIC", f"[{guild.name}] File vide — déconnexion dans 60 s si inactivité")
+        log("MUSIC", f"[{guild.name}] File vide — attente 60 s puis déco si inactif", flush=True)
         st["current"] = None
-        # Attendre 60 s avant de déconnecter (pas 2 s — évite les décos trop rapides)
         await asyncio.sleep(60)
         vc2 = guild.voice_client
         if vc2 and vc2.is_connected() and not vc2.is_playing() and not vc2.is_paused():
-            log("MUSIC", f"[{guild.name}] Déconnexion après inactivité")
+            log("MUSIC", f"[{guild.name}] Déconnexion après inactivité", flush=True)
             await vc2.disconnect()
         return
 
     track = st["queue"].pop(0)
     st["current"] = track
-    log("MUSIC", f"[{guild.name}] Lecture : '{track['title']}'")
+    url_preview = (track.get("url") or "None")[:60]
+    log("MUSIC", f"[{guild.name}] Dépile '{track['title']}' | url={url_preview}", flush=True)
 
-    # ── Résoudre l'URL de stream ──────────────────────────────────
-    # Cas Spotify : track["url"] est None → rechercher d'abord sur YT
+    # Étape 1 : si url=None (track Spotify), chercher sur YT
     if not track.get("url"):
-        log("MUSIC", f"[{guild.name}] Track Spotify sans URL — recherche YT")
-        yt_url = await _resolve_spotify_track_url(track["title"])
-        if not yt_url:
-            log("MUSIC", f"[{guild.name}] Recherche YT échouée pour '{track['title']}' — skip")
+        log("MUSIC", f"[{guild.name}] Sans URL — recherche YT pour '{track['title']}'", flush=True)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, _search_yt_sync, track["title"])
+        if not results:
+            log("MUSIC", f"[{guild.name}] Recherche YT introuvable — skip", flush=True)
+            ch_id = st.get("np_channel")
+            ch    = guild.get_channel(ch_id) if ch_id else None
+            if ch:
+                try: await ch.send(f"⚠️ Introuvable sur YouTube : **{track['title']}** — skippé.")
+                except Exception: pass
             await _play_next(guild)
             return
-        track["url"] = yt_url
+        track["url"]       = results[0]["url"]
+        track["duration"]  = track["duration"]  or results[0].get("duration", 0)
+        track["thumbnail"] = track["thumbnail"] or results[0].get("thumbnail")
+        log("MUSIC", f"[{guild.name}] URL YT trouvée : {track['url']}", flush=True)
 
+    # Étape 2 : résoudre le CDN audio
     stream_url = track.get("stream_url")
     if not stream_url:
         stream_url = await _get_stream_url(track["url"])
-
     if not stream_url:
-        log("MUSIC", f"[{guild.name}] Stream URL introuvable pour '{track['title']}' — skip")
+        log("MUSIC", f"[{guild.name}] CDN introuvable pour '{track['title']}' — skip", flush=True)
+        ch_id = st.get("np_channel")
+        ch    = guild.get_channel(ch_id) if ch_id else None
+        if ch:
+            try: await ch.send(f"⚠️ Stream audio indisponible pour **{track['title']}** — skippé.")
+            except Exception: pass
         await _play_next(guild)
         return
-
     track["stream_url"] = stream_url
+    log("MUSIC", f"[{guild.name}] Stream : {stream_url[:80]}", flush=True)
 
-    # ── Créer la source audio ──────────────────────────────────────
+    # Étape 3 : créer la source FFmpeg
     volume = st.get("volume", 0.5)
     try:
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS),
             volume=volume)
+        log("MUSIC", f"[{guild.name}] Source FFmpeg créée (vol={volume:.0%})", flush=True)
     except Exception as e:
-        log("MUSIC", f"[{guild.name}] Erreur création FFmpegPCMAudio : {e}")
+        log("MUSIC", f"[{guild.name}] Erreur FFmpegPCMAudio : {e}", flush=True)
         await _play_next(guild)
         return
 
-    # ── Callback after : déclenché par discord.py dans un thread séparé ──
+    # Étape 4 : after callback
     def _after(error):
         if error:
-            log("MUSIC", f"[{guild.name}] Erreur lecture (after callback) : {error}")
+            log("MUSIC", f"[{guild.name}] Erreur after : {error}", flush=True)
         else:
-            log("MUSIC", f"[{guild.name}] Fin de '{track['title']}'")
-        # Planifier _play_next sur la boucle asyncio principale
+            log("MUSIC", f"[{guild.name}] Fin : '{track['title']}'", flush=True)
         asyncio.run_coroutine_threadsafe(_play_next(guild), client.loop)
 
-    # ── Lancer la lecture ──────────────────────────────────────────
+    # Étape 5 : vc.play()
     try:
         vc.play(source, after=_after)
-        log("MUSIC", f"[{guild.name}] vc.play() lancé ✔")
+        log("MUSIC", f"[{guild.name}] vc.play() lancé ✔", flush=True)
     except discord.errors.ClientException as e:
-        log("MUSIC", f"[{guild.name}] vc.play ClientException : {e}")
-        await _play_next(guild)
+        log("MUSIC", f"[{guild.name}] vc.play ClientException : {e}", flush=True)
+        if "already" in str(e).lower():
+            st["queue"].insert(0, track)  # remettre en tête
+        else:
+            await _play_next(guild)
         return
     except Exception as e:
-        log("MUSIC", f"[{guild.name}] vc.play erreur inattendue : {e}")
+        log("MUSIC", f"[{guild.name}] vc.play erreur : {e}", flush=True)
         await _play_next(guild)
         return
 
-    # ── Embed Now Playing ─────────────────────────────────────────
+    # Étape 6 : embed Now Playing
     ch_id = st.get("np_channel")
     ch    = guild.get_channel(ch_id) if ch_id else None
     if ch:
         try:
             await ch.send(embed=_now_playing_embed(track, guild))
         except Exception as e:
-            log("MUSIC", f"[{guild.name}] Erreur envoi embed NP : {e}")
+            log("MUSIC", f"[{guild.name}] Erreur embed NP : {e}", flush=True)
 
 
 def _now_playing_embed(track: dict, guild: discord.Guild) -> discord.Embed:
@@ -1277,46 +1311,37 @@ def _now_playing_embed(track: dict, guild: discord.Guild) -> discord.Embed:
 
 # ── Autocomplete /play ────────────────────────────────────────────
 async def _autocomplete_play(inter: discord.Interaction, current: str):
-    """
-    Retourne jusqu'à 5 suggestions YouTube pendant que l'utilisateur tape.
-    FIX : utilise YTDL_SEARCH_OPTS dédié (extract_flat=True isolé)
-    au lieu de copier YTDL_OPTS qui contenait extract_flat='in_playlist'.
-    """
+    """5 suggestions YouTube en temps réel."""
     if not current or len(current) < 2:
         return []
     if not YT_DLP_OK:
         return []
-
-    loop = asyncio.get_running_loop()   # FIX : get_running_loop()
+    loop = asyncio.get_running_loop()
 
     def _search():
-        opts = dict(YTDL_SEARCH_OPTS)
-        opts["playlistend"] = 5
-        with youtube_dl.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch5:{current}", download=False)
-            if not info:
-                return []
-            results = []
-            for e in (info.get("entries") or []):
-                if not e:
-                    continue
-                title   = e.get("title") or "?"
-                vid_id  = e.get("id") or ""
-                webpage = e.get("webpage_url") or e.get("url") or ""
-                if vid_id and not webpage.startswith("http"):
-                    webpage = f"https://www.youtube.com/watch?v={vid_id}"
-                if webpage:
-                    results.append((title, webpage))
-            return results
+        opts = {**YTDL_FLAT, "playlistend": 5}
+        try:
+            with youtube_dl.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch5:{current}", download=False)
+                if not info: return []
+                results = []
+                for e in (info.get("entries") or []):
+                    if not e: continue
+                    title   = (e.get("title") or "?")[:100]
+                    vid_id  = e.get("id") or ""
+                    webpage = e.get("webpage_url") or e.get("url") or ""
+                    if vid_id and not webpage.startswith("http"):
+                        webpage = f"https://www.youtube.com/watch?v={vid_id}"
+                    if webpage:
+                        results.append((title, webpage))
+                return results
+        except Exception:
+            return []
 
     try:
         results = await loop.run_in_executor(None, _search)
-        return [
-            app_commands.Choice(name=t[:100], value=u)
-            for t, u in results if u
-        ][:5]
-    except Exception as e:
-        log("MUSIC", f"Autocomplete erreur : {e}")
+        return [app_commands.Choice(name=t, value=u) for t, u in results if u][:5]
+    except Exception:
         return []
 
 async def handle_cmds(message):
