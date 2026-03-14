@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.6 — hébergé sur Render
+  BOT AGENT v5.7 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -13,6 +13,8 @@
   v5.5 : fix lecture audio — player_client ios, diagnostic boot FFmpeg+PyNaCl
   v5.6 : FFMPEG_OPTS simplifie (options minimales), capture stderr FFmpeg dans _after,
          test FFmpeg reel au boot (subprocess -version), logs etat vc avant/apres play()
+  v5.7 : connexion vocale robuste (cas vc perime), music_play dispatch was_empty+join check,
+         timeout stream 30s, console musique integree au menu principal
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -52,7 +54,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.6"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.7"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -1239,7 +1241,7 @@ async def _get_stream_info(webpage_url: str) -> dict | None:
     try:
         result = await asyncio.wait_for(
             loop.run_in_executor(None, _fetch),
-            timeout=45.0
+            timeout=30.0
         )
         if result:
             log("MUSIC", f"Stream+méta résolu ✔ — titre='{result['title'] or '?'}' dur={result['duration']}s", flush=True)
@@ -1247,7 +1249,7 @@ async def _get_stream_info(webpage_url: str) -> dict | None:
             log("MUSIC", "Stream introuvable — aucun format utilisable", flush=True)
         return result
     except asyncio.TimeoutError:
-        log("MUSIC", f"TIMEOUT 45s _get_stream_info pour : {webpage_url[:70]}", flush=True)
+        log("MUSIC", f"TIMEOUT 30s _get_stream_info pour : {webpage_url[:70]}", flush=True)
         return None
     except Exception as e:
         log("MUSIC", f"Exception _get_stream_info : {e}", flush=True)
@@ -1750,23 +1752,36 @@ async def slash_play(inter: discord.Interaction, query: str):
         st    = _mstate(guild.id)
         st["np_channel"] = inter.channel_id
 
-        # Rejoindre le vocal si pas connecté
-        vc = guild.voice_client
+        # ── Connexion vocale robuste ──────────────────────────────────────
+        # Cas gérés :
+        #   A) Bot non connecté → connect()
+        #   B) Bot connecté même salon → rien
+        #   C) Bot connecté autre salon → move_to()
+        #   D) Objet voice_client périmé (is_connected=False) → cleanup + connect()
+        vc             = guild.voice_client
         target_channel = inter.user.voice.channel
-        if vc and vc.is_connected():
-            if vc.channel != target_channel:
-                log("MUSIC", f"Déplacement vocal → {target_channel.name}", flush=True)
-                await vc.move_to(target_channel)
+        log("MUSIC", f"vocal : vc={vc} connected={vc.is_connected() if vc else 'N/A'} target={target_channel.name}", flush=True)
+        try:
+            if vc and not vc.is_connected():
+                # Cas D : objet périmé → nettoyer pour éviter "Already connected"
+                log("MUSIC", "voice_client périmé (is_connected=False) → cleanup", flush=True)
+                try: await vc.disconnect(force=True)
+                except Exception: pass
+                vc = None
+            if vc and vc.is_connected():
+                if vc.channel != target_channel:
+                    log("MUSIC", f"Déplacement vocal : {vc.channel.name} → {target_channel.name}", flush=True)
+                    await vc.move_to(target_channel)
+                    log("MUSIC", f"Move vocal OK ✔", flush=True)
+                else:
+                    log("MUSIC", f"Déjà connecté à {target_channel.name} ✔", flush=True)
             else:
-                log("MUSIC", f"Déjà connecté à {target_channel.name}", flush=True)
-        else:
-            try:
                 log("MUSIC", f"Connexion au vocal : {target_channel.name}", flush=True)
                 vc = await target_channel.connect()
-                log("MUSIC", "Connexion vocale OK ✔", flush=True)
-            except Exception as e:
-                log("MUSIC", f"Erreur connexion vocal : {e}", flush=True)
-                await inter.followup.send(f"❌ Impossible de rejoindre le salon vocal : {e}"); return
+                log("MUSIC", f"Connexion vocale OK ✔ → {vc.channel.name}", flush=True)
+        except Exception as e:
+            log("MUSIC", f"Erreur connexion vocal : {e}", flush=True)
+            await inter.followup.send(f"❌ Impossible de rejoindre le salon vocal : {e}"); return
 
         # Synchroniser le volume
         vol_pct = tconf(guild.id).get("music_volume", 50)
@@ -3420,22 +3435,27 @@ async def _dispatch_inner(action, p):
         if not g: return {"error": "Guild not found"}
         if not YT_DLP_OK:
             return {"error": "yt_dlp non installé"}
+        # Vérifier que le bot est dans un vocal avant de chercher
+        vc = g.voice_client
+        if not vc or not vc.is_connected():
+            return {"error": "Bot non connecté à un salon vocal — lance music_join d'abord"}
         query     = p.get("query", "")
         ch_id     = p.get("np_channel_id")
         requester = p.get("requester", "Console")
         if not query: return {"error": "query requis"}
+        log("MUSIC", f"[Console] music_play query='{query[:60]}'", flush=True)
         tracks = await _resolve_query(query)
-        if not tracks: return {"error": "Aucun résultat"}
+        if not tracks: return {"error": "Aucun résultat pour cette recherche"}
         for t in tracks: t["requester"] = requester
         st = _mstate(g.id)
         st["np_channel"] = ch_id
-        was_empty = not st["queue"] and st["current"] is None
+        was_empty = not st["queue"] and not (vc.is_playing() or vc.is_paused())
         st["queue"].extend(tracks)
-        if was_empty:
-            vc = g.voice_client
-            if vc and vc.is_connected() and not vc.is_playing():
-                await _play_next(g)
-        return {"ok": True, "added": len(tracks), "titles": [t["title"] for t in tracks[:5]]}
+        log("MUSIC", f"[Console] {len(tracks)} track(s) ajoutée(s), was_empty={was_empty}", flush=True)
+        if was_empty and not vc.is_playing():
+            await _play_next(g)
+        return {"ok": True, "added": len(tracks),
+                "titles": [t.get("title") or t.get("url", "?")[:60] for t in tracks[:5]]}
 
     elif action == "music_stop":
         g = _g(p)
