@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.7 — hébergé sur Render
+  BOT AGENT v5.8 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -15,6 +15,9 @@
          test FFmpeg reel au boot (subprocess -version), logs etat vc avant/apres play()
   v5.7 : connexion vocale robuste (cas vc perime), music_play dispatch was_empty+join check,
          timeout stream 30s, console musique integree au menu principal
+  v5.8 : asyncio.sleep remplace time.sleep dans _play_next, chargement Opus explicite
+         au boot et dans on_ready, _now_playing_embed securise (title=None safe),
+         log opus.is_loaded() avant vc.play(), diagnostic Opus dans after()
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -54,7 +57,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.7"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.8"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -738,6 +741,28 @@ async def send_update_notifications():
 async def on_ready():
     log("BOT", "Connecte en tant que", str(client.user))
     log("BOT", f"{len(client.guilds)} serveur(s) visibles")
+    # ── Chargement et vérification Opus ──────────────────────────────────
+    # discord.py a besoin d'Opus pour encoder le PCM en paquets vocaux.
+    # Sans Opus, vc.play() s'exécute mais n'envoie aucun son — silencieux.
+    try:
+        if not discord.opus.is_loaded():
+            # Essayer les noms courants selon la plateforme
+            for _lib in ("libopus.so.0", "libopus.so", "opus", "libopus-0.dll"):
+                try:
+                    discord.opus.load_opus(_lib)
+                    if discord.opus.is_loaded():
+                        log("AUDIO", f"Opus chargé manuellement : {_lib} ✔")
+                        break
+                except Exception:
+                    continue
+        if discord.opus.is_loaded():
+            log("AUDIO", "Opus : chargé ✔ (encodage vocal Discord OK)")
+        else:
+            log("AUDIO", "Opus : NON CHARGÉ ❌ — vc.play() sera silencieux !")
+            log("AUDIO", "  -> Vérifier : RUN apt-get install -y libopus0 dans le Dockerfile")
+            log("AUDIO", "  -> discord.py tente un chargement automatique au premier play()")
+    except Exception as _e_opus:
+        log("AUDIO", f"Opus : exception lors du chargement : {_e_opus}")
     await load_data()
     # Restaurer les views persistantes pour les tickets en attente
     # On passe message_id= pour que discord.py rattache la view
@@ -1413,7 +1438,11 @@ async def _play_next(guild: discord.Guild):
             elif "invalid data" in combined or "moov atom" in combined:
                 log("MUSIC", f"[{guild.name}] >>> Format incompatible (stream non-seekable ?)", flush=True)
             elif "opus" in combined or "encoder" in combined:
-                log("MUSIC", f"[{guild.name}] >>> Erreur encodeur Opus — PyNaCl manquant/cassé ?", flush=True)
+                log("MUSIC", f"[{guild.name}] >>> Erreur Opus — is_loaded={discord.opus.is_loaded()}", flush=True)
+                if not discord.opus.is_loaded():
+                    log("MUSIC", f"[{guild.name}] >>> Opus NON CHARGÉ — libopus0 manquant dans le conteneur !", flush=True)
+                else:
+                    log("MUSIC", f"[{guild.name}] >>> Opus chargé mais erreur encoder — vérifier PyNaCl", flush=True)
             elif "connection" in combined:
                 log("MUSIC", f"[{guild.name}] >>> Erreur réseau — CDN inaccessible", flush=True)
         else:
@@ -1433,13 +1462,14 @@ async def _play_next(guild: discord.Guild):
 
     # Étape 5 : vc.play()
     log("MUSIC", f"[{guild.name}] ── Étape 5 : vc.play() ───────────────────────", flush=True)
-    log("MUSIC", f"[{guild.name}] avant play : connected={vc.is_connected()} playing={vc.is_playing()} paused={vc.is_paused()}", flush=True)
+    log("MUSIC", f"[{guild.name}] Opus chargé  : {discord.opus.is_loaded()}", flush=True)
+    log("MUSIC", f"[{guild.name}] avant play   : connected={vc.is_connected()} playing={vc.is_playing()} paused={vc.is_paused()}", flush=True)
     try:
         if vc.is_playing():
             log("MUSIC", f"[{guild.name}] vc déjà en lecture → stop() avant play()", flush=True)
             vc.stop()
         vc.play(source, after=_after)
-        import time as _time; _time.sleep(0.15)  # laisser FFmpeg démarrer
+        await asyncio.sleep(0.2)  # laisser FFmpeg démarrer (non-bloquant)
         playing_now = vc.is_playing()
         log("MUSIC", f"[{guild.name}] après play : connected={vc.is_connected()} playing={playing_now} paused={vc.is_paused()}", flush=True)
         if playing_now:
@@ -1472,18 +1502,28 @@ async def _play_next(guild: discord.Guild):
 
 
 def _now_playing_embed(track: dict, guild: discord.Guild) -> discord.Embed:
+    # Sécuriser tous les champs — title peut être None (track URL directe)
+    title     = track.get("title") or "🎵 Lecture en cours"
+    url       = track.get("url")
+    thumbnail = track.get("thumbnail")
+    duration  = track.get("duration") or 0
+    requester = track.get("requester") or "?"
+
     e = discord.Embed(
         title="🎵  Lecture en cours",
-        description=f"**{track['title']}**",
+        description=f"**{title}**",
         color=0x1DB954,
         timestamp=datetime.now(timezone.utc),
     )
-    if track.get("url"):
-        e.description = f"**[{track['title']}]({track['url']})**"
-    if track.get("thumbnail"):
-        e.set_thumbnail(url=track["thumbnail"])
-    e.add_field(name="⏱  Durée",        value=_fmt_duration(track.get("duration", 0)), inline=True)
-    e.add_field(name="👤  Demandé par", value=track.get("requester", "?"),              inline=True)
+    if url:
+        e.description = f"**[{title}]({url})**"
+    if thumbnail:
+        try:
+            e.set_thumbnail(url=thumbnail)
+        except Exception:
+            pass
+    e.add_field(name="⏱  Durée",        value=_fmt_duration(duration),  inline=True)
+    e.add_field(name="👤  Demandé par", value=requester,                  inline=True)
     vc = guild.voice_client
     if vc and vc.channel:
         e.add_field(name="🔊  Vocal", value=vc.channel.name, inline=True)
@@ -3580,6 +3620,29 @@ async def main():
     except ImportError:
         log("BOOT", "PyNaCl         : MANQUANT ❌ — vc.play() ne transmettra AUCUN son !")
         log("BOOT", "                 -> Ajouter PyNaCl>=1.5.0 dans requirements.txt")
+    # ── Test Opus au démarrage ───────────────────────────────────────────
+    # discord.py charge Opus automatiquement dans OpusEncoder mais seulement
+    # au moment du premier send_audio_packet(). On anticipe ici pour diagnostic.
+    try:
+        _opus_loaded = discord.opus.is_loaded()
+        if not _opus_loaded:
+            for _olib in ("libopus.so.0", "libopus.so", "opus", "libopus-0.dll"):
+                try:
+                    discord.opus.load_opus(_olib)
+                    _opus_loaded = discord.opus.is_loaded()
+                    if _opus_loaded:
+                        log("BOOT", f"Opus           : chargé ✔ via {_olib}")
+                        break
+                except Exception:
+                    continue
+        if _opus_loaded:
+            log("BOOT", "Opus           : OK ✔ (encodage vocal Discord disponible)")
+        else:
+            log("BOOT", "Opus           : NON CHARGÉ ❌")
+            log("BOOT", "                 Sans Opus, vc.play() sera silencieux !")
+            log("BOOT", "                 -> apt-get install -y libopus0  dans le Dockerfile")
+    except Exception as _e_o:
+        log("BOOT", f"Opus           : exception chargement : {_e_o}")
     # ── Options audio actives ────────────────────────────────────────
     log("BOOT", f"FFMPEG opts    : before='{FFMPEG_BEFORE_OPTIONS}' / options='{FFMPEG_OPTIONS}'")
     if YT_DLP_OK:
