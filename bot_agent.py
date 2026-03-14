@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.5 — hébergé sur Render
+  BOT AGENT v5.6 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -10,8 +10,9 @@
          was_empty, global menu_locked, logs debug complets)
   v5.4 : fix définitif musique — YTDL_STREAM format corrigé, User-Agent FFmpeg,
          _auto_disconnect non-bloquant, after callback guard loop, logs CDN URL
-  v5.5 : fix lecture audio — player_client ios (anti-bot-check YouTube datacenter),
-         diagnostic boot FFmpeg+PyNaCl, logs vc.is_playing() post-play, erreurs yt_dlp typées
+  v5.5 : fix lecture audio — player_client ios, diagnostic boot FFmpeg+PyNaCl
+  v5.6 : FFMPEG_OPTS simplifie (options minimales), capture stderr FFmpeg dans _after,
+         test FFmpeg reel au boot (subprocess -version), logs etat vc avant/apres play()
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -51,7 +52,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.5"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.6"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -874,16 +875,20 @@ _YT_UA = (
 )
 
 # ── Options FFmpeg ────────────────────────────────────────────────
-# -user_agent : transmis à YouTube par FFmpeg pour éviter le blocage 403
-# -reconnect  : reconnexion automatique si le CDN coupe le flux en cours de lecture
+# Options MINIMALES éprouvées pour les streams CDN YouTube.
+# -reconnect 1             : reconnexion si la connexion TCP est coupée
+# -reconnect_delay_max 5   : délai max entre tentatives
+# NE PAS ajouter -reconnect_streamed : incompatible avec certains formats DASH
+# NE PAS ajouter -user_agent : le CDN googlevideo.com ne l'exige pas,
+#   et la valeur avec espaces peut perturber le parsing d'args FFmpeg
+# NE PAS ajouter -loglevel warning : masque les erreurs en debug
+# stderr est passé via subprocess.PIPE dans _play_next pour capturer les erreurs FFmpeg
+FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_delay_max 5"
+FFMPEG_OPTIONS        = "-vn"
 FFMPEG_OPTS = {
     "executable":     FFMPEG_EXECUTABLE,
-    "before_options": (
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-        f"-user_agent '{_YT_UA}' "
-        "-loglevel warning"
-    ),
-    "options": "-vn",
+    "before_options": FFMPEG_BEFORE_OPTIONS,
+    "options":        FFMPEG_OPTIONS,
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -1348,51 +1353,98 @@ async def _play_next(guild: discord.Guild):
     track["stream_url"] = stream_url
     log("MUSIC", f"[{guild.name}] Stream : {stream_url[:80]}", flush=True)
 
-    # Étape 3 : créer la source FFmpeg
+    # Étape 3 : créer la source FFmpeg avec capture stderr
     volume = st.get("volume", 0.5)
-    log("MUSIC", f"[{guild.name}] FFmpegPCMAudio({stream_url[:70]}) vol={volume:.0%}", flush=True)
+    log("MUSIC", f"[{guild.name}] ── Étape 3 : FFmpegPCMAudio ──────────────────", flush=True)
+    log("MUSIC", f"[{guild.name}] executable   : {FFMPEG_EXECUTABLE}", flush=True)
+    log("MUSIC", f"[{guild.name}] stream_url   : {stream_url[:100]}", flush=True)
+    log("MUSIC", f"[{guild.name}] before_opts  : {FFMPEG_BEFORE_OPTIONS}", flush=True)
+    log("MUSIC", f"[{guild.name}] options      : {FFMPEG_OPTIONS}", flush=True)
+    log("MUSIC", f"[{guild.name}] volume       : {volume:.0%}", flush=True)
+
+    ffmpeg_source = None
     try:
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS),
-            volume=volume)
-        log("MUSIC", f"[{guild.name}] Source FFmpeg créée ✔", flush=True)
+        ffmpeg_source = discord.FFmpegPCMAudio(
+            stream_url,
+            executable=FFMPEG_EXECUTABLE,
+            before_options=FFMPEG_BEFORE_OPTIONS,
+            options=FFMPEG_OPTIONS,
+            stderr=subprocess.PIPE,  # capture stderr pour diagnostiquer les erreurs FFmpeg
+        )
+        source = discord.PCMVolumeTransformer(ffmpeg_source, volume=volume)
+        log("MUSIC", f"[{guild.name}] FFmpegPCMAudio + PCMVolumeTransformer créés ✔", flush=True)
     except Exception as e:
-        log("MUSIC", f"[{guild.name}] Erreur FFmpegPCMAudio : {e}", flush=True)
+        import traceback as _tb3
+        log("MUSIC", f"[{guild.name}] ERREUR création FFmpegPCMAudio : {e}", flush=True)
+        log("MUSIC", _tb3.format_exc(), flush=True)
         await _play_next(guild)
         return
 
-    # Étape 4 : after callback (appelé depuis le thread FFmpeg, PAS l'event loop)
+    # Étape 4 : after callback (appelé depuis le thread FFmpeg — PAS l'event loop)
     track_title_for_after = track.get("title") or "?"
+    _ffmpeg_proc = getattr(ffmpeg_source, "_process", None)
+
     def _after(error):
+        # Lire stderr FFmpeg — révèle la vraie erreur (403, codec, format, etc.)
+        stderr_output = ""
+        if _ffmpeg_proc is not None and _ffmpeg_proc.stderr:
+            try:
+                stderr_output = _ffmpeg_proc.stderr.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+
         if error:
-            # Convertir l'erreur en string pour le log (peut être une exception ou un string)
             err_msg = str(error)
-            log("MUSIC", f"[{guild.name}] after erreur (FFmpeg/Discord) : {err_msg[:200]}", flush=True)
-            if "encoder" in err_msg.lower() or "opus" in err_msg.lower():
-                log("MUSIC", f"[{guild.name}] after : erreur encoder Opus — PyNaCl manquant ?", flush=True)
+            log("MUSIC", f"[{guild.name}] ── after : ERREUR ──────────────────────", flush=True)
+            log("MUSIC", f"[{guild.name}] after error   : {err_msg[:300]}", flush=True)
+            if stderr_output:
+                stderr_tail = stderr_output[-600:] if len(stderr_output) > 600 else stderr_output
+                log("MUSIC", f"[{guild.name}] FFmpeg stderr : {stderr_tail}", flush=True)
+            else:
+                log("MUSIC", f"[{guild.name}] FFmpeg stderr : (vide — FFmpeg n'a rien loggué)", flush=True)
+            # Diagnostic rapide
+            combined = (err_msg + stderr_output).lower()
+            if "no such file" in combined or "not found" in combined:
+                log("MUSIC", f"[{guild.name}] >>> FFmpeg INTROUVABLE à {FFMPEG_EXECUTABLE}", flush=True)
+            elif "403" in combined or "forbidden" in combined:
+                log("MUSIC", f"[{guild.name}] >>> HTTP 403 — URL CDN expirée ou bloquée", flush=True)
+            elif "invalid data" in combined or "moov atom" in combined:
+                log("MUSIC", f"[{guild.name}] >>> Format incompatible (stream non-seekable ?)", flush=True)
+            elif "opus" in combined or "encoder" in combined:
+                log("MUSIC", f"[{guild.name}] >>> Erreur encodeur Opus — PyNaCl manquant/cassé ?", flush=True)
+            elif "connection" in combined:
+                log("MUSIC", f"[{guild.name}] >>> Erreur réseau — CDN inaccessible", flush=True)
         else:
-            log("MUSIC", f"[{guild.name}] Lecture terminée normalement : '{track_title_for_after}'", flush=True)
+            log("MUSIC", f"[{guild.name}] Lecture terminée ✔ : '{track_title_for_after}'", flush=True)
+            if stderr_output:
+                log("MUSIC", f"[{guild.name}] FFmpeg stderr (info) : {stderr_output[-200:]}", flush=True)
+
         try:
             loop = client.loop
             if loop and not loop.is_closed():
                 log("MUSIC", f"[{guild.name}] after : planification _play_next", flush=True)
                 asyncio.run_coroutine_threadsafe(_play_next(guild), loop)
             else:
-                log("MUSIC", f"[{guild.name}] after : event loop fermée — impossible de lancer _play_next", flush=True)
+                log("MUSIC", f"[{guild.name}] after : event loop fermée — _play_next impossible", flush=True)
         except Exception as ex:
-            log("MUSIC", f"[{guild.name}] after exception run_coroutine_threadsafe : {ex}", flush=True)
+            log("MUSIC", f"[{guild.name}] after run_coroutine_threadsafe exception : {ex}", flush=True)
 
     # Étape 5 : vc.play()
+    log("MUSIC", f"[{guild.name}] ── Étape 5 : vc.play() ───────────────────────", flush=True)
+    log("MUSIC", f"[{guild.name}] avant play : connected={vc.is_connected()} playing={vc.is_playing()} paused={vc.is_paused()}", flush=True)
     try:
         if vc.is_playing():
-            log("MUSIC", f"[{guild.name}] vc déjà en lecture — stop avant play", flush=True)
+            log("MUSIC", f"[{guild.name}] vc déjà en lecture → stop() avant play()", flush=True)
             vc.stop()
         vc.play(source, after=_after)
-        # Vérification immédiate : vc.is_playing() doit être True
-        playing_confirmed = vc.is_playing()
-        log("MUSIC", f"[{guild.name}] vc.play() appelé — is_playing()={playing_confirmed}", flush=True)
-        if not playing_confirmed:
-            log("MUSIC", f"[{guild.name}] AVERTISSEMENT : vc.is_playing()=False immédiatement après vc.play()", flush=True)
+        import time as _time; _time.sleep(0.15)  # laisser FFmpeg démarrer
+        playing_now = vc.is_playing()
+        log("MUSIC", f"[{guild.name}] après play : connected={vc.is_connected()} playing={playing_now} paused={vc.is_paused()}", flush=True)
+        if playing_now:
+            log("MUSIC", f"[{guild.name}] ✔ LECTURE AUDIO EN COURS — '{track.get('title') or '?'}'", flush=True)
+        else:
+            log("MUSIC", f"[{guild.name}] ⚠ is_playing()=False après vc.play() — FFmpeg a probablement échoué", flush=True)
+            log("MUSIC", f"[{guild.name}]   → after() sera appelé avec l'erreur (voir logs MUSIC suivants)", flush=True)
     except discord.errors.ClientException as e:
         log("MUSIC", f"[{guild.name}] vc.play ClientException : {e}", flush=True)
         if "already" in str(e).lower():
@@ -1401,9 +1453,9 @@ async def _play_next(guild: discord.Guild):
             await _play_next(guild)
         return
     except Exception as e:
-        import traceback as _tb
-        log("MUSIC", f"[{guild.name}] vc.play erreur : {e}", flush=True)
-        log("MUSIC", _tb.format_exc(), flush=True)
+        import traceback as _tb5
+        log("MUSIC", f"[{guild.name}] vc.play EXCEPTION : {e}", flush=True)
+        log("MUSIC", _tb5.format_exc(), flush=True)
         await _play_next(guild)
         return
 
@@ -3478,20 +3530,40 @@ async def main():
     log("BOOT", f"discord.py     : {discord.__version__}")
     log("BOOT", f"yt_dlp         : {'OK' if YT_DLP_OK else 'NON INSTALLE — musique impossible'}")
     log("BOOT", f"spotipy        : {'OK' if SPOTIPY_OK else 'non installe (optionnel)'}")
-    log("BOOT", f"FFmpeg         : {FFMPEG_EXECUTABLE}")
-    # Vérifications critiques pour l'audio Discord
-    import shutil as _shutil_boot
-    ffmpeg_ok = _shutil_boot.which("ffmpeg") is not None
-    log("BOOT", f"FFmpeg dispo   : {'OK ✔' if ffmpeg_ok else 'INTROUVABLE ❌ — musique silencieuse sans FFmpeg'}")
+    log("BOOT", f"FFmpeg chemin  : {FFMPEG_EXECUTABLE}")
+    # ── Test FFmpeg réel : vérifier qu'il existe ET fonctionne ──────
     try:
-        import nacl
-        log("BOOT", f"PyNaCl         : OK ✔ (chiffrement vocal Discord)")
+        _ffv = subprocess.run(
+            [FFMPEG_EXECUTABLE, "-version"],
+            capture_output=True, text=True, timeout=5
+        )
+        if _ffv.returncode == 0:
+            _ffv_line = _ffv.stdout.split("\n")[0]
+            log("BOOT", f"FFmpeg test    : OK ✔ — {_ffv_line[:70]}")
+        else:
+            log("BOOT", f"FFmpeg test    : ECHEC returncode={_ffv.returncode} ❌")
+            log("BOOT", f"FFmpeg stderr  : {_ffv.stderr[:200]}")
+    except FileNotFoundError:
+        log("BOOT", f"FFmpeg test    : INTROUVABLE a '{FFMPEG_EXECUTABLE}' ❌")
+        log("BOOT",  "                 -> La lecture audio sera impossible !")
+        log("BOOT",  "                 -> Verifier RUN apt-get install -y ffmpeg dans le Dockerfile")
+    except subprocess.TimeoutExpired:
+        log("BOOT", "FFmpeg test    : timeout 5s ❌")
+    except Exception as _eff:
+        log("BOOT", f"FFmpeg test    : exception : {_eff}")
+    # ── Test PyNaCl : OBLIGATOIRE pour le son Discord ───────────────
+    # Sans PyNaCl, vc.play() s'execute sans erreur mais n'envoie AUCUN paquet audio
+    try:
+        import nacl as _nacl_mod
+        _nacl_ver = getattr(_nacl_mod, "__version__", "?")
+        log("BOOT", f"PyNaCl         : OK ✔ v{_nacl_ver}")
     except ImportError:
-        log("BOOT", "PyNaCl         : MANQUANT ❌ — vc.play() ne transmettra AUCUN son sans PyNaCl !")
-        log("BOOT", "                 Ajouter PyNaCl>=1.5.0 dans requirements.txt")
-    # Test rapide yt_dlp si disponible
+        log("BOOT", "PyNaCl         : MANQUANT ❌ — vc.play() ne transmettra AUCUN son !")
+        log("BOOT", "                 -> Ajouter PyNaCl>=1.5.0 dans requirements.txt")
+    # ── Options audio actives ────────────────────────────────────────
+    log("BOOT", f"FFMPEG opts    : before='{FFMPEG_BEFORE_OPTIONS}' / options='{FFMPEG_OPTIONS}'")
     if YT_DLP_OK:
-        log("BOOT", f"yt_dlp player_client : ios+web (anti-bot-check datacenter)")
+        log("BOOT", "yt_dlp         : player_client=[ios, web] (anti-bot-check datacenter)")
     log("BOOT", f"PORT           : {PORT}")
     log("BOOT", f"REMOTE_ENABLED : {REMOTE_ENABLED}")
     log("BOOT", "DISCORD_TOKEN  : " + ("OK" if TOKEN else "*** MANQUANT ***"))
