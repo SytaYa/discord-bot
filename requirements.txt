@@ -12,7 +12,9 @@ python-dotenv==1.0.1
 asyncpg==0.29.0
 
 # ── Musique ───────────────────────────────────────────────────────
-yt-dlp==2024.8.6
+# yt-dlp : PAS de version épinglée — YouTube change ses protections régulièrement.
+# La dernière version contient toujours les meilleurs contournements anti-bot.
+yt-dlp
 PyNaCl==1.5.0
 
 # ── Spotify (optionnel) ───────────────────────────────────────────
