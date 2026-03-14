@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.10 — hébergé sur Render
+  BOT AGENT v5.11 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -21,6 +21,8 @@
   v5.9 : (révoqué — mode PIPE causait boucle infinie : FFmpeg EOF avant que yt-dlp écrive)
   v5.10: CDN direct propre, guard anti-boucle _fail_count max 3,
          yt-dlp non épinglé (toujours à jour), YTDL_STREAM retries=5
+  v5.11: logger yt_dlp custom (erreurs visibles Render), retry vanilla,
+         android player_client, music_locked+message console
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -60,7 +62,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.10"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.11"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -340,14 +342,18 @@ def tconf(gid):
             "music_enabled":    True,   # True = tout le monde, False = rôle requis
             "music_role_id":    None,   # rôle autorisé si music_enabled=False
             "music_volume":     50,     # volume par défaut (0–100)
+            "music_locked":     False,  # True = musique verrouillée globalement
+            "music_lock_msg":   "",     # message affiché quand la musique est verrouillée
         }
     if "menu_locked" not in ticket_config[gid]:
         ticket_config[gid]["menu_locked"] = False
     # Migrations des champs musique manquants (serveurs existants)
     cfg = ticket_config[gid]
-    if "music_enabled" not in cfg: cfg["music_enabled"] = True
-    if "music_role_id" not in cfg: cfg["music_role_id"] = None
-    if "music_volume"  not in cfg: cfg["music_volume"]  = 50
+    if "music_enabled"  not in cfg: cfg["music_enabled"]  = True
+    if "music_role_id"  not in cfg: cfg["music_role_id"]  = None
+    if "music_volume"   not in cfg: cfg["music_volume"]   = 50
+    if "music_locked"   not in cfg: cfg["music_locked"]   = False
+    if "music_lock_msg" not in cfg: cfg["music_lock_msg"] = ""
     return ticket_config[gid]
 
 def is_configured(gid):
@@ -935,17 +941,23 @@ FFMPEG_OPTS = {
 # Extractor args partagés : forcer le client iOS pour contourner le bot check
 _YT_EXTRACTOR_ARGS = {
     "youtube": {
-        "player_client": ["ios", "web", "tv", "mweb"],  # essayer plusieurs clients
+        "player_client": ["android", "mweb", "ios", "web"],  # android le moins bloqué sur datacenter 2025
     }
 }
 
 _YTDL_BASE = {
-    "quiet":           True,
-    "no_warnings":     True,
+    "quiet":           False,  # False pour voir les vraies erreurs yt_dlp dans les logs
+    "no_warnings":     False,
     "socket_timeout":  15,
     "geo_bypass":      True,
     "http_headers":    {"User-Agent": _YT_UA},
     "extractor_args":  _YT_EXTRACTOR_ARGS,
+    "logger":          type("YDLLogger", (), {
+        "debug":   lambda s, m: None,
+        "info":    lambda s, m: None,
+        "warning": lambda s, m: log("YTDL", f"[warn] {m}", flush=True),
+        "error":   lambda s, m: log("YTDL", f"[ERR] {m}", flush=True),
+    })(),
 }
 
 YTDL_FLAT = {
@@ -1002,6 +1014,11 @@ def _mstate(gid: int) -> dict:
 
 def _can_use_music(member: discord.Member, gid: int) -> tuple[bool, str]:
     cfg = tconf(gid)
+    # Vérifier le verrou global en premier
+    if cfg.get("music_locked", False):
+        msg = cfg.get("music_lock_msg") or "🔒 Le système musique est temporairement indisponible."
+        return False, msg
+    # Vérifier l'accès par rôle
     if cfg.get("music_enabled", True):
         return True, ""
     role_id = cfg.get("music_role_id")
@@ -1281,21 +1298,62 @@ async def _get_stream_info(webpage_url: str) -> dict | None:
             log("MUSIC", f"AUCUN format utilisable — liste formats: {[f.get('ext') for f in fmts[:5]]}", flush=True)
             return None
 
+    # Tentative 1 : avec extractor_args (player_client android/mweb/ios/web)
     try:
         result = await asyncio.wait_for(
             loop.run_in_executor(None, _fetch),
             timeout=30.0
         )
         if result:
-            log("MUSIC", f"Stream+méta résolu ✔ — titre='{result['title'] or '?'}' dur={result['duration']}s", flush=True)
-        else:
-            log("MUSIC", "Stream introuvable — aucun format utilisable", flush=True)
-        return result
+            log("MUSIC", f"Stream résolu ✔ — titre='{result['title'] or '?'}' dur={result['duration']}s", flush=True)
+            return result
+        log("MUSIC", "Tentative 1 échouée (extractor_args) — retry sans extractor_args", flush=True)
     except asyncio.TimeoutError:
-        log("MUSIC", f"TIMEOUT 30s _get_stream_info pour : {webpage_url[:70]}", flush=True)
+        log("MUSIC", f"TIMEOUT 30s tentative 1 pour : {webpage_url[:70]}", flush=True)
+    except Exception as e:
+        log("MUSIC", f"Exception tentative 1 : {e}", flush=True)
+
+    # Tentative 2 : sans extractor_args (YouTube vanilla)
+    log("MUSIC", f"Tentative 2 sans extractor_args pour : {webpage_url[:70]}", flush=True)
+    def _fetch_vanilla():
+        opts_vanilla = {k: v for k, v in YTDL_STREAM.items() if k != "extractor_args"}
+        with youtube_dl.YoutubeDL(opts_vanilla) as ydl:
+            try:
+                info = ydl.extract_info(webpage_url, download=False)
+            except Exception as ex:
+                log("MUSIC", f"Tentative 2 erreur : {str(ex)[:150]}", flush=True)
+                return None
+            if not info: return None
+            stream = info.get("url")
+            if stream and stream.startswith("http"):
+                log("MUSIC", f"Tentative 2 ✔ format='{info.get('format','?')}'", flush=True)
+                return {"stream_url": stream, "title": info.get("title"),
+                        "duration": int(info.get("duration") or 0),
+                        "thumbnail": info.get("thumbnail")}
+            fmts = info.get("formats") or []
+            for f in reversed(fmts):
+                u = f.get("url") or ""
+                if u.startswith("http"):
+                    log("MUSIC", f"Tentative 2 fallback ext={f.get('ext')}", flush=True)
+                    return {"stream_url": u, "title": info.get("title"),
+                            "duration": int(info.get("duration") or 0),
+                            "thumbnail": info.get("thumbnail")}
+            return None
+    try:
+        result2 = await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch_vanilla),
+            timeout=30.0
+        )
+        if result2:
+            log("MUSIC", f"Stream résolu ✔ (vanilla) — titre='{result2['title'] or '?'}'", flush=True)
+        else:
+            log("MUSIC", "Stream introuvable après 2 tentatives — YouTube bloque cette IP ?", flush=True)
+        return result2
+    except asyncio.TimeoutError:
+        log("MUSIC", f"TIMEOUT 30s tentative 2 pour : {webpage_url[:70]}", flush=True)
         return None
     except Exception as e:
-        log("MUSIC", f"Exception _get_stream_info : {e}", flush=True)
+        log("MUSIC", f"Exception tentative 2 : {e}", flush=True)
         return None
 
 
@@ -3595,6 +3653,19 @@ async def _dispatch_inner(action, p):
         tconf(g.id)["music_volume"] = level
         await save_data()
         return {"ok": True, "volume": level}
+
+    elif action == "music_lock":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        locked  = bool(p.get("locked", True))
+        msg     = str(p.get("message", "")) .strip()
+        cfg["music_locked"]   = locked
+        cfg["music_lock_msg"] = msg
+        await save_data()
+        log("MUSIC", f"[{g.name}] Musique {'verrouillée' if locked else 'déverrouillée'}"
+            + (f" — '{msg}'" if msg else ""), flush=True)
+        return {"ok": True, "locked": locked, "message": msg}
 
     elif action == "music_cfg":
         g = _g(p)
