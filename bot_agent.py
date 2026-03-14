@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.9 — hébergé sur Render
+  BOT AGENT v5.10 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -18,8 +18,9 @@
   v5.8 : asyncio.sleep remplace time.sleep dans _play_next, chargement Opus explicite
          au boot et dans on_ready, _now_playing_embed securise (title=None safe),
          log opus.is_loaded() avant vc.play(), diagnostic Opus dans after()
-  v5.9 : architecture hybride PIPE (yt-dlp CLI→FFmpeg stdin) + CDN fallback
-         contourne le blocage YouTube IPs datacenter Render 2025
+  v5.9 : (révoqué — mode PIPE causait boucle infinie : FFmpeg EOF avant que yt-dlp écrive)
+  v5.10: CDN direct propre, guard anti-boucle _fail_count max 3,
+         yt-dlp non épinglé (toujours à jour), YTDL_STREAM retries=5
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -59,7 +60,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.9"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.10"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -969,7 +970,8 @@ YTDL_STREAM = {
     "format":            "bestaudio/best",
     "extract_flat":      False,
     "noplaylist":        True,
-    "extractor_retries": 3,
+    "extractor_retries": 5,
+    "retries":           5,
 }
 
 
@@ -1341,11 +1343,15 @@ async def _play_next(guild: discord.Guild):
 
     track = st["queue"].pop(0)
     st["current"] = track
-    # title peut être None si la track vient d'une URL directe (autocomplete)
-    # sera rempli par _get_stream_info après résolution
+    # Guard anti-boucle infinie : si une track échoue 3 fois → skip définitif
+    _fails = track.get("_fail_count", 0)
+    if _fails >= 3:
+        log("MUSIC", f"[{guild.name}] Track échouée {_fails}x → skip définitif (anti-boucle)", flush=True)
+        await _play_next(guild)
+        return
     title_preview = track.get("title") or f"(URL: {(track.get('url') or '')[:40]})"
     url_preview   = (track.get("url") or "None")[:60]
-    log("MUSIC", f"[{guild.name}] Dépile '{title_preview}' | url={url_preview}", flush=True)
+    log("MUSIC", f"[{guild.name}] Dépile [{_fails} échec(s)] '{title_preview}' | url={url_preview}", flush=True)
 
     # Étape 1 : si url=None (track Spotify), chercher sur YT
     if not track.get("url"):
@@ -1367,119 +1373,68 @@ async def _play_next(guild: discord.Guild):
         log("MUSIC", f"[{guild.name}] URL YT trouvée : {track['url']}", flush=True)
 
     # ════════════════════════════════════════════════════════════════
-    # Étape 2+3 : créer la source audio — architecture hybride PIPE
-    #
-    # Méthode A (PIPE, préférée) :
-    #   yt-dlp CLI --output - | FFmpegPCMAudio(pipe=True)
-    #   yt-dlp télécharge l'audio en streaming → FFmpeg encode à la volée
-    #   Contourne le blocage YouTube sur les IPs datacenter (Render/AWS)
-    #   car YouTube traite différemment les téléchargements vs extractions URL
-    #
-    # Méthode B (CDN URL, fallback) :
-    #   yt_dlp Python → CDN URL → FFmpegPCMAudio(url)
-    #   Utilisée si yt-dlp CLI absent ou si on a déjà une stream_url en cache
+    # Étapes 2+3 : résoudre le stream CDN + créer la source FFmpeg
     # ════════════════════════════════════════════════════════════════
-    volume = st.get("volume", 0.5)
+    volume      = st.get("volume", 0.5)
     ffmpeg_source = None
     source        = None
-    _ytdlp_proc   = None   # process yt-dlp (mode PIPE) — pour cleanup dans _after
+    _ytdlp_proc   = None   # pas de subprocess yt-dlp externe
 
-    # ── Méthode A : PIPE ─────────────────────────────────────────
     webpage_url = track.get("url", "")
-    use_pipe = bool(_YTDLP_BIN and webpage_url)
 
-    if use_pipe:
-        log("MUSIC", f"[{guild.name}] ── Étape 2+3 : mode PIPE ──────────────────", flush=True)
-        log("MUSIC", f"[{guild.name}] yt-dlp CLI   : {_YTDLP_BIN}", flush=True)
-        log("MUSIC", f"[{guild.name}] webpage_url  : {webpage_url[:100]}", flush=True)
-        log("MUSIC", f"[{guild.name}] volume       : {volume:.0%}", flush=True)
-        try:
-            ytdlp_cmd = [
-                _YTDLP_BIN,
-                "--format", "bestaudio/best",
-                "--output", "-",              # écrire sur stdout
-                "--quiet",
-                "--no-warnings",
-                "--no-playlist",
-                "--extractor-args", "youtube:player_client=ios,web",
-                webpage_url,
-            ]
-            log("MUSIC", f"[{guild.name}] Lancement yt-dlp PIPE…", flush=True)
-            _ytdlp_proc = subprocess.Popen(
-                ytdlp_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            ffmpeg_source = discord.FFmpegPCMAudio(
-                _ytdlp_proc.stdout,
-                pipe=True,
-                executable=FFMPEG_EXECUTABLE,
-                options=FFMPEG_OPTIONS,
-                stderr=subprocess.PIPE,
-            )
-            source = discord.PCMVolumeTransformer(ffmpeg_source, volume=volume)
-            log("MUSIC", f"[{guild.name}] Source PIPE créée ✔ (yt-dlp→FFmpeg)", flush=True)
-        except Exception as _epipe:
-            import traceback as _tbpipe
-            log("MUSIC", f"[{guild.name}] Mode PIPE échoué : {_epipe} — fallback CDN", flush=True)
-            log("MUSIC", _tbpipe.format_exc(), flush=True)
-            if _ytdlp_proc:
-                try: _ytdlp_proc.kill()
-                except Exception: pass
-            _ytdlp_proc = None
-            ffmpeg_source = None
-            source = None
-            use_pipe = False
-
-    # ── Méthode B : CDN URL (fallback si PIPE indisponible ou échoué) ─
-    if not use_pipe or source is None:
-        log("MUSIC", f"[{guild.name}] ── Étape 2+3 : mode CDN URL ───────────────", flush=True)
-        stream_url = track.get("stream_url")
-        if not stream_url:
-            stream_info = await _get_stream_info(webpage_url)
-            if not stream_info:
-                title_disp = track.get("title") or webpage_url[:60] or "morceau inconnu"
-                log("MUSIC", f"[{guild.name}] Stream CDN introuvable pour '{title_disp}' — skip", flush=True)
-                ch_id = st.get("np_channel")
-                ch    = guild.get_channel(ch_id) if ch_id else None
-                if ch:
-                    try:
-                        await ch.send(
-                            f"⚠️ Impossible de lire **{title_disp}**\n"
-                            "_(Résolution audio échouée — vidéo privée, géobloquée ou bot check ?)_"
-                        )
-                    except Exception:
-                        pass
-                await _play_next(guild)
-                return
-            stream_url = stream_info["stream_url"]
-            if not track.get("title")    and stream_info.get("title"):
-                track["title"]     = stream_info["title"]
-            if not track.get("duration") and stream_info.get("duration"):
-                track["duration"]  = stream_info["duration"]
-            if not track.get("thumbnail") and stream_info.get("thumbnail"):
-                track["thumbnail"] = stream_info["thumbnail"]
-        track["stream_url"] = stream_url
-        log("MUSIC", f"[{guild.name}] CDN URL : {stream_url[:100]}", flush=True)
-        log("MUSIC", f"[{guild.name}] executable  : {FFMPEG_EXECUTABLE}", flush=True)
-        log("MUSIC", f"[{guild.name}] before_opts : {FFMPEG_BEFORE_OPTIONS}", flush=True)
-        log("MUSIC", f"[{guild.name}] volume      : {volume:.0%}", flush=True)
-        try:
-            ffmpeg_source = discord.FFmpegPCMAudio(
-                stream_url,
-                executable=FFMPEG_EXECUTABLE,
-                before_options=FFMPEG_BEFORE_OPTIONS,
-                options=FFMPEG_OPTIONS,
-                stderr=subprocess.PIPE,
-            )
-            source = discord.PCMVolumeTransformer(ffmpeg_source, volume=volume)
-            log("MUSIC", f"[{guild.name}] Source CDN créée ✔", flush=True)
-        except Exception as _ecdn:
-            import traceback as _tbcdn
-            log("MUSIC", f"[{guild.name}] ERREUR FFmpegPCMAudio CDN : {_ecdn}", flush=True)
-            log("MUSIC", _tbcdn.format_exc(), flush=True)
+    # Étape 2 : résoudre l'URL CDN via yt_dlp Python
+    stream_url = track.get("stream_url")
+    if not stream_url:
+        log("MUSIC", f"[{guild.name}] ── Étape 2 : résolution CDN ────────────────", flush=True)
+        log("MUSIC", f"[{guild.name}] webpage_url : {webpage_url[:100]}", flush=True)
+        stream_info = await _get_stream_info(webpage_url)
+        if not stream_info:
+            title_disp = track.get("title") or webpage_url[:60] or "morceau inconnu"
+            log("MUSIC", f"[{guild.name}] ✘ CDN introuvable pour '{title_disp}' — skip", flush=True)
+            ch_id = st.get("np_channel")
+            ch    = guild.get_channel(ch_id) if ch_id else None
+            if ch:
+                try:
+                    await ch.send(
+                        f"⚠️ Impossible de lire **{title_disp}**\n"
+                        "_(Source audio indisponible — bot check YouTube, vidéo privée ou géobloquée ?)_"
+                    )
+                except Exception:
+                    pass
             await _play_next(guild)
             return
+        stream_url = stream_info["stream_url"]
+        if not track.get("title")    and stream_info.get("title"):
+            track["title"]     = stream_info["title"]
+        if not track.get("duration") and stream_info.get("duration"):
+            track["duration"]  = stream_info["duration"]
+        if not track.get("thumbnail") and stream_info.get("thumbnail"):
+            track["thumbnail"] = stream_info["thumbnail"]
+    track["stream_url"] = stream_url
+    log("MUSIC", f"[{guild.name}] ✔ CDN résolu : {stream_url[:90]}", flush=True)
+
+    # Étape 3 : créer la source FFmpeg
+    log("MUSIC", f"[{guild.name}] ── Étape 3 : FFmpegPCMAudio ──────────────────", flush=True)
+    log("MUSIC", f"[{guild.name}] executable  : {FFMPEG_EXECUTABLE}", flush=True)
+    log("MUSIC", f"[{guild.name}] before_opts : {FFMPEG_BEFORE_OPTIONS}", flush=True)
+    log("MUSIC", f"[{guild.name}] options     : {FFMPEG_OPTIONS}", flush=True)
+    log("MUSIC", f"[{guild.name}] volume      : {volume:.0%}", flush=True)
+    try:
+        ffmpeg_source = discord.FFmpegPCMAudio(
+            stream_url,
+            executable=FFMPEG_EXECUTABLE,
+            before_options=FFMPEG_BEFORE_OPTIONS,
+            options=FFMPEG_OPTIONS,
+            stderr=subprocess.PIPE,
+        )
+        source = discord.PCMVolumeTransformer(ffmpeg_source, volume=volume)
+        log("MUSIC", f"[{guild.name}] ✔ Source FFmpeg créée", flush=True)
+    except Exception as _ecdn:
+        import traceback as _tbcdn
+        log("MUSIC", f"[{guild.name}] ✘ ERREUR FFmpegPCMAudio : {_ecdn}", flush=True)
+        log("MUSIC", _tbcdn.format_exc(), flush=True)
+        await _play_next(guild)
+        return
 
     # Étape 4 : after callback (appelé depuis le thread FFmpeg — PAS l'event loop)
     track_title_for_after = track.get("title") or "?"
@@ -1493,19 +1448,6 @@ async def _play_next(guild: discord.Guild):
                 stderr_output = _ffmpeg_proc.stderr.read().decode("utf-8", errors="replace").strip()
             except Exception:
                 pass
-        # Lire stderr yt-dlp si mode PIPE (erreurs de téléchargement)
-        ytdlp_stderr = ""
-        if _ytdlp_proc is not None:
-            try:
-                _ytdlp_proc.wait(timeout=2)
-                raw = _ytdlp_proc.stderr.read() if _ytdlp_proc.stderr else b""
-                ytdlp_stderr = raw.decode("utf-8", errors="replace").strip()
-            except Exception:
-                pass
-            try: _ytdlp_proc.kill()
-            except Exception: pass
-        if ytdlp_stderr:
-            log("MUSIC", f"[{guild.name}] yt-dlp stderr : {ytdlp_stderr[-400:]}", flush=True)
 
         if error:
             err_msg = str(error)
@@ -1538,6 +1480,17 @@ async def _play_next(guild: discord.Guild):
                 log("MUSIC", f"[{guild.name}] FFmpeg stderr (info) : {stderr_output[-200:]}", flush=True)
 
         try:
+            # Guard anti-boucle : si erreur, incrémenter le compteur de la track
+            if error and st.get("current") is track:
+                track["_fail_count"] = track.get("_fail_count", 0) + 1
+                cnt = track["_fail_count"]
+                if cnt < 3:
+                    log("MUSIC", f"[{guild.name}] after : retry {cnt}/3 — '{track_title_for_after}'", flush=True)
+                    track.pop("stream_url", None)   # vider le cache CDN pour résolution fraîche
+                    st["queue"].insert(0, track)
+                    st["current"] = None
+                else:
+                    log("MUSIC", f"[{guild.name}] after : 3 échecs → skip définitif '{track_title_for_after}'", flush=True)
             loop = client.loop
             if loop and not loop.is_closed():
                 log("MUSIC", f"[{guild.name}] after : planification _play_next", flush=True)

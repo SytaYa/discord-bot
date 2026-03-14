@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════
-#  Dockerfile — discord-bot v5.2
+#  Dockerfile — discord-bot v5.10
 #  Image : python:3.11-slim (Debian Bookworm)
 #  FFmpeg installé via apt-get (on est root dans le build Docker)
 #  Compatible Render Web Service (Docker runtime)
@@ -33,7 +33,8 @@ WORKDIR /app
 # Copier requirements en premier pour profiter du cache Docker layer
 COPY requirements.txt .
 RUN pip install --upgrade pip \
- && pip install -r requirements.txt
+ && pip install -r requirements.txt \
+ && pip install --upgrade yt-dlp   # forcer la dernière version à chaque build
 
 # ── Code source ────────────────────────────────────────────────────
 COPY bot_agent.py .
