@@ -11,11 +11,16 @@ python-dotenv==1.0.1
 # ── Base de données ───────────────────────────────────────────────
 asyncpg==0.29.0
 
-# ── Musique ───────────────────────────────────────────────────────
-# yt-dlp : PAS de version épinglée — YouTube change ses protections régulièrement.
-# La dernière version contient toujours les meilleurs contournements anti-bot.
-yt-dlp
+# ── Audio Discord ─────────────────────────────────────────────────
 PyNaCl==1.5.0
 
-# ── Spotify (optionnel) ───────────────────────────────────────────
+# ── Musique : métadonnées et recherche ────────────────────────────
 spotipy==2.23.0
+
+# ── Musique : audio Deezer (lecture complète) ─────────────────────
+# pydeezer permet la lecture complète via token ARL (variable DEEZER_ARL).
+# Sans pydeezer, le bot joue les previews 30s via l'API Deezer publique.
+pydeezer
+
+# NOTE : yt-dlp et les cookies YouTube ont été supprimés.
+# Le système musique utilise maintenant Spotify (métadonnées) + Deezer (audio).

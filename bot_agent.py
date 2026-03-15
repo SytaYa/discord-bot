@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.15 — hébergé sur Render
+  BOT AGENT v5.18 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -28,14 +28,14 @@
   v5.13: FIX AUDIO — reconnect_streamed remis (cause du silence), quiet=True yt_dlp
   v5.14: cwd=BOT_DIR portable (fix /app), priorité changelog stricte
   v5.15: /playtest diagnostic, timing after(), CMD FFmpeg loggée, PID FFmpeg
+  v5.16: cookies YouTube via YT_COOKIES_B64 (fix bot check Render/AWS)
+  v5.17: REFONTE MUSIQUE — Spotify (UX) + Deezer (audio), suppression yt_dlp/YouTube
+  v5.18: Commandes musique retirées (/play /stop /skip /pause /resume /queue /volume)
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
-try:
-    import yt_dlp as youtube_dl
-    YT_DLP_OK = True
-except ImportError:
-    YT_DLP_OK = False
+# yt_dlp supprimé — le système musique utilise maintenant Spotify + Deezer
+YT_DLP_OK = False   # conservé pour compatibilité dispatch console existant
 try:
     import spotipy
     from spotipy.oauth2 import SpotifyClientCredentials
@@ -68,11 +68,14 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.15"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.18"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+
+# Cookies YouTube supprimés (système musique migré vers Spotify + Deezer)
+YT_COOKIES_OK = False  # conservé pour compatibilité
 
 # ── État musique par serveur ──────────────────────────────────
 # music_state[guild_id] = {
@@ -817,6 +820,25 @@ async def send_update_notifications():
     log("BOT", f"Notifications envoyées : {sent}/{len(client.guilds)} serveur(s)")
 
 
+
+@tree.command(name="menu", description="Ouvrir le panel de gestion staff")
+async def slash_menu(inter: discord.Interaction):
+    try:
+        if not inter.guild:
+            await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True)
+            return
+        if not is_staff(inter.user, inter.guild.id):
+            await inter.response.send_message("🚫 Réservé au staff configuré.", ephemeral=True)
+            return
+        await send_staff_menu_inter(inter, inter.guild)
+    except Exception as e:
+        log("SLASH", f"/menu : {e}")
+        try:
+            await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception:
+            pass
+
+
 @client.event
 async def on_ready():
     log("BOT", "Connecte en tant que", str(client.user))
@@ -867,12 +889,7 @@ async def on_ready():
     try:
         # S'assurer que /menu est bien dans le tree local avant le sync
         existing = {c.name for c in tree.get_commands()}
-        music_cmds = {
-            "play": slash_play, "stop": slash_stop, "skip": slash_skip,
-            "pause": slash_pause, "resume": slash_resume,
-            "queue": slash_queue, "volume": slash_volume,
-        }
-        for name, fn in {"menu": slash_menu, **music_cmds}.items():
+        for name, fn in {"menu": slash_menu}.items():
             if name not in existing:
                 tree.add_command(fn)
                 log("SLASH", f"{name} ajouté au tree local")
@@ -956,120 +973,93 @@ async def on_raw_reaction_add(payload):
 # ── Commandes Discord ──────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════
-#  MOTEUR MUSIQUE  v3 — pipeline robuste
-#  Utilise yt_dlp + discord.py voice + FFmpeg
+# ══════════════════════════════════════════════════════════════════
+#  MOTEUR MUSIQUE  v4 — Spotify + Deezer
 #
 #  ARCHITECTURE :
-#  /play → _classify_query() → _resolve_query() → tracks[]
-#    Spotify track/album/playlist → spotipy → titre+artiste → url=None
-#    URL YT playlist → YTDL_FLAT_PLAYLIST → webpage_url par vidéo
-#    URL YT directe  → YTDL_FLAT → webpage_url
-#    Texte libre     → ytsearch1 → webpage_url
-#  → _play_next() → si url=None: _search_yt_sync() → webpage_url
-#  → _get_stream_url(webpage_url) → YTDL_STREAM (extract_flat=False!) → CDN audio
-#  → FFmpegPCMAudio(cdn_url) → PCMVolumeTransformer → vc.play()
+#  Spotify  → UX, recherche, autocomplete, métadonnées, playlists
+#  Deezer   → source audio (preview 30s gratuit OU stream complet avec ARL)
+#
+#  Flux :
+#  /play → Spotify (titre, artiste, durée, cover)
+#        → Deezer search (titre + artiste) → deezer_id + preview_url
+#        → _play_next() → stream_url (ARL si dispo) ou preview_url (30s)
+#        → FFmpegPCMAudio(url_mp3_direct) → vc.play()
+#
+#  Sans DEEZER_ARL : previews 30s uniquement (signalé clairement)
+#  Avec DEEZER_ARL  : lecture complète via pydeezer
+#
+#  Pas de YouTube, pas de yt_dlp, pas de cookies YouTube.
 # ══════════════════════════════════════════════════════════════════
 
-import shutil as _shutil
+import shutil as _shutil, urllib.request as _urllib_req, json as _json_mod
 
-# ── Chemin FFmpeg ─────────────────────────────────────────────────
+# ── FFmpeg ─────────────────────────────────────────────────────────
 FFMPEG_EXECUTABLE = _shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 log("MUSIC", f"FFmpeg : {FFMPEG_EXECUTABLE}", flush=True)
 
-# ── User-Agent Chrome — évite la détection bot YouTube sur les IPs datacenter ──
-_YT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-# ── Options FFmpeg ────────────────────────────────────────────────
-# -reconnect 1             : reconnexion TCP automatique
-# -reconnect_streamed 1    : OBLIGATOIRE — YouTube ferme la connexion après chaque
-#                            chunk HTTP. Sans ça, FFmpeg décode 1-3s puis s'arrête
-#                            silencieusement (after(None) appelé prématurément).
-# -reconnect_delay_max 5   : délai max entre reconnexions
-# -vn                      : ignorer la piste vidéo (audio uniquement)
-FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+# Options FFmpeg pour les streams MP3/FLAC Deezer (HTTP direct, pas chunked)
+FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS        = "-vn"
-FFMPEG_OPTS = {
-    "executable":     FFMPEG_EXECUTABLE,
-    "before_options": FFMPEG_BEFORE_OPTIONS,
-    "options":        FFMPEG_OPTIONS,
-}
 
-# ══════════════════════════════════════════════════════════════════
-# Options yt_dlp — trois jeux distincts, ne jamais mélanger
-#
-# PROBLÈME DATACENTER (Render/AWS/GCP) :
-# YouTube détecte les IPs de datacenter et répond
-# "Sign in to confirm you're not a bot" pour le client web standard.
-# FIX : forcer player_client="ios" — le client iOS contourne ce check
-# car YouTube ne vérifie pas le JS player pour les requêtes mobiles Apple.
-# Source: https://github.com/yt-dlp/yt-dlp/issues/9997
-# ══════════════════════════════════════════════════════════════════
+# ── Deezer config ──────────────────────────────────────────────────
+DEEZER_ARL  = os.getenv("DEEZER_ARL", "")   # token ARL pour lecture complète (optionnel)
+DEEZER_OK   = False                          # sera True si pydeezer dispo et ARL valide
+_deezer_client = None                        # instance pydeezer (si disponible)
 
-# Extractor args partagés : forcer le client iOS pour contourner le bot check
-_YT_EXTRACTOR_ARGS = {
-    "youtube": {
-        "player_client": ["android", "mweb", "ios", "web"],  # android le moins bloqué sur datacenter 2025
-    }
-}
-
-_YTDL_BASE = {
-    "quiet":           True,   # True pour ne pas polluer stdout — les erreurs passent par le logger
-    "no_warnings":     True,
-    "socket_timeout":  15,
-    "geo_bypass":      True,
-    "http_headers":    {"User-Agent": _YT_UA},
-    "extractor_args":  _YT_EXTRACTOR_ARGS,
-    "logger":          type("YDLLogger", (), {
-        "debug":   lambda s, m: None,
-        "info":    lambda s, m: None,
-        "warning": lambda s, m: log("YTDL", f"[warn] {m}", flush=True),
-        "error":   lambda s, m: log("YTDL", f"[ERR] {m}", flush=True),
-    })(),
-}
-
-YTDL_FLAT = {
-    **_YTDL_BASE,
-    "format":       "bestaudio/best",
-    "extract_flat": True,
-    "noplaylist":   True,
-}
-
-YTDL_FLAT_PLAYLIST = {
-    **_YTDL_BASE,
-    "format":       "bestaudio/best",
-    "extract_flat": "in_playlist",
-    "noplaylist":   False,
-}
-
-# YTDL_STREAM : résout l'URL en stream CDN audio réel
-# extract_flat=False OBLIGATOIRE — avec True yt_dlp retourne la page HTML
-# player_client=ios (via _YT_EXTRACTOR_ARGS) → contourne le bot check datacenter
-YTDL_STREAM = {
-    **_YTDL_BASE,
-    "format":            "bestaudio/best",
-    "extract_flat":      False,
-    "noplaylist":        True,
-    "extractor_retries": 5,
-    "retries":           5,
-}
+try:
+    import pydeezer
+    if DEEZER_ARL:
+        _deezer_client = pydeezer.Deezer(arl=DEEZER_ARL)
+        DEEZER_OK = True
+        log("MUSIC", "pydeezer : OK ✔ (lecture complète disponible)", flush=True)
+    else:
+        log("MUSIC", "pydeezer : installé mais DEEZER_ARL absent → previews 30s uniquement", flush=True)
+except ImportError:
+    log("MUSIC", "pydeezer : non installé → previews 30s uniquement", flush=True)
+except Exception as _e_dz:
+    log("MUSIC", f"pydeezer : erreur init : {_e_dz} → previews 30s", flush=True)
 
 
-# ── Chemin yt-dlp CLI (pour le mode PIPE) ────────────────────────
-def _ytdlp_executable() -> str | None:
-    """Cherche le binaire yt-dlp dans les chemins courants."""
-    import shutil as _sh
-    for candidate in ("yt-dlp", "/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp"):
-        found = _sh.which(candidate) or (candidate if __import__("os").path.isfile(candidate) else None)
-        if found:
-            return found
-    return None
+# ── Deezer API (publique, sans auth) ──────────────────────────────
+def _deezer_search(query: str) -> dict | None:
+    """
+    Cherche un titre sur Deezer via l'API publique.
+    Retourne le premier résultat : {id, preview, cover, duration} ou None.
+    L'API Deezer publique ne nécessite aucune clé.
+    """
+    try:
+        import urllib.parse as _up
+        url = "https://api.deezer.com/search?q=" + _up.quote(query) + "&limit=1&output=json"
+        req = _urllib_req.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _urllib_req.urlopen(req, timeout=10) as resp:
+            data = _json_mod.loads(resp.read().decode())
+        items = data.get("data") or []
+        if not items:
+            return None
+        t = items[0]
+        return {
+            "deezer_id":   str(t.get("id", "")),
+            "preview_url": t.get("preview", ""),   # MP3 30s direct, sans DRM
+            "thumbnail":   (t.get("album") or {}).get("cover_medium") or (t.get("album") or {}).get("cover") or "",
+            "duration":    t.get("duration", 0),
+        }
+    except Exception as e:
+        log("MUSIC", f"Deezer search error : {e}", flush=True)
+        return None
 
-_YTDLP_BIN = _ytdlp_executable()
-log("MUSIC", f"yt-dlp CLI : {_YTDLP_BIN or 'introuvable'}", flush=True)
+
+def _deezer_full_url(deezer_id: str) -> str | None:
+    """Obtient l'URL du stream complet via pydeezer (nécessite DEEZER_ARL)."""
+    if not DEEZER_OK or not _deezer_client:
+        return None
+    try:
+        track_data = _deezer_client.get_track(deezer_id)
+        download_url = track_data.get_url()
+        return download_url
+    except Exception as e:
+        log("MUSIC", f"pydeezer get_url error : {e}", flush=True)
+        return None
 
 
 # ── État musique par serveur ──────────────────────────────────────
@@ -1085,11 +1075,9 @@ def _mstate(gid: int) -> dict:
 
 def _can_use_music(member: discord.Member, gid: int) -> tuple[bool, str]:
     cfg = tconf(gid)
-    # Vérifier le verrou global en premier
     if cfg.get("music_locked", False):
         msg = cfg.get("music_lock_msg") or "🔒 Le système musique est temporairement indisponible."
         return False, msg
-    # Vérifier l'accès par rôle
     if cfg.get("music_enabled", True):
         return True, ""
     role_id = cfg.get("music_role_id")
@@ -1105,20 +1093,17 @@ def _can_use_music(member: discord.Member, gid: int) -> tuple[bool, str]:
 # ── Classification de la query ────────────────────────────────────
 def _classify_query(query: str) -> str:
     """
-    Retourne le type :
-    'spotify_track' | 'spotify_album' | 'spotify_playlist' |
-    'yt_playlist'   | 'yt_url'        | 'text'
+    'spotify_track' | 'spotify_album' | 'spotify_playlist' | 'text'
+    YouTube et autres URLs ne sont plus supportés.
     """
     q = query.strip()
     if "spotify.com/track/"    in q: return "spotify_track"
     if "spotify.com/album/"    in q: return "spotify_album"
     if "spotify.com/playlist/" in q: return "spotify_playlist"
-    if ("youtube.com" in q or "youtu.be" in q) and "list=" in q: return "yt_playlist"
-    if q.startswith(("http://", "https://")): return "yt_url"
     return "text"
 
 
-# ── Helpers Spotify ───────────────────────────────────────────────
+# ── Client Spotify ────────────────────────────────────────────────
 def _sp_client():
     if not SPOTIPY_OK or not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         return None
@@ -1130,308 +1115,142 @@ def _sp_client():
         log("MUSIC", f"Erreur client Spotify : {e}", flush=True)
         return None
 
-def _sp_track_to_search(t: dict) -> str:
-    """Track Spotify → requête de recherche YT : 'Titre Artiste'."""
-    name   = t.get("name") or ""
+
+def _sp_track_info(t: dict, album_thumb: str = "") -> dict:
+    """Extrait les infos d'un objet track Spotify → dict track normalisé."""
+    name    = t.get("name") or "Titre inconnu"
     artists = t.get("artists") or []
-    artist  = artists[0].get("name", "") if artists else ""
-    return f"{name} {artist}".strip()
+    artist  = ", ".join(a.get("name", "") for a in artists) if artists else "Artiste inconnu"
+    dur_s   = int((t.get("duration_ms") or 0) / 1000)
+    images  = (t.get("album") or {}).get("images") or []
+    thumb   = (images[0].get("url") if images else "") or album_thumb
+    sp_url  = (t.get("external_urls") or {}).get("spotify") or ""
+    return {
+        "title":        name,
+        "artist":       artist,
+        "duration":     dur_s,
+        "thumbnail":    thumb,
+        "spotify_url":  sp_url,
+        "deezer_id":    None,
+        "preview_url":  None,
+        "stream_url":   None,
+        "requester":    "",
+        "_fail_count":  0,
+    }
 
 
-# ── Résolution Spotify (synchrone, pour executor) ────────────────
+# ── Résolution Spotify → liste de tracks ─────────────────────────
 def _resolve_spotify_sync(query: str, qtype: str) -> list[dict]:
     """
-    Retourne une liste de tracks avec title=<recherche YT> et url=None.
-    url=None = pas encore d'URL YT → sera recherchée dans _play_next.
+    Spotify URL → liste de tracks normalisés.
+    Chaque track a: title, artist, duration, thumbnail, spotify_url.
+    deezer_id et stream_url sont résolus plus tard dans _play_next.
     """
     sp = _sp_client()
     if not sp:
-        log("MUSIC", "Spotify : credentials manquants", flush=True)
+        log("MUSIC", "Spotify : credentials manquants ou SPOTIPY non installé", flush=True)
         return []
     tracks = []
     try:
         if qtype == "spotify_track":
-            t        = sp.track(query)
-            search_q = _sp_track_to_search(t)
-            log("MUSIC", f"Spotify track → recherche : '{search_q}'", flush=True)
-            tracks = [{"title": search_q, "url": None,
-                       "duration": int((t.get("duration_ms") or 0) / 1000),
-                       "thumbnail": None}]
+            t = sp.track(query)
+            tracks = [_sp_track_info(t)]
+            log("MUSIC", f"Spotify track : '{tracks[0]['title']}' — {tracks[0]['artist']}", flush=True)
 
         elif qtype == "spotify_album":
             album  = sp.album(query)
+            images = (album.get("images") or [])
+            thumb  = images[0].get("url") if images else ""
             items  = (sp.album_tracks(query, limit=50) or {}).get("items") or []
-            thumb  = ((album.get("images") or [{}])[0]).get("url")
             for item in items:
-                sq = _sp_track_to_search(item)
-                tracks.append({"title": sq, "url": None,
-                               "duration": int((item.get("duration_ms") or 0) / 1000),
-                               "thumbnail": thumb})
-            log("MUSIC", f"Spotify album : {len(tracks)} tracks", flush=True)
+                tr = _sp_track_info(item, album_thumb=thumb)
+                tracks.append(tr)
+            log("MUSIC", f"Spotify album : {len(tracks)} tracks — '{album.get('name','?')}'", flush=True)
 
         elif qtype == "spotify_playlist":
-            results = sp.playlist_items(
-                query,
-                fields="items.track(name,artists,duration_ms)",
-                limit=50) or {}
-            for item in (results.get("items") or []):
+            pl      = sp.playlist(query, fields="name,images,tracks.items.track")
+            images  = (pl.get("images") or [])
+            pl_thumb = images[0].get("url") if images else ""
+            items   = (pl.get("tracks") or {}).get("items") or []
+            for item in items:
                 t = item.get("track")
-                if not t: continue
-                sq = _sp_track_to_search(t)
-                tracks.append({"title": sq, "url": None,
-                               "duration": int((t.get("duration_ms") or 0) / 1000),
-                               "thumbnail": None})
-            log("MUSIC", f"Spotify playlist : {len(tracks)} tracks", flush=True)
+                if not t or not t.get("name"): continue
+                tr = _sp_track_info(t, album_thumb=pl_thumb)
+                tracks.append(tr)
+            log("MUSIC", f"Spotify playlist : {len(tracks)} tracks — '{pl.get('name','?')}'", flush=True)
+
     except Exception as e:
         log("MUSIC", f"Erreur Spotify ({qtype}) : {e}", flush=True)
     return tracks
 
 
-# ── Recherche YT texte → webpage_url (synchrone) ─────────────────
-def _search_yt_sync(query: str) -> list[dict]:
-    """
-    ytsearch1 → premier résultat YT.
-    Retourne webpage_url (PAS un stream CDN).
-    """
+def _search_spotify_sync(query: str) -> list[dict]:
+    """Recherche texte Spotify → premier résultat track."""
+    sp = _sp_client()
+    if not sp:
+        return []
     try:
-        with youtube_dl.YoutubeDL(YTDL_FLAT) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-            if not info: return []
-            entries = info.get("entries") or []
-            if not entries: return []
-            e = entries[0]
-            if not e: return []
-            vid_id  = e.get("id") or ""
-            webpage = e.get("webpage_url") or e.get("url") or ""
-            if vid_id and not webpage.startswith("http"):
-                webpage = f"https://www.youtube.com/watch?v={vid_id}"
-            if not webpage: return []
-            log("MUSIC", f"YT search '{query[:50]}' → '{e.get('title','?')}' {webpage}", flush=True)
-            return [{"title":     e.get("title") or query,
-                     "url":       webpage,
-                     "duration":  int(e.get("duration") or 0),
-                     "thumbnail": e.get("thumbnail")}]
+        results = sp.search(q=query, type="track", limit=1)
+        items   = (results.get("tracks") or {}).get("items") or []
+        if not items:
+            log("MUSIC", f"Spotify search '{query[:50]}' : aucun résultat", flush=True)
+            return []
+        tr = _sp_track_info(items[0])
+        log("MUSIC", f"Spotify search '{query[:50]}' → '{tr['title']}' — {tr['artist']}", flush=True)
+        return [tr]
     except Exception as e:
-        log("MUSIC", f"Erreur _search_yt_sync '{query[:50]}' : {e}", flush=True)
+        log("MUSIC", f"Spotify search error '{query[:50]}' : {e}", flush=True)
         return []
 
 
-# ── Résolution playlist YT (synchrone) ───────────────────────────
-def _resolve_yt_playlist_sync(url: str) -> list[dict]:
-    try:
-        with youtube_dl.YoutubeDL(YTDL_FLAT_PLAYLIST) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info: return []
-            result = []
-            for e in (info.get("entries") or []):
-                if not e: continue
-                vid_id  = e.get("id") or ""
-                webpage = e.get("url") or e.get("webpage_url") or ""
-                if vid_id and not webpage.startswith("http"):
-                    webpage = f"https://www.youtube.com/watch?v={vid_id}"
-                if not webpage: continue
-                result.append({"title":     e.get("title") or "Titre inconnu",
-                               "url":       webpage,
-                               "duration":  int(e.get("duration") or 0),
-                               "thumbnail": e.get("thumbnail")})
-            log("MUSIC", f"Playlist YT : {len(result)} tracks", flush=True)
-            return result
-    except Exception as e:
-        log("MUSIC", f"Erreur playlist YT : {e}", flush=True)
-        return []
-
-
-# ── Résolution URL YT directe (synchrone) ────────────────────────
-def _resolve_yt_url_sync(url: str) -> list[dict]:
-    """
-    Pour une URL YT directe (venant de l'autocomplete ou saisie manuelle) :
-    on NE refait PAS un appel yt_dlp extract_flat ici — c'est inutile et coûteux
-    (5-20s) et ça fait dépasser le timeout de l'interaction Discord.
-    On construit le track directement avec l'URL fournie.
-    Le titre exact sera récupéré par YTDL_STREAM lors de la résolution du stream.
-    """
-    # Normaliser l'URL : s'assurer qu'on a bien une URL watch?v= propre
-    url = url.strip()
-    # Extraire le video_id pour avoir une URL canonique
-    vid_id = ""
-    if "watch?v=" in url:
-        import re as _re
-        m = _re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
-        if m: vid_id = m.group(1)
-    elif "youtu.be/" in url:
-        import re as _re
-        m = _re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
-        if m: vid_id = m.group(1)
-
-    canonical = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else url
-    log("MUSIC", f"URL directe → track immédiat (pas d'appel yt_dlp) : {canonical}", flush=True)
-    return [{"title": None, "url": canonical, "duration": 0, "thumbnail": None}]
-
-
-# ── Point d'entrée ────────────────────────────────────────────────
+# ── Point d'entrée résolution ─────────────────────────────────────
 async def _resolve_query(query: str) -> list[dict]:
-    """
-    Résout une query en liste de tracks.
-    track["url"] = webpage_url YT, ou None pour les tracks Spotify
-    (l'URL YT sera cherchée dans _play_next au moment de jouer).
-    """
+    """Résout une query en liste de tracks Spotify."""
     qtype = _classify_query(query)
     log("MUSIC", f"Query='{query[:60]}' type={qtype}", flush=True)
     loop = asyncio.get_running_loop()
 
     if qtype in ("spotify_track", "spotify_album", "spotify_playlist"):
-        tracks = await loop.run_in_executor(None, _resolve_spotify_sync, query, qtype)
-        if not tracks:
-            log("MUSIC", "Spotify échoué — fallback recherche YT texte brut", flush=True)
-            tracks = await loop.run_in_executor(None, _search_yt_sync, query)
-        return tracks
+        return await loop.run_in_executor(None, _resolve_spotify_sync, query, qtype)
 
-    if qtype == "yt_playlist":
-        return await loop.run_in_executor(None, _resolve_yt_playlist_sync, query)
-
-    if qtype == "yt_url":
-        return await loop.run_in_executor(None, _resolve_yt_url_sync, query)
-
-    # text
-    return await loop.run_in_executor(None, _search_yt_sync, query)
+    # Recherche texte libre → Spotify search
+    return await loop.run_in_executor(None, _search_spotify_sync, query)
 
 
-# ── Résolution stream CDN audio + métadonnées ────────────────────
-async def _get_stream_info(webpage_url: str) -> dict | None:
+# ── Résolution audio Deezer pour un track ─────────────────────────
+def _resolve_deezer_for_track(track: dict) -> dict:
     """
-    webpage_url YT → dict { "stream_url", "title", "duration", "thumbnail" }
-    Un seul appel YTDL_STREAM (extract_flat=False) fait tout en une fois :
-    - résout le CDN audio (obligatoire, extract_flat=False)
-    - récupère titre, durée, thumbnail (utile pour les URLs venant d'autocomplete)
-    Retourne None si échec.
+    Cherche le track sur Deezer et peuple deezer_id + preview_url.
+    Si DEEZER_ARL disponible, obtient aussi stream_url (lecture complète).
+    Retourne le track modifié.
     """
-    if not YT_DLP_OK:
-        return None
-    log("MUSIC", f"Résolution stream+métadonnées : {webpage_url[:70]}", flush=True)
-    loop = asyncio.get_running_loop()
+    search_q = f"{track['title']} {track['artist']}"
+    log("MUSIC", f"Deezer search : '{search_q[:60]}'", flush=True)
+    dz = _deezer_search(search_q)
+    if not dz:
+        log("MUSIC", f"Deezer : aucun résultat pour '{search_q[:50]}'", flush=True)
+        return track
 
-    def _fetch():
-        with youtube_dl.YoutubeDL(YTDL_STREAM) as ydl:
-            try:
-                info = ydl.extract_info(webpage_url, download=False)
-            except Exception as ex:
-                err_str = str(ex)
-                if "Sign in" in err_str or "bot" in err_str.lower() or "confirm" in err_str:
-                    log("MUSIC", f"BLOCAGE BOT YouTube pour {webpage_url[:50]} — player_client ios devrait contourner", flush=True)
-                elif "403" in err_str:
-                    log("MUSIC", f"HTTP 403 YouTube pour {webpage_url[:50]} — vidéo bloquée géographiquement ?", flush=True)
-                elif "429" in err_str:
-                    log("MUSIC", f"HTTP 429 YouTube pour {webpage_url[:50]} — trop de requêtes, attendre", flush=True)
-                elif "unavailable" in err_str.lower() or "private" in err_str.lower():
-                    log("MUSIC", f"Vidéo indisponible/privée : {webpage_url[:50]}", flush=True)
-                else:
-                    log("MUSIC", f"yt_dlp erreur sur {webpage_url[:50]} : {err_str[:120]}", flush=True)
-                return None
-            if not info:
-                log("MUSIC", f"yt_dlp info=None pour {webpage_url[:60]}", flush=True)
-                return None
+    track["deezer_id"]   = dz["deezer_id"]
+    track["preview_url"] = dz["preview_url"]
+    if not track["thumbnail"] and dz.get("thumbnail"):
+        track["thumbnail"] = dz["thumbnail"]
+    if not track["duration"] and dz.get("duration"):
+        track["duration"] = dz["duration"]
 
-            title     = info.get("title") or None
-            duration  = int(info.get("duration") or 0)
-            thumbnail = info.get("thumbnail")
-            fmts      = info.get("formats") or []
+    # Tenter le stream complet si ARL disponible
+    if DEEZER_OK and dz["deezer_id"]:
+        full_url = _deezer_full_url(dz["deezer_id"])
+        if full_url:
+            track["stream_url"] = full_url
+            log("MUSIC", f"Deezer stream complet ✔ (deezer_id={dz['deezer_id']})", flush=True)
+            return track
 
-            log("MUSIC", f"yt_dlp OK — title='{title}' dur={duration}s formats={len(fmts)}", flush=True)
-
-            # Chemin 1 : info["url"] = CDN direct (format single-stream résolu)
-            stream = info.get("url")
-            if stream and stream.startswith("http"):
-                fmt_note = info.get("format") or info.get("ext") or "?"
-                log("MUSIC", f"Stream CDN direct ✔ format='{fmt_note}' url={stream[:60]}", flush=True)
-                return {"stream_url": stream, "title": title,
-                        "duration": duration, "thumbnail": thumbnail}
-
-            # Chemin 2 : formats audio-only (vcodec=none, acodec présent)
-            audio_only = [f for f in fmts
-                          if f.get("acodec") not in (None, "none")
-                          and f.get("vcodec") in (None, "none")
-                          and (f.get("url") or "").startswith("http")]
-            if audio_only:
-                audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
-                log("MUSIC", f"{len(audio_only)} formats audio-only — abr={audio_only[0].get('abr')} ext={audio_only[0].get('ext')}", flush=True)
-                return {"stream_url": audio_only[0]["url"], "title": title,
-                        "duration": duration, "thumbnail": thumbnail}
-
-            # Chemin 3 : fallback — n'importe quel format avec URL HTTP
-            log("MUSIC", f"Pas de format audio-only — fallback sur {len(fmts)} formats totaux", flush=True)
-            for f in reversed(fmts):
-                u = f.get("url") or ""
-                if u.startswith("http"):
-                    log("MUSIC", f"Fallback format ext={f.get('ext')} acodec={f.get('acodec')}", flush=True)
-                    return {"stream_url": u, "title": title,
-                            "duration": duration, "thumbnail": thumbnail}
-
-            log("MUSIC", f"AUCUN format utilisable — liste formats: {[f.get('ext') for f in fmts[:5]]}", flush=True)
-            return None
-
-    # Tentative 1 : avec extractor_args (player_client android/mweb/ios/web)
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, _fetch),
-            timeout=30.0
-        )
-        if result:
-            log("MUSIC", f"Stream résolu ✔ — titre='{result['title'] or '?'}' dur={result['duration']}s", flush=True)
-            return result
-        log("MUSIC", "Tentative 1 échouée (extractor_args) — retry sans extractor_args", flush=True)
-    except asyncio.TimeoutError:
-        log("MUSIC", f"TIMEOUT 30s tentative 1 pour : {webpage_url[:70]}", flush=True)
-    except Exception as e:
-        log("MUSIC", f"Exception tentative 1 : {e}", flush=True)
-
-    # Tentative 2 : sans extractor_args (YouTube vanilla)
-    log("MUSIC", f"Tentative 2 sans extractor_args pour : {webpage_url[:70]}", flush=True)
-    def _fetch_vanilla():
-        opts_vanilla = {k: v for k, v in YTDL_STREAM.items() if k != "extractor_args"}
-        with youtube_dl.YoutubeDL(opts_vanilla) as ydl:
-            try:
-                info = ydl.extract_info(webpage_url, download=False)
-            except Exception as ex:
-                log("MUSIC", f"Tentative 2 erreur : {str(ex)[:150]}", flush=True)
-                return None
-            if not info: return None
-            stream = info.get("url")
-            if stream and stream.startswith("http"):
-                log("MUSIC", f"Tentative 2 ✔ format='{info.get('format','?')}'", flush=True)
-                return {"stream_url": stream, "title": info.get("title"),
-                        "duration": int(info.get("duration") or 0),
-                        "thumbnail": info.get("thumbnail")}
-            fmts = info.get("formats") or []
-            for f in reversed(fmts):
-                u = f.get("url") or ""
-                if u.startswith("http"):
-                    log("MUSIC", f"Tentative 2 fallback ext={f.get('ext')}", flush=True)
-                    return {"stream_url": u, "title": info.get("title"),
-                            "duration": int(info.get("duration") or 0),
-                            "thumbnail": info.get("thumbnail")}
-            return None
-    try:
-        result2 = await asyncio.wait_for(
-            loop.run_in_executor(None, _fetch_vanilla),
-            timeout=30.0
-        )
-        if result2:
-            log("MUSIC", f"Stream résolu ✔ (vanilla) — titre='{result2['title'] or '?'}'", flush=True)
-        else:
-            log("MUSIC", "Stream introuvable après 2 tentatives — YouTube bloque cette IP ?", flush=True)
-        return result2
-    except asyncio.TimeoutError:
-        log("MUSIC", f"TIMEOUT 30s tentative 2 pour : {webpage_url[:70]}", flush=True)
-        return None
-    except Exception as e:
-        log("MUSIC", f"Exception tentative 2 : {e}", flush=True)
-        return None
-
-
-# Alias rétrocompatible pour les appels qui utilisent encore _get_stream_url
-async def _get_stream_url(webpage_url: str) -> str | None:
-    result = await _get_stream_info(webpage_url)
-    return result["stream_url"] if result else None
+    # Fallback : preview 30s
+    if dz["preview_url"]:
+        track["stream_url"] = dz["preview_url"]
+        log("MUSIC", f"Deezer preview 30s ✔ url={dz['preview_url'][:60]}", flush=True)
+    return track
 
 
 # ── Utilitaires ───────────────────────────────────────────────────
@@ -1445,9 +1264,8 @@ def _fmt_duration(seconds: int) -> str:
 # ── Player ────────────────────────────────────────────────────────
 async def _play_next(guild: discord.Guild):
     """
-    Dépile et joue le prochain morceau.
-    Tracks Spotify (url=None) : recherche YT avant de résoudre le CDN.
-    File vide → attente 60 s → déco si inactif.
+    Dépile et joue le prochain morceau via Deezer.
+    Si pas de stream_url disponible → message clair à l'utilisateur.
     """
     st = _mstate(guild.id)
     vc = guild.voice_client
@@ -1458,96 +1276,65 @@ async def _play_next(guild: discord.Guild):
         return
 
     if not st["queue"]:
-        log("MUSIC", f"[{guild.name}] File vide — déconnexion auto dans 60 s si inactif", flush=True)
+        log("MUSIC", f"[{guild.name}] File vide — déconnexion auto dans 60s", flush=True)
         st["current"] = None
-        # Lancer le timer de déco en tâche de fond — NE PAS bloquer _play_next
         async def _auto_disconnect():
             await asyncio.sleep(60)
             vc2 = guild.voice_client
             if vc2 and vc2.is_connected() and not vc2.is_playing() and not vc2.is_paused():
-                log("MUSIC", f"[{guild.name}] Déconnexion après 60 s d'inactivité", flush=True)
+                log("MUSIC", f"[{guild.name}] Déconnexion après inactivité", flush=True)
                 await vc2.disconnect()
         asyncio.create_task(_auto_disconnect())
         return
 
     track = st["queue"].pop(0)
     st["current"] = track
-    # Guard anti-boucle infinie : si une track échoue 3 fois → skip définitif
-    _fails = track.get("_fail_count", 0)
-    if _fails >= 3:
-        log("MUSIC", f"[{guild.name}] Track échouée {_fails}x → skip définitif (anti-boucle)", flush=True)
+
+    # Guard anti-boucle
+    if track.get("_fail_count", 0) >= 3:
+        log("MUSIC", f"[{guild.name}] Track échouée 3x → skip définitif", flush=True)
         await _play_next(guild)
         return
-    title_preview = track.get("title") or f"(URL: {(track.get('url') or '')[:40]})"
-    url_preview   = (track.get("url") or "None")[:60]
-    log("MUSIC", f"[{guild.name}] Dépile [{_fails} échec(s)] '{title_preview}' | url={url_preview}", flush=True)
 
-    # Étape 1 : si url=None (track Spotify), chercher sur YT
-    if not track.get("url"):
-        log("MUSIC", f"[{guild.name}] Sans URL — recherche YT pour '{track['title']}'", flush=True)
+    log("MUSIC", f"[{guild.name}] ▶ '{track['title']}' — {track['artist']}", flush=True)
+
+    # Étape 1 : résoudre le stream Deezer si pas encore fait
+    if not track.get("stream_url"):
+        log("MUSIC", f"[{guild.name}] Résolution Deezer...", flush=True)
         loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, _search_yt_sync, track["title"])
-        if not results:
-            log("MUSIC", f"[{guild.name}] Recherche YT introuvable — skip", flush=True)
-            ch_id = st.get("np_channel")
-            ch    = guild.get_channel(ch_id) if ch_id else None
-            if ch:
-                try: await ch.send(f"⚠️ Introuvable sur YouTube : **{track['title']}** — skippé.")
-                except Exception: pass
-            await _play_next(guild)
-            return
-        track["url"]       = results[0]["url"]
-        track["duration"]  = track["duration"]  or results[0].get("duration", 0)
-        track["thumbnail"] = track["thumbnail"] or results[0].get("thumbnail")
-        log("MUSIC", f"[{guild.name}] URL YT trouvée : {track['url']}", flush=True)
+        track = await loop.run_in_executor(None, _resolve_deezer_for_track, track)
+        st["current"] = track
 
-    # ════════════════════════════════════════════════════════════════
-    # Étapes 2+3 : résoudre le stream CDN + créer la source FFmpeg
-    # ════════════════════════════════════════════════════════════════
-    volume      = st.get("volume", 0.5)
-    ffmpeg_source = None
-    source        = None
-    _ytdlp_proc   = None   # pas de subprocess yt-dlp externe
-
-    webpage_url = track.get("url", "")
-
-    # Étape 2 : résoudre l'URL CDN via yt_dlp Python
     stream_url = track.get("stream_url")
     if not stream_url:
-        log("MUSIC", f"[{guild.name}] ── Étape 2 : résolution CDN ────────────────", flush=True)
-        log("MUSIC", f"[{guild.name}] webpage_url : {webpage_url[:100]}", flush=True)
-        stream_info = await _get_stream_info(webpage_url)
-        if not stream_info:
-            title_disp = track.get("title") or webpage_url[:60] or "morceau inconnu"
-            log("MUSIC", f"[{guild.name}] ✘ CDN introuvable pour '{title_disp}' — skip", flush=True)
-            ch_id = st.get("np_channel")
-            ch    = guild.get_channel(ch_id) if ch_id else None
-            if ch:
-                try:
-                    await ch.send(
-                        f"⚠️ Impossible de lire **{title_disp}**\n"
-                        "_(Source audio indisponible — bot check YouTube, vidéo privée ou géobloquée ?)_"
-                    )
-                except Exception:
-                    pass
-            await _play_next(guild)
-            return
-        stream_url = stream_info["stream_url"]
-        if not track.get("title")    and stream_info.get("title"):
-            track["title"]     = stream_info["title"]
-        if not track.get("duration") and stream_info.get("duration"):
-            track["duration"]  = stream_info["duration"]
-        if not track.get("thumbnail") and stream_info.get("thumbnail"):
-            track["thumbnail"] = stream_info["thumbnail"]
-    track["stream_url"] = stream_url
-    log("MUSIC", f"[{guild.name}] ✔ CDN résolu : {stream_url[:90]}", flush=True)
+        title_disp = f"**{track['title']}** — {track['artist']}"
+        log("MUSIC", f"[{guild.name}] Aucun stream Deezer pour {title_disp} — skip", flush=True)
+        ch_id = st.get("np_channel")
+        ch    = guild.get_channel(ch_id) if ch_id else None
+        if ch:
+            try:
+                is_preview = not DEEZER_OK
+                if is_preview:
+                    msg = (f"⚠️ Impossible de lire **{track['title']}** — {track['artist']}\n"
+                           f"_Deezer n'a pas trouvé ce morceau._\n"
+                           f"Pour activer la lecture complète, configure `DEEZER_ARL`.")
+                else:
+                    msg = f"⚠️ Stream Deezer indisponible pour **{track['title']}** — skippé."
+                await ch.send(msg)
+            except Exception: pass
+        track["_fail_count"] = track.get("_fail_count", 0) + 1
+        await _play_next(guild)
+        return
 
-    # Étape 3 : créer la source FFmpeg
-    log("MUSIC", f"[{guild.name}] ── Étape 3 : FFmpegPCMAudio ──────────────────", flush=True)
-    log("MUSIC", f"[{guild.name}] executable  : {FFMPEG_EXECUTABLE}", flush=True)
-    log("MUSIC", f"[{guild.name}] before_opts : {FFMPEG_BEFORE_OPTIONS}", flush=True)
-    log("MUSIC", f"[{guild.name}] options     : {FFMPEG_OPTIONS}", flush=True)
-    log("MUSIC", f"[{guild.name}] volume      : {volume:.0%}", flush=True)
+    # Vérifier si c'est un preview 30s et prévenir l'utilisateur
+    is_preview = "preview" in stream_url or (not DEEZER_OK and not track.get("deezer_id") is None)
+    if is_preview and not DEEZER_OK:
+        log("MUSIC", f"[{guild.name}] Mode preview 30s (DEEZER_ARL absent)", flush=True)
+
+    # Étape 2 : créer la source FFmpeg
+    volume = st.get("volume", 0.5)
+    log("MUSIC", f"[{guild.name}] Stream URL : {stream_url[:80]}", flush=True)
+    log("MUSIC", f"[{guild.name}] FFmpeg : {FFMPEG_EXECUTABLE} | before={FFMPEG_BEFORE_OPTIONS}", flush=True)
     try:
         ffmpeg_source = discord.FFmpegPCMAudio(
             stream_url,
@@ -1557,129 +1344,57 @@ async def _play_next(guild: discord.Guild):
             stderr=subprocess.PIPE,
         )
         source = discord.PCMVolumeTransformer(ffmpeg_source, volume=volume)
-        log("MUSIC", f"[{guild.name}] ✔ Source FFmpeg créée", flush=True)
-    except Exception as _ecdn:
-        import traceback as _tbcdn
-        log("MUSIC", f"[{guild.name}] ✘ ERREUR FFmpegPCMAudio : {_ecdn}", flush=True)
-        log("MUSIC", _tbcdn.format_exc(), flush=True)
+        log("MUSIC", f"[{guild.name}] Source FFmpeg créée ✔", flush=True)
+    except Exception as e:
+        import traceback as _tb3
+        log("MUSIC", f"[{guild.name}] ERREUR FFmpegPCMAudio : {e}", flush=True)
+        log("MUSIC", _tb3.format_exc(), flush=True)
         await _play_next(guild)
         return
 
-    # Étape 4 : after callback (appelé depuis le thread FFmpeg — PAS l'event loop)
-    track_title_for_after = track.get("title") or "?"
-    _ffmpeg_proc = getattr(ffmpeg_source, "_process", None)
+    # Étape 3 : after callback
     import time as _time_after
-    _after_ref_time = _time_after.time()
+    _after_ref = _time_after.time()
+    track_title_for_after = f"{track.get('title','?')} — {track.get('artist','?')}"
+    _ffmpeg_proc = getattr(ffmpeg_source, "_process", None)
 
     def _after(error):
-        _dur = _time_after.time() - _after_ref_time
-        log("MUSIC", f"[{guild.name}] ── after() appelé — durée : {_dur:.1f}s", flush=True)
-        if _dur < 3.0:
-            log("MUSIC", f"[{guild.name}] ⚠ LECTURE < 3s — FFmpeg mort tôt (error={error})", flush=True)
-        # Lire stderr FFmpeg
-        stderr_output = ""
-        if _ffmpeg_proc is not None and _ffmpeg_proc.stderr:
-            try:
-                stderr_output = _ffmpeg_proc.stderr.read().decode("utf-8", errors="replace").strip()
-            except Exception:
-                pass
-
+        dur = _time_after.time() - _after_ref
         if error:
-            err_msg = str(error)
-            log("MUSIC", f"[{guild.name}] ── after : ERREUR ──────────────────────", flush=True)
-            log("MUSIC", f"[{guild.name}] after error   : {err_msg[:300]}", flush=True)
-            if stderr_output:
-                stderr_tail = stderr_output[-600:] if len(stderr_output) > 600 else stderr_output
-                log("MUSIC", f"[{guild.name}] FFmpeg stderr : {stderr_tail}", flush=True)
-            else:
-                log("MUSIC", f"[{guild.name}] FFmpeg stderr : (vide — FFmpeg n'a rien loggué)", flush=True)
-            # Diagnostic rapide
-            combined = (err_msg + stderr_output).lower()
-            if "no such file" in combined or "not found" in combined:
-                log("MUSIC", f"[{guild.name}] >>> FFmpeg INTROUVABLE à {FFMPEG_EXECUTABLE}", flush=True)
-            elif "403" in combined or "forbidden" in combined:
-                log("MUSIC", f"[{guild.name}] >>> HTTP 403 — URL CDN expirée ou bloquée", flush=True)
-            elif "invalid data" in combined or "moov atom" in combined:
-                log("MUSIC", f"[{guild.name}] >>> Format incompatible (stream non-seekable ?)", flush=True)
-            elif "opus" in combined or "encoder" in combined:
-                log("MUSIC", f"[{guild.name}] >>> Erreur Opus — is_loaded={discord.opus.is_loaded()}", flush=True)
-                if not discord.opus.is_loaded():
-                    log("MUSIC", f"[{guild.name}] >>> Opus NON CHARGÉ — libopus0 manquant dans le conteneur !", flush=True)
-                else:
-                    log("MUSIC", f"[{guild.name}] >>> Opus chargé mais erreur encoder — vérifier PyNaCl", flush=True)
-            elif "connection" in combined:
-                log("MUSIC", f"[{guild.name}] >>> Erreur réseau — CDN inaccessible", flush=True)
-        else:
-            log("MUSIC", f"[{guild.name}] Lecture terminée ✔ : '{track_title_for_after}'", flush=True)
-            if stderr_output:
-                log("MUSIC", f"[{guild.name}] FFmpeg stderr (info) : {stderr_output[-200:]}", flush=True)
-
-        try:
-            # Guard anti-boucle : si erreur, incrémenter le compteur de la track
-            if error and st.get("current") is track:
+            log("MUSIC", f"[{guild.name}] after ERREUR ({dur:.1f}s) : {error}", flush=True)
+            sterr = ""
+            if _ffmpeg_proc and _ffmpeg_proc.stderr:
+                try: sterr = _ffmpeg_proc.stderr.read(1000).decode("utf-8", errors="replace")
+                except Exception: pass
+            if sterr:
+                log("MUSIC", f"[{guild.name}] FFmpeg stderr : {sterr[:300]}", flush=True)
+            # retry
+            if st.get("current") is track:
                 track["_fail_count"] = track.get("_fail_count", 0) + 1
-                cnt = track["_fail_count"]
-                if cnt < 3:
-                    log("MUSIC", f"[{guild.name}] after : retry {cnt}/3 — '{track_title_for_after}'", flush=True)
-                    track.pop("stream_url", None)   # vider le cache CDN pour résolution fraîche
+                if track["_fail_count"] < 3:
+                    track.pop("stream_url", None)
                     st["queue"].insert(0, track)
                     st["current"] = None
-                else:
-                    log("MUSIC", f"[{guild.name}] after : 3 échecs → skip définitif '{track_title_for_after}'", flush=True)
-            loop = client.loop
-            if loop and not loop.is_closed():
-                log("MUSIC", f"[{guild.name}] after : planification _play_next", flush=True)
-                asyncio.run_coroutine_threadsafe(_play_next(guild), loop)
-            else:
-                log("MUSIC", f"[{guild.name}] after : event loop fermée — _play_next impossible", flush=True)
+        else:
+            log("MUSIC", f"[{guild.name}] ✔ Lecture terminée ({dur:.1f}s) : {track_title_for_after}", flush=True)
+            if dur < 3.0:
+                log("MUSIC", f"[{guild.name}] ⚠ Très courte ({dur:.1f}s) — URL invalide ?", flush=True)
+        try:
+            lp = client.loop
+            if lp and not lp.is_closed():
+                asyncio.run_coroutine_threadsafe(_play_next(guild), lp)
         except Exception as ex:
-            log("MUSIC", f"[{guild.name}] after run_coroutine_threadsafe exception : {ex}", flush=True)
+            log("MUSIC", f"[{guild.name}] after exception : {ex}", flush=True)
 
-    # Étape 5 : vc.play() — avec diagnostic complet
-    import shlex as _shlex, time as _time_mod
-    log("MUSIC", f"[{guild.name}] ── Étape 5 : vc.play() ───────────────────────", flush=True)
-    log("MUSIC", f"[{guild.name}] Opus chargé  : {discord.opus.is_loaded()}", flush=True)
-    log("MUSIC", f"[{guild.name}] avant play   : connected={vc.is_connected()} playing={vc.is_playing()} paused={vc.is_paused()}", flush=True)
-    # Logger la commande FFmpeg EXACTE que discord.py va exécuter
-    _ffcmd = ([FFMPEG_EXECUTABLE]
-              + _shlex.split(FFMPEG_BEFORE_OPTIONS)
-              + ["-i", stream_url]
-              + _shlex.split(FFMPEG_OPTIONS))
-    log("MUSIC", f"[{guild.name}] CMD FFmpeg   : {' '.join(_ffcmd[:6])} -i <url> {' '.join(_ffcmd[-2:])}", flush=True)
-    log("MUSIC", f"[{guild.name}] stream_url   : {stream_url}", flush=True)
-    _play_start_time = _time_mod.time()
+    # Étape 4 : vc.play()
+    log("MUSIC", f"[{guild.name}] Opus={discord.opus.is_loaded()} connected={vc.is_connected()} playing={vc.is_playing()}", flush=True)
     try:
         if vc.is_playing():
-            log("MUSIC", f"[{guild.name}] vc déjà en lecture → stop() avant play()", flush=True)
             vc.stop()
         vc.play(source, after=_after)
-        await asyncio.sleep(0.5)  # 500ms pour laisser FFmpeg vraiment démarrer
-        playing_now = vc.is_playing()
-        # PID du process FFmpeg (via source.original si PCMVolumeTransformer)
-        _ffproc = getattr(getattr(source, 'original', source), '_process', None)
-        _ffpid  = _ffproc.pid if _ffproc else "N/A"
-        log("MUSIC", f"[{guild.name}] après play   : connected={vc.is_connected()} playing={playing_now} paused={vc.is_paused()}", flush=True)
-        log("MUSIC", f"[{guild.name}] FFmpeg PID   : {_ffpid}", flush=True)
-        if playing_now:
-            log("MUSIC", f"[{guild.name}] ✔ LECTURE AUDIO EN COURS — '{track.get('title') or '?'}'", flush=True)
-            # Vérifier encore 2s plus tard que FFmpeg n'est pas mort prématurément
-            await asyncio.sleep(2.0)
-            still_playing = vc.is_playing()
-            log("MUSIC", f"[{guild.name}] Vérif 2.5s   : is_playing()={still_playing}", flush=True)
-            if not still_playing:
-                log("MUSIC", f"[{guild.name}] ⚠ FFmpeg mort en < 2.5s — URL CDN expirée ou -reconnect_streamed manquant", flush=True)
-        else:
-            log("MUSIC", f"[{guild.name}] ⚠ is_playing()=False 500ms après play() — FFmpeg a échoué au démarrage", flush=True)
-            if _ffproc:
-                try:
-                    _rc = _ffproc.poll()
-                    log("MUSIC", f"[{guild.name}] FFmpeg returncode : {_rc}", flush=True)
-                    _ff_err = (_ffproc.stderr.read(2000).decode('utf-8', errors='replace')
-                               if _ffproc.stderr else '')
-                    if _ff_err:
-                        log("MUSIC", f"[{guild.name}] FFmpeg stderr     : {_ff_err[:500]}", flush=True)
-                except Exception as _eproc:
-                    log("MUSIC", f"[{guild.name}] lecture proc stderr : {_eproc}", flush=True)
+        await asyncio.sleep(0.5)
+        playing = vc.is_playing()
+        log("MUSIC", f"[{guild.name}] vc.play() → is_playing={playing}", flush=True)
     except discord.errors.ClientException as e:
         log("MUSIC", f"[{guild.name}] vc.play ClientException : {e}", flush=True)
         if "already" in str(e).lower():
@@ -1694,83 +1409,87 @@ async def _play_next(guild: discord.Guild):
         await _play_next(guild)
         return
 
-    # Étape 6 : embed Now Playing
+    # Étape 5 : embed Now Playing
     ch_id = st.get("np_channel")
     ch    = guild.get_channel(ch_id) if ch_id else None
     if ch:
         try:
             await ch.send(embed=_now_playing_embed(track, guild))
+            # Si preview 30s, avertir
+            if is_preview and not DEEZER_OK:
+                await ch.send(
+                    "⏱️ **Aperçu 30s** — Pour la lecture complète, configure `DEEZER_ARL` "
+                    "dans les variables d'environnement Render.",
+                    delete_after=30
+                )
         except Exception as e:
             log("MUSIC", f"[{guild.name}] Erreur embed NP : {e}", flush=True)
 
 
 def _now_playing_embed(track: dict, guild: discord.Guild) -> discord.Embed:
-    # Sécuriser tous les champs — title peut être None (track URL directe)
-    title     = track.get("title") or "🎵 Lecture en cours"
-    url       = track.get("url")
-    thumbnail = track.get("thumbnail")
+    """Embed Now Playing enrichi avec métadonnées Spotify/Deezer."""
+    title    = track.get("title")   or "Titre inconnu"
+    artist   = track.get("artist")  or "Artiste inconnu"
+    sp_url   = track.get("spotify_url") or ""
+    thumbnail = track.get("thumbnail") or ""
     duration  = track.get("duration") or 0
     requester = track.get("requester") or "?"
+    is_preview = not DEEZER_OK or ("preview" in (track.get("stream_url") or ""))
 
+    desc = f"**[{title}]({sp_url})**" if sp_url else f"**{title}**"
     e = discord.Embed(
-        title="🎵  Lecture en cours",
-        description=f"**{title}**",
+        title="🎵  Lecture en cours" + (" *(aperçu 30s)*" if is_preview else ""),
+        description=desc,
         color=0x1DB954,
         timestamp=datetime.now(timezone.utc),
     )
-    if url:
-        e.description = f"**[{title}]({url})**"
-    if thumbnail:
-        try:
-            e.set_thumbnail(url=thumbnail)
-        except Exception:
-            pass
-    e.add_field(name="⏱  Durée",        value=_fmt_duration(duration),  inline=True)
-    e.add_field(name="👤  Demandé par", value=requester,                  inline=True)
+    e.add_field(name="🎤  Artiste",      value=artist,                          inline=True)
+    e.add_field(name="⏱  Durée",         value=_fmt_duration(duration),          inline=True)
+    e.add_field(name="👤  Demandé par",  value=requester,                        inline=True)
     vc = guild.voice_client
     if vc and vc.channel:
         e.add_field(name="🔊  Vocal", value=vc.channel.name, inline=True)
     n = len(_mstate(guild.id)["queue"])
     if n:
         e.set_footer(text=f"{n} morceau(x) suivant(s) dans la file")
+    if thumbnail:
+        try: e.set_thumbnail(url=thumbnail)
+        except Exception: pass
     return e
 
 
-# ── Autocomplete /play ────────────────────────────────────────────
+# ── Autocomplete /play — Spotify ──────────────────────────────────
 async def _autocomplete_play(inter: discord.Interaction, current: str):
     """
-    5 suggestions YouTube en temps réel (pendant la saisie de /play).
-    Retourne des Choice(name=titre, value=URL_canonique_youtube).
-    La value URL est utilisée directement par slash_play sans appel yt_dlp
-    supplémentaire — cohérence garantie autocomplete ↔ lecture.
+    5 suggestions Spotify en temps réel.
+    Retourne Choice(name='Titre — Artiste', value='spotify:track:ID').
+    La value est une URI Spotify → _classify_query → 'spotify_track'.
     """
     if not current or len(current) < 2:
         return []
-    if not YT_DLP_OK:
+    if not SPOTIPY_OK or not SPOTIFY_CLIENT_ID:
         return []
     loop = asyncio.get_running_loop()
 
     def _search():
-        opts = {**YTDL_FLAT, "playlistend": 5}
+        sp = _sp_client()
+        if not sp: return []
         try:
-            with youtube_dl.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch5:{current}", download=False)
-                if not info:
-                    log("MUSIC", f"Autocomplete '{current[:30]}' : yt_dlp info=None", flush=True)
-                    return []
-                results = []
-                for e in (info.get("entries") or []):
-                    if not e: continue
-                    title  = (e.get("title") or "?")[:100]
-                    vid_id = e.get("id") or ""
-                    if not vid_id:
-                        continue  # sans id on ne peut pas construire une URL fiable
-                    # Toujours construire une URL canonique depuis l'id
-                    # (évite les URLs malformées ou manquantes selon la version yt_dlp)
-                    webpage = f"https://www.youtube.com/watch?v={vid_id}"
-                    results.append((title, webpage))
-                log("MUSIC", f"Autocomplete '{current[:30]}' → {len(results)} suggestions", flush=True)
-                return results
+            res   = sp.search(q=current, type="track", limit=5)
+            items = (res.get("tracks") or {}).get("items") or []
+            out   = []
+            for t in items:
+                name    = t.get("name", "?")[:80]
+                artists = t.get("artists") or []
+                artist  = artists[0].get("name", "?") if artists else "?"
+                label   = f"{name} — {artist}"[:100]
+                # Construire une URL Spotify complète (reconnue par _classify_query)
+                sp_id   = t.get("id", "")
+                value   = f"https://open.spotify.com/track/{sp_id}"
+                if sp_id:
+                    out.append((label, value))
+            log("MUSIC", f"Autocomplete '{current[:30]}' → {len(out)} suggestions Spotify", flush=True)
+            return out
         except Exception as ex:
             log("MUSIC", f"Autocomplete erreur : {ex}", flush=True)
             return []
@@ -1778,550 +1497,18 @@ async def _autocomplete_play(inter: discord.Interaction, current: str):
     try:
         results = await asyncio.wait_for(
             loop.run_in_executor(None, _search),
-            timeout=2.8  # Discord coupe l'autocomplete après 3s — on doit répondre avant
+            timeout=2.8
         )
         return [app_commands.Choice(name=t, value=u) for t, u in results if u][:5]
     except asyncio.TimeoutError:
-        log("MUSIC", f"Autocomplete TIMEOUT 2.8s pour '{current[:30]}'", flush=True)
+        log("MUSIC", f"Autocomplete TIMEOUT pour '{current[:30]}'", flush=True)
         return []
     except Exception as ex:
-        log("MUSIC", f"Autocomplete exception executor : {ex}", flush=True)
+        log("MUSIC", f"Autocomplete exception : {ex}", flush=True)
         return []
 
-async def handle_cmds(message):
-    if not message.guild: return
-    content = message.content.strip()
-    guild   = message.guild
-    cfg     = tconf(guild.id)
-
-    # Les actions sur ticket se font uniquement via le salon staff (boutons/menu) ou commandes !taccept/trefuse/tclose
-    # On ignore !accept/refuse/close tapés dans le salon ticket lui-même
-
-    if not content.startswith("!"): return
-    parts = content[1:].split(); cmd = parts[0].lower(); args = parts[1:]
-
-    if cmd == "ticket":
-        if maintenance_mode:
-            await message.channel.send("🔧 **Bot en maintenance** — tickets temporairement indisponibles."); return
-        ok_cfg, msg_cfg = is_configured(guild.id)
-        if not ok_cfg: await message.channel.send("❌ " + msg_cfg); return
-        if not args:
-            if not cfg["types"]: await message.channel.send("❌ Aucun type de ticket configuré."); return
-            await message.channel.send("🎫 **Ouvrir un ticket :**\n" +
-                "\n".join("• `!ticket " + k + "` — " + v["emoji"] + " " + v["label"] for k, v in cfg["types"].items()))
-            return
-        key = args[0].lower()
-        if key not in cfg["types"]: await message.channel.send("❌ Type inconnu : `" + key + "`"); return
-        ch, err = await open_ticket(guild, message.author, key)
-        if err: await message.channel.send("❌ " + err)
-        return
-
-    if not is_staff(message.author, guild.id): return
-
-    if cmd == "tpending":
-        gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == guild.id]
-        if not gp: await message.channel.send("📭 Aucun salon en attente."); return
-        lines = ["`" + str(i) + ".` <#" + str(k) + ">  " + v["detected_at"] for i, (k, v) in enumerate(gp, 1)]
-        await message.channel.send("📥 **En attente :**\n" + "\n".join(lines) + "\n`!tlaunch <n°> <type>`")
-
-    elif cmd == "tlaunch":
-        if len(args) < 2: await message.channel.send("❌ `!tlaunch <n°> <type> [membre]`"); return
-        gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == guild.id]
-        ch_obj = None; pdata = None
-        try:
-            idx = int(args[0]) - 1
-            if 0 <= idx < len(gp): ch_obj = guild.get_channel(gp[idx][0]); pdata = gp[idx][1]
-        except ValueError:
-            for k, v in gp:
-                c = guild.get_channel(k)
-                if c and args[0].lstrip("#").lower() in c.name.lower(): ch_obj = c; pdata = v; break
-        if not ch_obj: await message.channel.send("❌ Salon introuvable."); return
-        key = args[1].lower()
-        if key not in cfg["types"]: await message.channel.send("❌ Types : " + ", ".join("`" + k + "`" for k in cfg["types"])); return
-        # Priorité : 3e arg → owner_id stocké → premier non-admin dans salon
-        member = None
-        if len(args) >= 3:
-            member = find_member(args[2], guild)
-            if not member: await message.channel.send("❌ Membre introuvable."); return
-        if not member:
-            owner_id = (pdata or {}).get("owner_id")
-            if owner_id: member = guild.get_member(owner_id)
-        if not member:
-            membres_ch = [m for m in guild.members if not m.bot and ch_obj.permissions_for(m).view_channel
-                          and not m.guild_permissions.administrator]
-            if not membres_ch: membres_ch = [m for m in guild.members if not m.bot and ch_obj.permissions_for(m).view_channel]
-            if not membres_ch: await message.channel.send("❌ Aucun membre dans ce salon."); return
-            member = membres_ch[0]
-        await message.channel.send("▶️ Lancement pour " + member.mention + " dans " + ch_obj.mention + "…")
-        asyncio.create_task(run_questions(guild, cfg, ch_obj, member, key))
-
-    elif cmd == "tlist":
-        filtre = args[0].lower() if args else "open"
-        ss = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id]
-        if filtre == "open":   ss = [s for s in ss if s["status"] in ("open", "pending")]
-        elif filtre == "closed": ss = [s for s in ss if s["status"] not in ("open", "pending")]
-        if not ss: await message.channel.send("📭 Aucun ticket (" + filtre + ")."); return
-        icons = {"open": "🟡", "pending": "🟡", "accepted": "✅", "refused": "❌", "closed": "🔒"}
-        await message.channel.send("🎫 **Tickets :**\n" + "\n".join(
-            icons.get(s["status"], "❓") + " `#" + str(s["number"]).zfill(4) + "` " + s["type"] + " <@" + str(s["user_id"]) + ">"
-            for s in sorted(ss, key=lambda x: x["number"])))
-
-    elif cmd in ("taccept", "trefuse", "tclose"):
-        if not args: await message.channel.send("❌ `!" + cmd + " <n°>`"); return
-        try: num = int(args[0].lstrip("#"))
-        except ValueError: await message.channel.send("❌ Numéro invalide."); return
-        s = next((x for x in ticket_sessions.values() if x["guild_id"] == guild.id and x["number"] == num), None)
-        if not s: await message.channel.send("❌ Ticket #" + str(num) + " introuvable."); return
-        act = {"taccept": "accepted", "trefuse": "refused", "tclose": "closed"}[cmd]
-        raison = " ".join(args[1:]) if len(args) > 1 else {"accepted": "Accepté.", "refused": "Refusé.", "closed": "Fermé."}.get(act, "")
-        await do_action(guild, s, act, raison, message.author)
-        await message.add_reaction("✅")
-
-    elif cmd == "tsend":
-        if len(args) < 2: await message.channel.send("❌ `!tsend <n°> <msg>`"); return
-        try: num = int(args[0].lstrip("#"))
-        except ValueError: await message.channel.send("❌ Numéro invalide."); return
-        s = next((x for x in ticket_sessions.values() if x["guild_id"] == guild.id and x["number"] == num), None)
-        if not s: await message.channel.send("❌ Ticket #" + str(num) + " introuvable."); return
-        ch_obj = guild.get_channel(s["channel_id"])
-        if not ch_obj: await message.channel.send("❌ Salon introuvable."); return
-        await ch_obj.send("📢 **Staff** (" + message.author.display_name + ") : " + " ".join(args[1:]))
-        await message.add_reaction("✅")
-
-    elif cmd == "thelp":
-        await message.channel.send(
-            "🎫 **Commandes tickets**\n"
-            "`!ticket [type]` `!tpending` `!tlaunch <n°> <type>`\n"
-            "`!tlist [open|closed|all]` `!taccept <n°>` `!trefuse <n°>` `!tclose <n°>`\n"
-            "`!tsend <n°> <msg>` `/menu`")
 
 
-
-# ════════════════════════════════════════════════════════════════
-#  SLASH COMMANDS
-# ════════════════════════════════════════════════════════════════
-@tree.command(name="menu", description="Ouvrir le panel de gestion staff")
-async def slash_menu(inter: discord.Interaction):
-    try:
-        # Vérifications rapides (< 1 ms) — répondent avant tout traitement lent
-        if not inter.guild:
-            await inter.response.send_message(
-                "Cette commande n'est disponible que sur un serveur.", ephemeral=True)
-            return
-        guild = inter.guild
-        cfg   = tconf(guild.id)
-        if maintenance_mode:
-            await inter.response.send_message(
-                "🔧 Le bot est actuellement en maintenance. Réessaie plus tard.", ephemeral=True)
-            return
-        if cfg.get("menu_locked"):
-            await inter.response.send_message(
-                "🔒 Le menu est actuellement désactivé par l'administration.", ephemeral=True)
-            return
-        if not is_staff(inter.user, guild.id):
-            await inter.response.send_message("🚫 Accès réservé au staff.", ephemeral=True)
-            return
-        # defer() immédiat — Discord reçoit la réponse en < 1s, on a 15 min pour le followup
-        await inter.response.defer(ephemeral=False)
-        await send_staff_menu_inter(inter, guild)
-    except discord.errors.InteractionResponded:
-        # L'interaction a déjà été répondue (cas de double-clic rapide)
-        pass
-    except Exception as e:
-        import traceback
-        log("SLASH", f"/menu exception : {e}")
-        log("SLASH", traceback.format_exc())
-        # Tenter de notifier l'utilisateur si possible
-        try:
-            msg = "❌ Une erreur interne s'est produite. Réessaie dans quelques secondes."
-            if inter.response.is_done():
-                await inter.followup.send(msg, ephemeral=True)
-            else:
-                await inter.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
-
-
-# ══════════════════════════════════════════════════════════════════
-#  SLASH COMMANDS MUSIQUE
-# ══════════════════════════════════════════════════════════════════
-
-def _music_check(inter: discord.Interaction) -> tuple[bool, str]:
-    """Vérifie : guild OK, vocal OK, accès OK. Retourne (ok, error_msg)."""
-    if not inter.guild:
-        return False, "Cette commande n'est disponible que sur un serveur."
-    ok_, msg = _can_use_music(inter.user, inter.guild.id)
-    if not ok_:
-        return False, msg
-    return True, ""
-
-@tree.command(name="play", description="Lancer de la musique (titre, lien ou playlist Spotify)")
-@app_commands.describe(query="Titre, lien YouTube ou lien de playlist Spotify")
-@app_commands.autocomplete(query=_autocomplete_play)
-async def slash_play(inter: discord.Interaction, query: str):
-    try:
-        ok_, msg = _music_check(inter)
-        if not ok_:
-            await inter.response.send_message(msg, ephemeral=True); return
-        if not inter.user.voice or not inter.user.voice.channel:
-            await inter.response.send_message("🔇 Tu dois être dans un salon vocal.", ephemeral=True); return
-        if not YT_DLP_OK:
-            await inter.response.send_message(
-                "❌ `yt_dlp` n'est pas installé sur le serveur. Ajoute `yt_dlp` à `requirements.txt`.",
-                ephemeral=True); return
-
-        await inter.response.defer()
-
-        qtype = _classify_query(query)
-        log("MUSIC", f"/play reçu — query='{query[:60]}' type={qtype} user={inter.user}", flush=True)
-
-        # Résoudre la requête avec timeout de sécurité
-        # Discord donne 15 min pour followup après defer(), mais yt_dlp peut bloquer
-        try:
-            tracks = await asyncio.wait_for(_resolve_query(query), timeout=30.0)
-        except asyncio.TimeoutError:
-            log("MUSIC", f"/play TIMEOUT 30s pour query='{query[:60]}'", flush=True)
-            await inter.followup.send("⏱ Recherche trop longue (timeout 30s). Réessaie.", ephemeral=True)
-            return
-        log("MUSIC", f"/play résolu : {len(tracks)} track(s)", flush=True)
-        if not tracks:
-            await inter.followup.send("❌ Aucun résultat pour cette recherche.", ephemeral=True); return
-
-        # Renseigner le demandeur
-        for t in tracks:
-            t["requester"] = inter.user.display_name
-
-        guild = inter.guild
-        st    = _mstate(guild.id)
-        st["np_channel"] = inter.channel_id
-
-        # ── Connexion vocale robuste ──────────────────────────────────────
-        # Cas gérés :
-        #   A) Bot non connecté → connect()
-        #   B) Bot connecté même salon → rien
-        #   C) Bot connecté autre salon → move_to()
-        #   D) Objet voice_client périmé (is_connected=False) → cleanup + connect()
-        vc             = guild.voice_client
-        target_channel = inter.user.voice.channel
-        log("MUSIC", f"vocal : vc={vc} connected={vc.is_connected() if vc else 'N/A'} target={target_channel.name}", flush=True)
-        try:
-            if vc and not vc.is_connected():
-                # Cas D : objet périmé → nettoyer pour éviter "Already connected"
-                log("MUSIC", "voice_client périmé (is_connected=False) → cleanup", flush=True)
-                try: await vc.disconnect(force=True)
-                except Exception: pass
-                vc = None
-            if vc and vc.is_connected():
-                if vc.channel != target_channel:
-                    log("MUSIC", f"Déplacement vocal : {vc.channel.name} → {target_channel.name}", flush=True)
-                    await vc.move_to(target_channel)
-                    log("MUSIC", f"Move vocal OK ✔", flush=True)
-                else:
-                    log("MUSIC", f"Déjà connecté à {target_channel.name} ✔", flush=True)
-            else:
-                log("MUSIC", f"Connexion au vocal : {target_channel.name}", flush=True)
-                vc = await target_channel.connect()
-                log("MUSIC", f"Connexion vocale OK ✔ → {vc.channel.name}", flush=True)
-        except Exception as e:
-            log("MUSIC", f"Erreur connexion vocal : {e}", flush=True)
-            await inter.followup.send(f"❌ Impossible de rejoindre le salon vocal : {e}"); return
-
-        # Synchroniser le volume
-        vol_pct = tconf(guild.id).get("music_volume", 50)
-        st["volume"] = vol_pct / 100
-
-        # Ajouter les tracks à la file
-        # was_empty : on vérifie aussi vc.is_playing() car current peut être orphelin
-        # (morceau précédent planté → current != None mais rien ne joue)
-        was_empty = not st["queue"] and not (vc.is_playing() or vc.is_paused())
-        st["queue"].extend(tracks)
-
-        if len(tracks) == 1:
-            title = tracks[0].get("title") or "🎵 Morceau en attente de résolution"
-            msg   = f"✅ **{title}** ajouté à la file."
-        else:
-            msg = f"✅ **{len(tracks)} morceaux** ajoutés à la file."
-
-        await inter.followup.send(msg)
-
-        # Lancer la lecture si rien ne joue
-        log("MUSIC", f"was_empty={was_empty} is_playing={vc.is_playing()} is_paused={vc.is_paused()}", flush=True)
-        if was_empty and not (vc.is_playing() or vc.is_paused()):
-            log("MUSIC", "Lancement _play_next ✔", flush=True)
-            await _play_next(guild)
-        else:
-            log("MUSIC", f"Lecture déjà en cours — {len(st['queue'])} en file", flush=True)
-
-    except discord.errors.InteractionResponded:
-        pass
-    except Exception as e:
-        import traceback
-        log("SLASH", f"/play exception : {e}"); log("SLASH", traceback.format_exc())
-        try:
-            m = "❌ Erreur lors de la lecture. Réessaie."
-            if inter.response.is_done(): await inter.followup.send(m, ephemeral=True)
-            else: await inter.response.send_message(m, ephemeral=True)
-        except Exception: pass
-
-
-@tree.command(name="playtest", description="[DEBUG] Tester l'audio avec une URL YouTube fixe")
-async def slash_playtest(inter: discord.Interaction):
-    """Diagnostic audio complet — URL fixe, bypass de toute la logique de recherche."""
-    import shlex as _shlex, time as _ttest
-    TEST_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # Me at the zoo (19s, toujours dispo)
-    await inter.response.defer(ephemeral=True)
-    if not inter.guild:
-        await inter.followup.send("❌ Serveur requis.", ephemeral=True); return
-    if not inter.user.voice or not inter.user.voice.channel:
-        await inter.followup.send("❌ Rejoins un vocal d'abord.", ephemeral=True); return
-    if not YT_DLP_OK:
-        await inter.followup.send("❌ yt_dlp manquant.", ephemeral=True); return
-
-    guild = inter.guild
-    log("TEST", "╔══ /playtest ═══════════════════════════════════════", flush=True)
-    log("TEST", f"║ URL      : {TEST_URL}", flush=True)
-    log("TEST", f"║ FFmpeg   : {FFMPEG_EXECUTABLE}", flush=True)
-    log("TEST", f"║ Opus     : {discord.opus.is_loaded()}", flush=True)
-
-    # Connexion vocale
-    vc = guild.voice_client
-    target = inter.user.voice.channel
-    try:
-        if vc and not vc.is_connected():
-            try: await vc.disconnect(force=True)
-            except Exception: pass
-            vc = None
-        if vc and vc.is_connected():
-            if vc.channel != target: await vc.move_to(target)
-        else:
-            vc = await target.connect()
-        log("TEST", f"║ Vocal    : {vc.channel.name} ✔", flush=True)
-    except Exception as e:
-        log("TEST", f"║ Vocal ERREUR : {e}", flush=True)
-        await inter.followup.send(f"❌ Vocal : {e}", ephemeral=True); return
-
-    # Résolution yt_dlp
-    log("TEST", "║ ── yt_dlp ──────────────────────────────────────────", flush=True)
-    t0 = _ttest.time()
-    si = await _get_stream_info(TEST_URL)
-    log("TEST", f"║ Durée    : {_ttest.time()-t0:.1f}s", flush=True)
-    if not si:
-        log("TEST", "║ ✘ yt_dlp a échoué → voir logs [YTDL] / [MUSIC]", flush=True)
-        await inter.followup.send("❌ yt_dlp échec. Voir logs [YTDL]/[MUSIC].", ephemeral=True); return
-    log("TEST", f"║ URL CDN  : {si['stream_url']}", flush=True)
-    log("TEST", f"║ Titre    : {si.get('title')}  dur={si.get('duration')}s", flush=True)
-
-    # FFmpegPCMAudio
-    log("TEST", "║ ── FFmpegPCMAudio ──────────────────────────────────", flush=True)
-    _cmd = ([FFMPEG_EXECUTABLE] + _shlex.split(FFMPEG_BEFORE_OPTIONS)
-            + ["-i", si["stream_url"]] + _shlex.split(FFMPEG_OPTIONS))
-    log("TEST", f"║ CMD      : {' '.join(_cmd[:6])} -i <url> {' '.join(_cmd[-2:])}", flush=True)
-    try:
-        ff_src = discord.FFmpegPCMAudio(si["stream_url"],
-                     executable=FFMPEG_EXECUTABLE,
-                     before_options=FFMPEG_BEFORE_OPTIONS,
-                     options=FFMPEG_OPTIONS, stderr=subprocess.PIPE)
-        vol_src = discord.PCMVolumeTransformer(ff_src, volume=0.5)
-        log("TEST", "║ ✔ Source créée", flush=True)
-    except Exception as e:
-        log("TEST", f"║ ✘ FFmpegPCMAudio ERREUR : {e}", flush=True)
-        await inter.followup.send(f"❌ FFmpegPCMAudio : {e}", ephemeral=True); return
-
-    # vc.play()
-    log("TEST", "║ ── vc.play() ───────────────────────────────────────", flush=True)
-    _pt = _ttest.time()
-    _ffp = getattr(ff_src, "_process", None)
-
-    def _after_test(error):
-        dur = _ttest.time() - _pt
-        log("TEST", f"║ after()  : dur={dur:.1f}s  error={error}", flush=True)
-        if error:
-            ferr = ""
-            if _ffp and _ffp.stderr:
-                try: ferr = _ffp.stderr.read(2000).decode('utf-8', errors='replace')
-                except Exception: pass
-            log("TEST", f"║ ✘ ERREUR : {error}", flush=True)
-            if ferr: log("TEST", f"║ stderr   : {ferr[:500]}", flush=True)
-        elif dur < 3.0:
-            log("TEST", f"║ ⚠ Trop court ({dur:.1f}s) — reconnect_streamed ? URL invalide ?", flush=True)
-        else:
-            log("TEST", f"║ ✔ Lecture normale ({dur:.1f}s)", flush=True)
-        log("TEST", "╚══ /playtest fin ═══════════════════════════════════", flush=True)
-
-    try:
-        if vc.is_playing(): vc.stop()
-        vc.play(vol_src, after=_after_test)
-        await asyncio.sleep(0.5)
-        playing = vc.is_playing()
-        pid = _ffp.pid if _ffp else "N/A"
-        log("TEST", f"║ playing  : {playing}  PID={pid}", flush=True)
-        if playing:
-            log("TEST", "║ ✔ vc.play() ACTIF", flush=True)
-            _tmsg = (
-                "✅ **Test en cours**\n"
-                f"URL CDN : `{si['stream_url'][:80]}`\n"
-                f"FFmpeg PID : `{pid}`\n"
-                "→ Si pas de son malgré is_playing=True → problème PyNaCl/Opus.\n"
-                "→ Résultat complet dans les logs Render [TEST]."
-            )
-            await inter.followup.send(_tmsg, ephemeral=True)
-        else:
-            log("TEST", "║ ✘ is_playing=False — FFmpeg crashé au démarrage", flush=True)
-            await inter.followup.send("❌ FFmpeg démarre puis s'arrête. Voir logs [TEST].", ephemeral=True)
-    except Exception as e:
-        log("TEST", f"║ ✘ vc.play() exception : {e}", flush=True)
-        await inter.followup.send(f"❌ vc.play() : {e}", ephemeral=True)
-
-
-@tree.command(name="stop", description="Arrêter la musique et déconnecter le bot du vocal")
-async def slash_stop(inter: discord.Interaction):
-    try:
-        ok_, msg = _music_check(inter)
-        if not ok_:
-            await inter.response.send_message(msg, ephemeral=True); return
-        guild = inter.guild
-        vc    = guild.voice_client if guild else None
-        if not vc or not vc.is_connected():
-            await inter.response.send_message("🔇 Le bot n'est pas dans un salon vocal.", ephemeral=True); return
-        st = _mstate(guild.id)
-        st["queue"].clear()
-        st["current"] = None
-        await vc.disconnect()
-        await inter.response.send_message("⏹  Musique arrêtée et bot déconnecté.")
-    except Exception as e:
-        log("SLASH", f"/stop : {e}")
-        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
-        except Exception: pass
-
-
-@tree.command(name="skip", description="Passer au morceau suivant")
-async def slash_skip(inter: discord.Interaction):
-    try:
-        ok_, msg = _music_check(inter)
-        if not ok_:
-            await inter.response.send_message(msg, ephemeral=True); return
-        guild = inter.guild
-        vc    = guild.voice_client if guild else None
-        if not vc or not vc.is_playing():
-            await inter.response.send_message("🔇 Rien n'est en lecture.", ephemeral=True); return
-        st = _mstate(guild.id)
-        cur = st.get("current")
-        title = cur["title"] if cur else "?"
-        vc.stop()   # déclenche _play_next via after callback
-        n = len(st["queue"])
-        msg = f"⏭  **{title}** skippé."
-        if n: msg += f" {n} morceau(x) restant(s)."
-        else: msg += " File vide."
-        await inter.response.send_message(msg)
-    except Exception as e:
-        log("SLASH", f"/skip : {e}")
-        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
-        except Exception: pass
-
-
-@tree.command(name="pause", description="Mettre la musique en pause")
-async def slash_pause(inter: discord.Interaction):
-    try:
-        ok_, msg = _music_check(inter)
-        if not ok_:
-            await inter.response.send_message(msg, ephemeral=True); return
-        guild = inter.guild
-        vc    = guild.voice_client if guild else None
-        if not vc or not vc.is_playing():
-            await inter.response.send_message("🔇 Rien n'est en lecture.", ephemeral=True); return
-        vc.pause()
-        await inter.response.send_message("⏸  Lecture mise en pause.")
-    except Exception as e:
-        log("SLASH", f"/pause : {e}")
-        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
-        except Exception: pass
-
-
-@tree.command(name="resume", description="Reprendre la lecture")
-async def slash_resume(inter: discord.Interaction):
-    try:
-        ok_, msg = _music_check(inter)
-        if not ok_:
-            await inter.response.send_message(msg, ephemeral=True); return
-        guild = inter.guild
-        vc    = guild.voice_client if guild else None
-        if not vc or not vc.is_paused():
-            await inter.response.send_message("▶️  La lecture n'est pas en pause.", ephemeral=True); return
-        vc.resume()
-        await inter.response.send_message("▶️  Lecture reprise.")
-    except Exception as e:
-        log("SLASH", f"/resume : {e}")
-        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
-        except Exception: pass
-
-
-@tree.command(name="queue", description="Afficher la file d'attente")
-async def slash_queue(inter: discord.Interaction):
-    try:
-        if not inter.guild:
-            await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True); return
-        await inter.response.defer(ephemeral=True)
-        st  = _mstate(inter.guild.id)
-        cur = st.get("current")
-        q   = st.get("queue", [])
-        vc  = inter.guild.voice_client
-
-        e = discord.Embed(title="🎶  File d'attente", color=0x1DB954,
-                          timestamp=datetime.now(timezone.utc))
-
-        if cur:
-            status = "▶️  En lecture" if (vc and vc.is_playing()) else "⏸  En pause"
-            e.add_field(
-                name=f"{status}",
-                value="**" + cur["title"] + "**\n⏱ " + _fmt_duration(cur.get("duration",0)) + "  •  👤 " + cur.get("requester","?"),
-                inline=False)
-        else:
-            e.add_field(name="Aucune lecture en cours", value="File vide.", inline=False)
-
-        if q:
-            lines = []
-            for i, t in enumerate(q[:10], 1):
-                lines.append(f"`{i}.` {t['title']}  `{_fmt_duration(t.get('duration',0))}`")
-            if len(q) > 10:
-                lines.append(f"… et {len(q)-10} autre(s)")
-            e.add_field(name=f"📋  Suivants ({len(q)})", value="\n".join(lines), inline=False)
-
-        await inter.followup.send(embed=e, ephemeral=True)
-    except Exception as e:
-        log("SLASH", f"/queue : {e}")
-        try:
-            if inter.response.is_done(): await inter.followup.send("❌ Erreur.", ephemeral=True)
-            else: await inter.response.send_message("❌ Erreur.", ephemeral=True)
-        except Exception: pass
-
-
-@tree.command(name="volume", description="Régler le volume (0–100)")
-@app_commands.describe(level="Volume de 0 à 100")
-async def slash_volume(inter: discord.Interaction, level: int):
-    try:
-        ok_, msg = _music_check(inter)
-        if not ok_:
-            await inter.response.send_message(msg, ephemeral=True); return
-        if not 0 <= level <= 100:
-            await inter.response.send_message("❌ Le volume doit être entre 0 et 100.", ephemeral=True); return
-        guild = inter.guild
-        st    = _mstate(guild.id)
-        st["volume"] = level / 100
-        # Appliquer immédiatement si en cours de lecture
-        vc = guild.voice_client
-        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-            vc.source.volume = level / 100
-        # Sauvegarder dans la config serveur
-        tconf(guild.id)["music_volume"] = level
-        await save_data()
-        bar = "█" * (level // 10) + "░" * (10 - level // 10)
-        await inter.response.send_message(f"🔊  Volume : `{bar}` **{level}%**")
-    except Exception as e:
-        log("SLASH", f"/volume : {e}")
-        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
-        except Exception: pass
-
-# ══════════════════════════════════════════════════════════════════
 #  MENU DISCORD STAFF — DESIGN MODERNE
 # ══════════════════════════════════════════════════════════════════
 
@@ -3785,8 +2972,8 @@ async def _dispatch_inner(action, p):
     elif action == "music_play":
         g = _g(p)
         if not g: return {"error": "Guild not found"}
-        if not YT_DLP_OK:
-            return {"error": "yt_dlp non installé"}
+        if not SPOTIPY_OK:
+            return {"error": "spotipy non installé"}
         # Vérifier que le bot est dans un vocal avant de chercher
         vc = g.voice_client
         if not vc or not vc.is_connected():
@@ -3946,7 +3133,7 @@ async def main():
     log("BOOT", "=" * 52)
     log("BOOT", f"Python         : {sys.version.split()[0]}")
     log("BOOT", f"discord.py     : {discord.__version__}")
-    log("BOOT", f"yt_dlp         : {'OK' if YT_DLP_OK else 'NON INSTALLE — musique impossible'}")
+    log("BOOT", "Musique        : Spotify (métadonnées) + Deezer (audio)")
     log("BOOT", f"spotipy        : {'OK' if SPOTIPY_OK else 'non installe (optionnel)'}")
     log("BOOT", f"FFmpeg chemin  : {FFMPEG_EXECUTABLE}")
     # ── Test FFmpeg réel : vérifier qu'il existe ET fonctionne ──────
@@ -4003,8 +3190,9 @@ async def main():
         log("BOOT", f"Opus           : exception chargement : {_e_o}")
     # ── Options audio actives ────────────────────────────────────────
     log("BOOT", f"FFMPEG opts    : before='{FFMPEG_BEFORE_OPTIONS}' / options='{FFMPEG_OPTIONS}'")
-    if YT_DLP_OK:
-        log("BOOT", "yt_dlp         : player_client=[ios, web] (anti-bot-check datacenter)")
+    if SPOTIPY_OK and SPOTIFY_CLIENT_ID:
+        log("BOOT", "Spotify        : OK ✔ (métadonnées + recherche + playlists)")
+        log("BOOT", f"Deezer ARL     : {'OK ✔ (lecture complète)' if os.getenv('DEEZER_ARL') else 'absent → previews 30s uniquement'}")
     log("BOOT", f"PORT           : {PORT}")
     log("BOOT", f"REMOTE_ENABLED : {REMOTE_ENABLED}")
     log("BOOT", "DISCORD_TOKEN  : " + ("OK" if TOKEN else "*** MANQUANT ***"))
