@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.12 — hébergé sur Render
+  BOT AGENT v5.14 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -25,6 +25,8 @@
          android player_client, music_locked+message console
   v5.12: changelog manuel BDD (load/save), notification utilise changelog,
          dispatch update_check/update_publish
+  v5.13: FIX AUDIO — reconnect_streamed remis (cause du silence), quiet=True yt_dlp
+  v5.14: cwd=BOT_DIR portable (fix /app), priorité changelog stricte
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -61,10 +63,11 @@ REMOTE_SECRET  = os.getenv("BOT_REMOTE_SECRET", "changeme")
 REMOTE_ENABLED = os.getenv("BOT_REMOTE_ENABLED", "true").lower() == "true"
 PORT           = int(os.getenv("PORT", 8080))
 DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.json")
+BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bot (portable)
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.12"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.14"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -759,18 +762,28 @@ def get_last_commit_message() -> str:
 
 async def send_update_notifications():
     """Envoie un embed de mise à jour dans chaque salon staff configuré.
-    Utilise le changelog manuel s'il existe, sinon le dernier commit Git.
+
+    Priorité stricte :
+      1. Changelog manuel (saisi depuis la console distante) — version ET description
+      2. Fallback uniquement si aucun changelog manuel valide n'existe :
+         BOT_VERSION + dernier commit Git
+    Le commit Git n'est JAMAIS utilisé si un changelog manuel existe.
     """
-    # Priorité : changelog manuel > commit Git
     cl = _cached_changelog
-    if cl:
-        version_str = cl.get("version") or BOT_VERSION
-        description = cl.get("description") or "Mise à jour déployée."
-        log("BOT", f"Notification mise à jour — changelog v{version_str} : {description[:60]}")
+    # Vérifier que le changelog manuel est réellement complet (version ET description non vides)
+    cl_version     = cl.get("version", "").strip()     if cl else ""
+    cl_description = cl.get("description", "").strip() if cl else ""
+    has_manual_cl  = bool(cl_version and cl_description)
+
+    if has_manual_cl:
+        version_str = cl_version
+        description = cl_description
+        log("BOT", f"Notification — changelog manuel v{version_str} : {description[:60]}")
     else:
+        # Fallback : aucun changelog manuel valide → BOT_VERSION + commit Git
         version_str = BOT_VERSION
         description = get_last_commit_message()
-        log("BOT", f"Notification mise à jour — commit : {description[:60]}")
+        log("BOT", f"Notification — fallback commit : {description[:60]}")
 
     sent = 0
     for g in client.guilds:
@@ -970,15 +983,13 @@ _YT_UA = (
 )
 
 # ── Options FFmpeg ────────────────────────────────────────────────
-# Options MINIMALES éprouvées pour les streams CDN YouTube.
-# -reconnect 1             : reconnexion si la connexion TCP est coupée
-# -reconnect_delay_max 5   : délai max entre tentatives
-# NE PAS ajouter -reconnect_streamed : incompatible avec certains formats DASH
-# NE PAS ajouter -user_agent : le CDN googlevideo.com ne l'exige pas,
-#   et la valeur avec espaces peut perturber le parsing d'args FFmpeg
-# NE PAS ajouter -loglevel warning : masque les erreurs en debug
-# stderr est passé via subprocess.PIPE dans _play_next pour capturer les erreurs FFmpeg
-FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_delay_max 5"
+# -reconnect 1             : reconnexion TCP automatique
+# -reconnect_streamed 1    : OBLIGATOIRE — YouTube ferme la connexion après chaque
+#                            chunk HTTP. Sans ça, FFmpeg décode 1-3s puis s'arrête
+#                            silencieusement (after(None) appelé prématurément).
+# -reconnect_delay_max 5   : délai max entre reconnexions
+# -vn                      : ignorer la piste vidéo (audio uniquement)
+FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS        = "-vn"
 FFMPEG_OPTS = {
     "executable":     FFMPEG_EXECUTABLE,
@@ -1005,8 +1016,8 @@ _YT_EXTRACTOR_ARGS = {
 }
 
 _YTDL_BASE = {
-    "quiet":           False,  # False pour voir les vraies erreurs yt_dlp dans les logs
-    "no_warnings":     False,
+    "quiet":           True,   # True pour ne pas polluer stdout — les erreurs passent par le logger
+    "no_warnings":     True,
     "socket_timeout":  15,
     "geo_bypass":      True,
     "http_headers":    {"User-Agent": _YT_UA},
@@ -3751,7 +3762,7 @@ async def _dispatch_inner(action, p):
         # Comparer les commits de dev et main via git log
         # Retourne: {ahead: N, behind: N, commits: [...], current_branch: "...", changelog: {...}}
         def _git(cmd):
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd="/app")
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=BOT_DIR)
             return r.stdout.strip(), r.returncode
         # Récupérer les infos sur les branches distantes
         _git(["git", "fetch", "origin", "--quiet"])
