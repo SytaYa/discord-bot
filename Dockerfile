@@ -1,23 +1,21 @@
 # ══════════════════════════════════════════════════════════════════
-#  Dockerfile — discord-bot v5.10
+#  Dockerfile — discord-bot v5.17
 #  Image : python:3.11-slim (Debian Bookworm)
-#  FFmpeg installé via apt-get (on est root dans le build Docker)
-#  Compatible Render Web Service (Docker runtime)
+#  Musique : Spotify (métadonnées) + Deezer (audio via FFmpeg)
+#  FFmpeg lit les URLs MP3/FLAC Deezer directement — pas de yt-dlp
 # ══════════════════════════════════════════════════════════════════
 
 FROM python:3.11-slim
 
-# ── Métadonnées ────────────────────────────────────────────────────
 LABEL maintainer="discord-bot" \
-      description="Discord bot with music support (yt-dlp + FFmpeg)"
+      description="Discord bot — Spotify + Deezer audio, no YouTube"
 
-# ── Variables d'environnement système ─────────────────────────────
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# ── Dépendances système (dont FFmpeg) ─────────────────────────────
+# ── Dépendances système ────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libopus0 \
@@ -26,25 +24,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Répertoire de travail ──────────────────────────────────────────
 WORKDIR /app
 
 # ── Dépendances Python ─────────────────────────────────────────────
-# Copier requirements en premier pour profiter du cache Docker layer
 COPY requirements.txt .
 RUN pip install --upgrade pip \
- && pip install -r requirements.txt \
- && pip install --upgrade yt-dlp   # forcer la dernière version à chaque build
+ && pip install -r requirements.txt
 
 # ── Code source ────────────────────────────────────────────────────
-COPY bot_agent.py .
-
-# Copier bot_data.json s'il existe (migration initiale), sinon ignorer
-# Le .dockerignore exclut les fichiers sensibles (.env, secrets, etc.)
 COPY . .
 
-# ── Port exposé (health check Render) ─────────────────────────────
 EXPOSE 8080
-
-# ── Lancement ──────────────────────────────────────────────────────
 CMD ["python", "bot_agent.py"]
