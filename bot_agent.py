@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.18 — hébergé sur Render
+  BOT AGENT v5.19 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -31,6 +31,7 @@
   v5.16: cookies YouTube via YT_COOKIES_B64 (fix bot check Render/AWS)
   v5.17: REFONTE MUSIQUE — Spotify (UX) + Deezer (audio), suppression yt_dlp/YouTube
   v5.18: Commandes musique retirées (/play /stop /skip /pause /resume /queue /volume)
+  v5.19: /menu refait — navigation séparée Staff/Tickets, embeds modernes
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -68,7 +69,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.18"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.19"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -1527,350 +1528,710 @@ def _e_empty(title, desc=""):
 
 
 async def send_staff_menu(channel, guild, invoker=None):
-    """Envoie le panel staff. Supprime l'ancien message actif pour ce serveur."""
+    """Envoie le panel staff dans un salon texte (appelé par !menu ou event)."""
     if invoker and not is_staff(invoker, guild.id):
-        await channel.send(embed=_e_err("🚫  Accès refusé", "Réservé au staff configuré."))
+        await channel.send(embed=_e_err("🚫  Accès refusé", "Cette commande est réservée au staff."))
         return
     cfg = tconf(guild.id)
     if cfg.get("menu_locked"):
         if invoker:
-            await channel.send(embed=_e_warn("🔒  Menu verrouillé [" + guild.name + "]", "Déverrouille via la console (`lockmenu off`)."))
+            await channel.send(embed=_e_warn(
+                "🔒  Panel verrouillé",
+                "Le panel staff est désactivé sur ce serveur.\nContacte un administrateur ou utilise la console distante."))
         return
-    # Supprimer l'ancien menu actif pour ce serveur (via ID mémorisé ou scan du salon)
     await _delete_active_menu(guild.id, channel=channel)
-
-    cat = guild.get_channel(cfg.get("category_id") or 0)
-    sch = guild.get_channel(cfg.get("staff_channel_id") or 0)
-    sro = guild.get_role(cfg.get("staff_role_id") or 0)
-
-    ot = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("open", "pending")]
-    pt = [v for v in pending_channels.values() if v["guild_id"] == guild.id]
-    ct = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("accepted", "refused", "closed")]
-
-    def bar(n, total, w=10):
-        if total == 0: return "`" + "░" * w + "`"
-        f = round(n / total * w)
-        return "`" + "█" * f + "░" * (w - f) + "`"
-
-    total_t = max(len(ot) + len(ct), 1)
-
-    e = discord.Embed(color=C_DARK, timestamp=datetime.now(timezone.utc))
-    e.set_author(name="⚡  Panel Staff — " + guild.name,
-                 icon_url=guild.icon.url if guild.icon else None)
-
-    # Config bloc
-    cfg_val  = "> 📁  **Catégorie** — " + ("`" + cat.name + "`" if cat else "❌ Non définie") + "\n"
-    cfg_val += "> 📣  **Salon staff** — " + (sch.mention if sch else "❌ Non défini") + "\n"
-    cfg_val += "> 🛡  **Rôle staff** — " + (sro.mention if sro else "⚠️ Non défini")
-    e.add_field(name="⚙️  Configuration", value=cfg_val, inline=False)
-
-    # Stats
-    stats_val  = "> 🟡  **En cours**    " + bar(len(ot), total_t) + "  `" + str(len(ot)) + "`\n"
-    stats_val += "> ✅  **Traités**     " + bar(len(ct), total_t) + "  `" + str(len(ct)) + "`\n"
-    stats_val += "> 📥  **En attente** (DraftBot)  `" + str(len(pt)) + "`\n"
-    stats_val += "> 📝  **Types configurés**        `" + str(len(cfg["types"])) + "`"
-    e.add_field(name="📊  Statistiques", value=stats_val, inline=False)
-
-    # Derniers tickets
-    if ot:
-        icons = {"open": "🟡", "pending": "⏳"}
-        recent = sorted(ot, key=lambda x: x["number"], reverse=True)[:3]
-        last = ""
-        for s in recent:
-            mem  = guild.get_member(s["user_id"])
-            name = mem.display_name if mem else str(s["user_id"])
-            last += "> " + icons.get(s["status"], "🟡") + "  `#" + str(s["number"]).zfill(4) + "` **" + s["type"] + "** — " + name + "\n"
-        e.add_field(name="🕐  Tickets récents", value=last.rstrip(), inline=False)
-
-    e.set_footer(text=("🔧 MAINTENANCE  •  " if maintenance_mode else "") +
-                 ("🔒 Menu verrouillé  •  " if cfg.get("menu_locked") else "") +
-                 "Panel staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
-    msg = await channel.send(embed=e, view=DashboardView(guild))
+    e, view = _build_home_embed(guild), DashboardView(guild)
+    msg = await channel.send(embed=e, view=view)
     active_menu_msgs[guild.id] = (channel.id, msg.id)
 
 
 async def send_staff_menu_inter(inter: discord.Interaction, guild):
-    """Version de send_staff_menu qui répond à une interaction slash."""
+    """Envoie le panel staff en réponse à une interaction slash /menu."""
     cfg = tconf(guild.id)
-    # Supprimer l'ancien menu actif
+    if cfg.get("menu_locked"):
+        await inter.response.send_message(embed=_e_warn(
+            "🔒  Panel verrouillé",
+            "Le panel staff est désactivé sur ce serveur.\nContacte un administrateur."),
+            ephemeral=True)
+        return
     await _delete_active_menu(guild.id, channel=inter.channel)
-
-    cat = guild.get_channel(cfg.get("category_id") or 0)
-    sch = guild.get_channel(cfg.get("staff_channel_id") or 0)
-    sro = guild.get_role(cfg.get("staff_role_id") or 0)
-    ot  = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("open", "pending")]
-    pt  = [v for v in pending_channels.values() if v["guild_id"] == guild.id]
-    ct  = [s for s in ticket_sessions.values() if s["guild_id"] == guild.id and s["status"] in ("accepted", "refused", "closed")]
-
-    def bar(n, total, w=10):
-        if total == 0: return "`" + "░" * w + "`"
-        f = round(n / total * w)
-        return "`" + "█" * f + "░" * (w - f) + "`"
-
-    total_t = max(len(ot) + len(ct), 1)
-    e = discord.Embed(color=C_DARK, timestamp=datetime.now(timezone.utc))
-    e.set_author(name="⚡  Panel Staff — " + guild.name,
-                 icon_url=guild.icon.url if guild.icon else None)
-
-    cfg_val  = "> 📁  **Catégorie** — " + ("`" + cat.name + "`" if cat else "❌ Non définie") + "\n"
-    cfg_val += "> 📣  **Salon staff** — " + (sch.mention if sch else "❌ Non défini") + "\n"
-    cfg_val += "> 🛡  **Rôle staff** — " + (sro.mention if sro else "⚠️ Non défini")
-    e.add_field(name="⚙️  Configuration", value=cfg_val, inline=False)
-
-    stats_val  = "> 🟡  **En cours**    " + bar(len(ot), total_t) + "  `" + str(len(ot)) + "`\n"
-    stats_val += "> ✅  **Traités**     " + bar(len(ct), total_t) + "  `" + str(len(ct)) + "`\n"
-    stats_val += "> 📥  **En attente** (DraftBot)  `" + str(len(pt)) + "`\n"
-    stats_val += "> 📝  **Types configurés**        `" + str(len(cfg["types"])) + "`"
-    e.add_field(name="📊  Statistiques", value=stats_val, inline=False)
-
-    if ot:
-        icons = {"open": "🟡", "pending": "⏳"}
-        recent = sorted(ot, key=lambda x: x["number"], reverse=True)[:3]
-        last = ""
-        for s in recent:
-            mem  = guild.get_member(s["user_id"])
-            name = mem.display_name if mem else str(s["user_id"])
-            last += "> " + icons.get(s["status"], "🟡") + "  `#" + str(s["number"]).zfill(4) + "` **" + s["type"] + "** — " + name + "\n"
-        e.add_field(name="🕐  Tickets récents", value=last.rstrip(), inline=False)
-
-    e.set_footer(text=("🔧 MAINTENANCE  •  " if maintenance_mode else "") +
-                 ("🔒 Menu verrouillé  •  " if cfg.get("menu_locked") else "") +
-                 "Panel staff  •  " + str(len([m for m in guild.members if not m.bot])) + " membres")
-
-    # Envoyer le panel — via followup si defer() a déjà été appelé, sinon send_message
+    e, view = _build_home_embed(guild), DashboardView(guild)
     if inter.response.is_done():
-        msg = await inter.followup.send(embed=e, view=DashboardView(guild), wait=True)
+        msg = await inter.followup.send(embed=e, view=view, wait=True)
     else:
-        await inter.response.send_message(embed=e, view=DashboardView(guild))
+        await inter.response.send_message(embed=e, view=view)
         msg = await inter.original_response()
     active_menu_msgs[guild.id] = (inter.channel.id, msg.id)
 
 
+def _build_home_embed(guild: discord.Guild) -> discord.Embed:
+    """Construit l'embed principal du panel — accueil propre et moderne."""
+    cfg     = tconf(guild.id)
+    cat     = guild.get_channel(cfg.get("category_id") or 0)
+    sch     = guild.get_channel(cfg.get("staff_channel_id") or 0)
+    sro     = guild.get_role(cfg.get("staff_role_id") or 0)
+    humans  = [m for m in guild.members if not m.bot]
+    online  = [m for m in humans if m.status != discord.Status.offline]
+    ot      = [s for s in ticket_sessions.values()
+                if s["guild_id"] == guild.id and s["status"] in ("open", "pending")]
+    ct      = [s for s in ticket_sessions.values()
+                if s["guild_id"] == guild.id and s["status"] in ("accepted", "refused", "closed")]
+    pt      = [v for v in pending_channels.values() if v["guild_id"] == guild.id]
+
+    # Statut général du bot
+    ok_cfg, _ = is_configured(guild.id)
+    status_line = "✅  Système opérationnel" if ok_cfg else "⚠️  Configuration incomplète"
+    if maintenance_mode:
+        status_line = "🔧  Mode maintenance actif"
+
+    e = discord.Embed(
+        description=(
+            f"### 🏠  Bienvenue sur le Panel Staff\n"
+            f"*{guild.name}*  •  {status_line}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc)
+    )
+    if guild.icon:
+        e.set_thumbnail(url=guild.icon.url)
+
+    # Bloc serveur
+    e.add_field(
+        name="🌐  Serveur",
+        value=(
+            f"> 👥  **{len(humans)}** membres  •  **{len(online)}** en ligne\n"
+            f"> 🤖  **{len([m for m in guild.members if m.bot])}** bots\n"
+            f"> 📅  Créé <t:{int(guild.created_at.timestamp())}:R>"
+        ),
+        inline=True
+    )
+
+    # Bloc staff
+    e.add_field(
+        name="🛡️  Staff",
+        value=(
+            f"> 📣  {sch.mention if sch else '`Non défini`'}\n"
+            f"> 🛡  {sro.mention if sro else '`Non défini`'}\n"
+            f"> 📁  `{cat.name if cat else 'Non définie'}`"
+        ),
+        inline=True
+    )
+
+    # Bloc tickets
+    total_t = len(ot) + len(ct)
+    e.add_field(
+        name="🎫  Tickets",
+        value=(
+            f"> 🟡  **{len(ot)}** en cours\n"
+            f"> ✅  **{len(ct)}** traités\n"
+            f"> 📥  **{len(pt)}** en attente"
+        ),
+        inline=True
+    )
+
+    # Séparateur + navigation hint
+    e.add_field(
+        name="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        value="Utilise le menu déroulant ci-dessous pour naviguer.",
+        inline=False
+    )
+
+    # Footer
+    alerts = []
+    if maintenance_mode:       alerts.append("🔧 Maintenance")
+    if cfg.get("menu_locked"): alerts.append("🔒 Menu verrouillé")
+    if not ok_cfg:             alerts.append("⚠️ Config incomplète")
+    footer = "  •  ".join(alerts) if alerts else "Panel Staff"
+    e.set_footer(text=footer + f"  •  {len(humans)} membres")
+    return e
+
+
+def _build_section_embed(guild, section: str) -> discord.Embed:
+    """Construit l'embed d'une section spécifique — pour l'édition en place."""
+    cfg    = tconf(guild.id)
+    cat    = guild.get_channel(cfg.get("category_id") or 0)
+    sch    = guild.get_channel(cfg.get("staff_channel_id") or 0)
+    sro    = guild.get_role(cfg.get("staff_role_id") or 0)
+    ot     = [s for s in ticket_sessions.values()
+               if s["guild_id"] == guild.id and s["status"] in ("open", "pending")]
+    ct     = [s for s in ticket_sessions.values()
+               if s["guild_id"] == guild.id and s["status"] in ("accepted", "refused", "closed")]
+    pt     = [v for v in pending_channels.values() if v["guild_id"] == guild.id]
+    humans = [m for m in guild.members if not m.bot]
+    online = [m for m in humans if m.status != discord.Status.offline]
+
+    if section == "home":
+        return _build_home_embed(guild)
+
+    elif section == "tickets":
+        e = discord.Embed(
+            description=(
+                f"### 🎫  Tickets en cours\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=C_ORANGE,
+            timestamp=datetime.now(timezone.utc)
+        )
+        if ot:
+            icons = {"open": "🟡", "pending": "⏳"}
+            recent = sorted(ot, key=lambda x: x["number"], reverse=True)[:6]
+            for s in recent:
+                mem = guild.get_member(s["user_id"])
+                mn  = mem.display_name if mem else str(s["user_id"])
+                tt  = cfg["types"].get(s["type"], {})
+                e.add_field(
+                    name=f"{icons.get(s['status'],'🟡')}  #{str(s['number']).zfill(4)} · {tt.get('emoji','🎫')} {tt.get('label', s['type'])}",
+                    value=f"> 👤  **{mn}**\n> 📅  {s['opened_at']}\n> <#{s['channel_id']}>",
+                    inline=True
+                )
+        else:
+            e.add_field(name="Aucun ticket en cours", value="> *La file est vide.*", inline=False)
+        e.set_footer(text=f"🟡 {len(ot)} en cours  •  ✅ {len(ct)} traités  •  📥 {len(pt)} en attente")
+        return e
+
+    elif section == "config_staff":
+        ok_cfg, msg_cfg = is_configured(guild.id)
+        e = discord.Embed(
+            description=(
+                f"### ⚙️  Configuration — Staff\n"
+                f"Paramètres liés au staff et aux permissions.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=C_BLURPLE,
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.add_field(
+            name="📣  Salon des notifications",
+            value=sch.mention if sch else "`❌ Non défini`",
+            inline=True
+        )
+        e.add_field(
+            name="🛡️  Rôle staff",
+            value=sro.mention if sro else "`❌ Non défini`",
+            inline=True
+        )
+        e.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
+        e.add_field(
+            name="📊  Statut",
+            value=(
+                f"> {'✅  Salon configuré' if sch else '❌  Salon manquant'}\n"
+                f"> {'✅  Rôle configuré'  if sro else '❌  Rôle manquant'}"
+            ),
+            inline=False
+        )
+        if not ok_cfg:
+            e.add_field(name="⚠️  Action requise", value=f"> {msg_cfg}", inline=False)
+        e.set_footer(text="Utilise les menus ci-dessous pour modifier.")
+        return e
+
+    elif section == "config_tickets":
+        ok_cfg, msg_cfg = is_configured(guild.id)
+        e = discord.Embed(
+            description=(
+                f"### 🎫  Configuration — Tickets\n"
+                f"Paramètres liés au système de tickets.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=C_PURPLE,
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.add_field(
+            name="📁  Catégorie des tickets",
+            value=f"`{cat.name}`" if cat else "`❌ Non définie`",
+            inline=True
+        )
+        e.add_field(
+            name="🔢  Compteur tickets",
+            value=f"`#{str(cfg['counter']).zfill(4)}`",
+            inline=True
+        )
+        e.add_field(
+            name="📝  Types configurés",
+            value=f"`{len(cfg['types'])}` type(s)",
+            inline=True
+        )
+        e.add_field(
+            name="📊  Statistiques",
+            value=(
+                f"> 🟡  **{len(ot)}** tickets en cours\n"
+                f"> ✅  **{len(ct)}** traités\n"
+                f"> 📥  **{len(pt)}** en attente"
+            ),
+            inline=False
+        )
+        e.set_footer(text="Utilise les menus ci-dessous pour modifier.")
+        return e
+
+    elif section == "server":
+        e = discord.Embed(
+            description=(
+                f"### 🌐  Informations serveur\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=C_TEAL,
+            timestamp=datetime.now(timezone.utc)
+        )
+        if guild.icon:
+            e.set_thumbnail(url=guild.icon.url)
+        bots   = [m for m in guild.members if m.bot]
+        txt_ch = [c for c in guild.channels if isinstance(c, discord.TextChannel)]
+        voc_ch = [c for c in guild.channels if isinstance(c, discord.VoiceChannel)]
+        e.add_field(
+            name="👥  Membres",
+            value=(
+                f"> 👤  **{len(humans)}** humains\n"
+                f"> 🟢  **{len(online)}** en ligne\n"
+                f"> 🤖  **{len(bots)}** bots"
+            ),
+            inline=True
+        )
+        e.add_field(
+            name="📡  Salons",
+            value=(
+                f"> 💬  **{len(txt_ch)}** texte\n"
+                f"> 🔊  **{len(voc_ch)}** vocal\n"
+                f"> 📂  **{len(guild.categories)}** catégories"
+            ),
+            inline=True
+        )
+        e.add_field(
+            name="📋  Rôles",
+            value=f"> **{len(guild.roles) - 1}** rôles configurés",
+            inline=True
+        )
+        e.add_field(
+            name="📅  Informations",
+            value=(
+                f"> 🆔  `{guild.id}`\n"
+                f"> 📅  Créé <t:{int(guild.created_at.timestamp())}:D>\n"
+                f"> 👑  {guild.owner.mention if guild.owner else '`Inconnu`'}"
+            ),
+            inline=False
+        )
+        return e
+
+    elif section == "members":
+        si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
+              discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+        e = discord.Embed(
+            description=(
+                f"### 👥  Membres — {guild.name}\n"
+                f"`{len(humans)}` membre(s)  •  `{len(online)}` en ligne\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=C_GREEN,
+            timestamp=datetime.now(timezone.utc)
+        )
+        chunk    = humans[:24]
+        lines    = [f"{si.get(m.status,'⚫')} **{m.display_name}**" for m in chunk]
+        col_size = max(1, (len(lines) + 2) // 3)
+        for ci in range(3):
+            col = lines[ci * col_size:(ci + 1) * col_size]
+            if col: e.add_field(name="\u200b", value="\n".join(col), inline=True)
+        if len(humans) > 24:
+            e.set_footer(text=f"… et {len(humans) - 24} autres membres")
+        return e
+
+    # fallback
+    return _build_home_embed(guild)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DashboardView — menu principal avec navigation par sections
+# ══════════════════════════════════════════════════════════════════
 class DashboardView(discord.ui.View):
-    def __init__(self, guild):
+    """View principale du panel staff — navigation + actions rapides."""
+
+    def __init__(self, guild: discord.Guild, active_section: str = "home"):
         super().__init__(timeout=600)
-        self.guild = guild
-        sel = discord.ui.Select(
-            placeholder="📂  Choisir une section…",
+        self.guild          = guild
+        self.active_section = active_section
+
+        # ── Menu déroulant de navigation ─────────────────────────
+        nav = discord.ui.Select(
+            placeholder="📂  Navigation…",
             row=0,
             options=[
-                discord.SelectOption(label="🎫  Tickets ouverts",    value="tickets",  description="Voir et gérer les tickets en cours"),
-                discord.SelectOption(label="📥  Salons en attente",   value="pending",  description="Lancer les questions DraftBot"),
-                discord.SelectOption(label="📝  Types de tickets",    value="types",    description="Voir, créer, modifier, supprimer les types"),
-                discord.SelectOption(label="⚙️   Configuration",      value="config",   description="Catégorie, salon staff, rôle staff"),
-                discord.SelectOption(label="👥  Membres",             value="members",  description="Liste des membres et modération"),
-                discord.SelectOption(label="📋  Rôles",               value="roles",    description="Liste des rôles du serveur"),
-                discord.SelectOption(label="📡  Salons",              value="channels", description="Salons texte par catégorie"),
-                discord.SelectOption(label="🌐  Infos serveur",       value="server",   description="Statistiques du serveur"),
+                discord.SelectOption(
+                    label="🏠  Accueil",
+                    value="home",
+                    description="Vue d'ensemble du serveur",
+                    default=(active_section == "home")
+                ),
+                discord.SelectOption(
+                    label="🎫  Tickets",
+                    value="tickets",
+                    description="Gérer les tickets en cours",
+                    default=(active_section == "tickets")
+                ),
+                discord.SelectOption(
+                    label="📥  Salons en attente",
+                    value="pending",
+                    description="Lancer les questions DraftBot",
+                    default=(active_section == "pending")
+                ),
+                discord.SelectOption(
+                    label="📝  Types de tickets",
+                    value="types",
+                    description="Créer et gérer les types",
+                    default=(active_section == "types")
+                ),
+                discord.SelectOption(
+                    label="👥  Membres",
+                    value="members",
+                    description="Liste et modération",
+                    default=(active_section == "members")
+                ),
+                discord.SelectOption(
+                    label="🌐  Serveur",
+                    value="server",
+                    description="Statistiques et informations",
+                    default=(active_section == "server")
+                ),
             ]
         )
-        sel.callback = self.on_select
-        self.add_item(sel)
-        # Bouton Fermer le menu
-        btn_close = discord.ui.Button(label="Fermer le menu", style=discord.ButtonStyle.secondary,
-                                      emoji="✖️", row=1)
-        btn_close.callback = self.close_menu
-        self.add_item(btn_close)
-        # Bouton Rafraîchir
-        btn_refresh = discord.ui.Button(label="Rafraîchir", style=discord.ButtonStyle.secondary,
-                                        emoji="🔄", row=1)
-        btn_refresh.callback = self.refresh_menu
+        nav.callback = self._on_nav
+        self.add_item(nav)
+
+        # ── Menu déroulant Configuration (séparé) ────────────────
+        cfg_select = discord.ui.Select(
+            placeholder="⚙️  Configuration…",
+            row=1,
+            options=[
+                discord.SelectOption(
+                    label="🛡️  Staff & Permissions",
+                    value="config_staff",
+                    description="Salon staff, rôle staff",
+                    default=(active_section == "config_staff")
+                ),
+                discord.SelectOption(
+                    label="🎫  Système de tickets",
+                    value="config_tickets",
+                    description="Catégorie, compteur, types",
+                    default=(active_section == "config_tickets")
+                ),
+            ]
+        )
+        cfg_select.callback = self._on_nav
+        self.add_item(cfg_select)
+
+        # ── Boutons d'action rapide ───────────────────────────────
+        btn_refresh = discord.ui.Button(
+            label="Actualiser",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔄",
+            row=2
+        )
+        btn_refresh.callback = self._refresh
         self.add_item(btn_refresh)
 
-    def _guard(self, inter):
-        cfg = tconf(self.guild.id)
-        if maintenance_mode: return False, "🔧 Bot en maintenance."
-        if not is_staff(inter.user, self.guild.id): return False, "🚫 Réservé au staff."
-        if cfg.get("menu_locked"): return False, "🔒 Menu verrouillé sur ce serveur."
-        return True, None
+        btn_close = discord.ui.Button(
+            label="Fermer",
+            style=discord.ButtonStyle.danger,
+            emoji="✖️",
+            row=2
+        )
+        btn_close.callback = self._close
+        self.add_item(btn_close)
 
-    async def close_menu(self, inter: discord.Interaction):
-        try: await inter.message.delete()
-        except: pass
-        active_menu_msgs.pop(self.guild.id, None)
-        await inter.response.send_message(embed=_e_empty("✖️  Menu fermé"), ephemeral=True)
-        self.stop()
+    def _guard(self, inter: discord.Interaction) -> tuple[bool, str]:
+        if maintenance_mode:
+            return False, "🔧  Le bot est en maintenance."
+        if not is_staff(inter.user, self.guild.id):
+            return False, "🚫  Accès réservé au staff."
+        if tconf(self.guild.id).get("menu_locked"):
+            return False, "🔒  Le panel est verrouillé sur ce serveur."
+        return True, ""
 
-    async def refresh_menu(self, inter: discord.Interaction):
+    async def _on_nav(self, inter: discord.Interaction):
         ok2, reason = self._guard(inter)
         if not ok2:
-            await inter.response.send_message(embed=_e_warn("⚠️", reason), ephemeral=True); return
-        # Reconstruire l'embed à jour et éditer le message EN PLACE (pas de nouveau message)
-        cfg = tconf(self.guild.id)
-        cat = self.guild.get_channel(cfg.get("category_id") or 0)
-        sch = self.guild.get_channel(cfg.get("staff_channel_id") or 0)
-        sro = self.guild.get_role(cfg.get("staff_role_id") or 0)
-        ot  = [s for s in ticket_sessions.values() if s["guild_id"] == self.guild.id and s["status"] in ("open", "pending")]
-        pt  = [v for v in pending_channels.values() if v["guild_id"] == self.guild.id]
-        ct  = [s for s in ticket_sessions.values() if s["guild_id"] == self.guild.id and s["status"] in ("accepted", "refused", "closed")]
-        total_t = max(len(ot) + len(ct), 1)
-        def bar(n, t, w=10):
-            if t == 0: return "`" + "░" * w + "`"
-            f = round(n / t * w); return "`" + "█" * f + "░" * (w - f) + "`"
-        e = discord.Embed(color=C_DARK, timestamp=datetime.now(timezone.utc))
-        e.set_author(name="⚡  Panel Staff — " + self.guild.name,
-                     icon_url=self.guild.icon.url if self.guild.icon else None)
-        cfg_val  = "> 📁  **Catégorie** — " + ("`" + cat.name + "`" if cat else "❌ Non définie") + "\n"
-        cfg_val += "> 📣  **Salon staff** — " + (sch.mention if sch else "❌ Non défini") + "\n"
-        cfg_val += "> 🛡  **Rôle staff** — " + (sro.mention if sro else "⚠️ Non défini")
-        e.add_field(name="⚙️  Configuration", value=cfg_val, inline=False)
-        stats_val  = "> 🟡 En cours " + bar(len(ot), total_t) + " `" + str(len(ot)) + "`\n"
-        stats_val += "> ✅ Traités   " + bar(len(ct), total_t) + " `" + str(len(ct)) + "`\n"
-        stats_val += "> 📥 En attente `" + str(len(pt)) + "`  •  📝 Types `" + str(len(cfg["types"])) + "`"
-        e.add_field(name="📊  Statistiques", value=stats_val, inline=False)
-        e.set_footer(text=("🔧 MAINTENANCE  •  " if maintenance_mode else "") +
-                     ("🔒 Menu verrouillé  •  " if cfg.get("menu_locked") else "") +
-                     "Panel staff  •  " + str(len([m for m in self.guild.members if not m.bot])) + " membres  •  🔄 " + datetime.now().strftime("%H:%M:%S"))
-        # Éditer le message existant — aucun nouveau message créé
-        await inter.response.edit_message(embed=e, view=DashboardView(self.guild))
-        active_menu_msgs[self.guild.id] = (inter.channel.id, inter.message.id)
+            await inter.response.send_message(
+                embed=_e_warn("⚠️  Accès refusé", reason), ephemeral=True); return
 
-    async def on_select(self, inter: discord.Interaction):
-        ok2, reason = self._guard(inter)
-        if not ok2:
-            await inter.response.send_message(embed=_e_warn("⚠️", reason), ephemeral=True); return
-        val = inter.data["values"][0]
-        g   = self.guild
-        cfg = tconf(g.id)
+        section = inter.data["values"][0]
+        g       = self.guild
+        cfg     = tconf(g.id)
 
-        # ── Tickets ouverts ──────────────────────────────────────
-        if val == "tickets":
+        # Sections qui ouvrent une sous-vue éphémère séparée
+        if section == "tickets":
             ss = [s for s in ticket_sessions.values()
                   if s["guild_id"] == g.id and s["status"] in ("open", "pending")]
-            if not ss:
-                await inter.response.send_message(embed=_e_empty("🎫  Tickets ouverts", "Aucun ticket en cours."), ephemeral=True)
-                return
-            icons = {"open": "🟡", "pending": "⏳"}
-            e = discord.Embed(title="🎫  Tickets en cours",
-                              description="`" + str(len(ss)) + "` ticket(s) ouvert(s)",
-                              color=C_ORANGE)
-            for s in sorted(ss, key=lambda x: x["number"])[:9]:
-                mem = g.get_member(s["user_id"])
-                mn  = mem.display_name if mem else str(s["user_id"])
-                ico = icons.get(s["status"], "🟡")
-                tt  = cfg["types"].get(s["type"], {})
-                field_val = "👤 **" + mn + "**\n📅 " + s["opened_at"] + "\n<#" + str(s["channel_id"]) + ">"
-                e.add_field(name=ico + "  #" + str(s["number"]).zfill(4) + " · " + tt.get("emoji", "🎫") + " " + tt.get("label", s["type"]),
-                            value=field_val, inline=True)
-            await inter.response.send_message(embed=e, view=TicketListView(g, ss, cfg), ephemeral=True)
+            e = _build_section_embed(g, "tickets")
+            if ss:
+                await inter.response.send_message(
+                    embed=e, view=TicketListView(g, ss, cfg), ephemeral=True)
+            else:
+                await inter.response.send_message(embed=e, ephemeral=True)
+            return
 
-        # ── Salons en attente ────────────────────────────────────
-        elif val == "pending":
+        if section == "pending":
             gp = [(k, v) for k, v in pending_channels.items() if v["guild_id"] == g.id]
             if not gp:
-                await inter.response.send_message(embed=_e_empty("📥  Salons en attente", "Aucun salon détecté."), ephemeral=True)
+                await inter.response.send_message(
+                    embed=_e_empty("📥  Salons en attente", "Aucun salon détecté."), ephemeral=True)
                 return
             ok_cfg2, msg_cfg2 = is_configured(g.id)
             if not ok_cfg2:
-                await inter.response.send_message(embed=_e_warn("⚠️  Config incomplète", msg_cfg2), ephemeral=True); return
+                await inter.response.send_message(
+                    embed=_e_warn("⚠️  Config incomplète", msg_cfg2), ephemeral=True); return
             if not cfg["types"]:
-                await inter.response.send_message(embed=_e_warn("⚠️  Aucun type défini", "Crée des types via la section Types."), ephemeral=True)
-                return
-            e = discord.Embed(title="📥  Salons en attente",
-                              description="`" + str(len(gp)) + "` salon(s) détecté(s) par DraftBot",
-                              color=C_AMBER)
+                await inter.response.send_message(
+                    embed=_e_warn("⚠️  Aucun type", "Crée d'abord des types via Configuration → Tickets."),
+                    ephemeral=True); return
+            e = discord.Embed(
+                description=(
+                    f"### 📥  Salons en attente\n"
+                    f"`{len(gp)}` salon(s) détecté(s)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                ),
+                color=C_AMBER
+            )
             for k, v in gp[:10]:
                 ch = g.get_channel(k)
-                e.add_field(name="#" + (ch.name if ch else str(k)), value="⏱ " + v["detected_at"], inline=True)
+                e.add_field(name=f"#{ch.name if ch else k}", value=f"> ⏱  {v['detected_at']}", inline=True)
             await inter.response.send_message(embed=e, view=PendingLaunchView(g, cfg, gp), ephemeral=True)
+            return
 
-        # ── Types de tickets ─────────────────────────────────────
-        elif val == "types":
-            e = discord.Embed(title="📝  Types de tickets",
-                              description="`" + str(len(cfg["types"])) + "` type(s) configuré(s)",
-                              color=C_PURPLE)
+        if section == "types":
+            e = discord.Embed(
+                description=(
+                    f"### 📝  Types de tickets\n"
+                    f"`{len(cfg['types'])}` type(s) configuré(s)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                ),
+                color=C_PURPLE
+            )
             if cfg["types"]:
                 for key, t in cfg["types"].items():
                     qs    = t.get("questions", [])
-                    q_txt = "\n".join("• " + q for q in qs[:5]) or "*Aucune question*"
-                    if len(qs) > 5: q_txt += "\n*…+" + str(len(qs) - 5) + " autres*"
-                    e.add_field(name=t["emoji"] + "  **" + t["label"] + "**  `[" + key + "]`",
-                                value=q_txt[:256], inline=False)
+                    q_txt = "\n".join("• " + q for q in qs[:4]) or "*Aucune question*"
+                    if len(qs) > 4: q_txt += f"\n*…+{len(qs)-4} autres*"
+                    e.add_field(
+                        name=f"{t['emoji']}  **{t['label']}**  `[{key}]`",
+                        value=q_txt[:256], inline=False)
             else:
-                e.description += "\n\n*Aucun type — crées-en un avec le bouton ci-dessous.*"
+                e.add_field(name="Aucun type", value="> *Crée ton premier type avec le bouton ci-dessous.*", inline=False)
             await inter.response.send_message(embed=e, view=TypesManagerView(g, cfg), ephemeral=True)
+            return
 
-        # ── Configuration ────────────────────────────────────────
-        elif val == "config":
-            cat2 = g.get_channel(cfg.get("category_id") or 0)
-            sch2 = g.get_channel(cfg.get("staff_channel_id") or 0)
-            sro2 = g.get_role(cfg.get("staff_role_id") or 0)
-            e = discord.Embed(title="⚙️  Configuration du système de tickets", color=C_BLUE)
-            e.add_field(name="📁  Catégorie tickets",
-                        value="`" + cat2.name + "`" if cat2 else "❌ *Non définie*", inline=True)
-            e.add_field(name="📣  Salon staff",
-                        value=sch2.mention if sch2 else "❌ *Non défini*", inline=True)
-            e.add_field(name="🛡  Rôle staff",
-                        value=sro2.mention if sro2 else "⚠️ *Non défini*", inline=True)
-            e.add_field(name="🔢  Compteur",
-                        value="`#" + str(cfg["counter"]).zfill(4) + "`", inline=True)
-            e.add_field(name="📝  Types",
-                        value="`" + str(len(cfg["types"])) + "` type(s)", inline=True)
-            e.add_field(name="🔒  Menu Discord",
-                        value="Verrouillé 🔒" if cfg.get("menu_locked") else "Libre 🔓", inline=True)
-            e.set_footer(text="Utilise les menus ci-dessous pour modifier la configuration.")
-            await inter.response.send_message(embed=e, view=ConfigFullView(g, cfg), ephemeral=True)
-
-        # ── Membres ──────────────────────────────────────────────
-        elif val == "members":
+        if section == "members":
             humans = [m for m in g.members if not m.bot]
-            si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
-                  discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
-            e = discord.Embed(title="👥  Membres — " + g.name,
-                              description="`" + str(len(humans)) + "` membre(s)",
-                              color=C_GREEN)
-            chunk = humans[:24]
-            lines = [si.get(m.status, "⚫") + " **" + m.display_name + "**" for m in chunk]
-            col_size = max(1, (len(lines) + 2) // 3)
-            for ci in range(3):
-                col = lines[ci * col_size:(ci + 1) * col_size]
-                if col: e.add_field(name="\u200b", value="\n".join(col), inline=True)
-            if len(humans) > 24: e.set_footer(text="…et " + str(len(humans) - 24) + " autres membres")
+            e = _build_section_embed(g, "members")
             await inter.response.send_message(embed=e, view=MemberActionView(g), ephemeral=True)
+            return
 
-        # ── Rôles ────────────────────────────────────────────────
-        elif val == "roles":
-            roles = [r for r in g.roles if r.name != "@everyone"][::-1]
-            e = discord.Embed(title="📋  Rôles — " + g.name,
-                              description="`" + str(len(roles)) + "` rôle(s)",
-                              color=C_BLURPLE)
-            lines = [("🔵" if r.color.value else "⚪") + " " + r.mention + "  `" + str(len(r.members)) + " membres`"
-                     for r in roles[:20]]
-            e.description += "\n\n" + "\n".join(lines)
-            if len(roles) > 20: e.set_footer(text="…et " + str(len(roles) - 20) + " autres rôles")
+        if section == "server":
+            e = _build_section_embed(g, "server")
             await inter.response.send_message(embed=e, ephemeral=True)
+            return
 
-        # ── Salons ───────────────────────────────────────────────
-        elif val == "channels":
-            e = discord.Embed(title="📡  Salons — " + g.name, color=C_TEAL)
-            cats = sorted(g.categories, key=lambda c: c.position)
-            for cat3 in cats[:6]:
-                txt = [c for c in cat3.channels if isinstance(c, discord.TextChannel)]
-                if not txt: continue
-                val_str = "\n".join("#" + c.name for c in txt[:8])
-                if len(txt) > 8: val_str += "\n*…+" + str(len(txt) - 8) + "*"
-                e.add_field(name="📁 " + cat3.name, value=val_str, inline=True)
-            await inter.response.send_message(embed=e, ephemeral=True)
+        # Sections config → édition en place du message principal
+        if section in ("config_staff", "config_tickets"):
+            e    = _build_section_embed(g, section)
+            view = DashboardView(g, active_section=section)
+            # Attacher la sous-vue de config appropriée en éphémère
+            if section == "config_staff":
+                await inter.response.edit_message(embed=e, view=view)
+                cfg_view = ConfigStaffView(g, cfg)
+                await inter.followup.send(
+                    embed=_e_ok("⚙️  Modifier — Staff", "Utilise les menus ci-dessous pour changer les paramètres."),
+                    view=cfg_view, ephemeral=True)
+            else:
+                await inter.response.edit_message(embed=e, view=view)
+                cfg_view = ConfigTicketsView(g, cfg)
+                await inter.followup.send(
+                    embed=_e_ok("⚙️  Modifier — Tickets", "Utilise les menus ci-dessous pour changer les paramètres."),
+                    view=cfg_view, ephemeral=True)
+            return
 
-        # ── Infos serveur ────────────────────────────────────────
-        elif val == "server":
-            humans = [m for m in g.members if not m.bot]
-            online = [m for m in humans if m.status != discord.Status.offline]
-            bots   = [m for m in g.members if m.bot]
-            e = discord.Embed(title="🌐  " + g.name, color=C_DARK,
-                              timestamp=datetime.now(timezone.utc))
-            if g.icon: e.set_thumbnail(url=g.icon.url)
-            e.add_field(name="👥  Membres",  value="`" + str(len(humans)) + "` total\n`" + str(len(online)) + "` en ligne", inline=True)
-            e.add_field(name="🤖  Bots",     value="`" + str(len(bots)) + "`", inline=True)
-            e.add_field(name="📋  Rôles",    value="`" + str(len(g.roles) - 1) + "`", inline=True)
-            txt_chs = [c for c in g.channels if isinstance(c, discord.TextChannel)]
-            e.add_field(name="📡  Salons",   value="`" + str(len(txt_chs)) + "` texte\n`" + str(len(g.categories)) + "` catégorie(s)", inline=True)
-            e.add_field(name="📅  Création", value="<t:" + str(int(g.created_at.timestamp())) + ":D>", inline=True)
-            e.add_field(name="🆔  ID",       value="`" + str(g.id) + "`", inline=True)
-            await inter.response.send_message(embed=e, ephemeral=True)
+        # Accueil ou fallback
+        e = _build_section_embed(g, "home")
+        await inter.response.edit_message(embed=e, view=DashboardView(g, "home"))
+        active_menu_msgs[g.id] = (inter.channel.id, inter.message.id)
+
+    async def _refresh(self, inter: discord.Interaction):
+        ok2, reason = self._guard(inter)
+        if not ok2:
+            await inter.response.send_message(embed=_e_warn("⚠️", reason), ephemeral=True); return
+        e    = _build_section_embed(self.guild, self.active_section)
+        view = DashboardView(self.guild, self.active_section)
+        await inter.response.edit_message(embed=e, view=view)
+        active_menu_msgs[self.guild.id] = (inter.channel.id, inter.message.id)
+
+    async def _close(self, inter: discord.Interaction):
+        try: await inter.message.delete()
+        except Exception: pass
+        active_menu_msgs.pop(self.guild.id, None)
+        await inter.response.send_message(
+            embed=_e_empty("✖️  Panel fermé", "Tu peux le rouvrir avec `/menu`."), ephemeral=True)
+        self.stop()
 
 
-# ── Vue : liste tickets + sélection ──────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  ConfigStaffView — sous-vue configuration staff (éphémère)
+# ══════════════════════════════════════════════════════════════════
+class ConfigStaffView(discord.ui.View):
+    """Sous-vue de configuration Staff & Permissions — éphémère."""
+
+    def __init__(self, guild: discord.Guild, cfg: dict, role_page: int = 0):
+        super().__init__(timeout=300)
+        self.guild     = guild
+        self.cfg       = cfg
+        self.role_page = role_page
+
+        chs      = sorted([c for c in guild.channels if isinstance(c, discord.TextChannel)], key=lambda c: c.name)
+        all_roles = [r for r in guild.roles if r.name != "@everyone"]
+
+        # Sélecteur salon staff
+        if chs:
+            s_ch = discord.ui.Select(
+                placeholder="📣  Salon des notifications staff…",
+                options=[discord.SelectOption(
+                    label=f"#{c.name}"[:50],
+                    value=str(c.id),
+                    default=(cfg.get("staff_channel_id") == c.id)
+                ) for c in chs[:25]],
+                row=0
+            )
+            s_ch.callback = self._set_channel
+            self.add_item(s_ch)
+
+        # Sélecteur rôle staff (paginé)
+        if all_roles:
+            page_start = role_page * 24
+            page_roles = all_roles[page_start:page_start + 24]
+            has_next   = (page_start + 24) < len(all_roles)
+            opts = [discord.SelectOption(
+                label=r.name[:50],
+                description=f"{len(r.members)} membre(s)",
+                value=str(r.id),
+                default=(cfg.get("staff_role_id") == r.id)
+            ) for r in page_roles]
+            if has_next:
+                opts.append(discord.SelectOption(
+                    label=f"➡️  Suite ({len(all_roles) - page_start - 24} rôles)",
+                    value="__next__",
+                    description="Voir la page suivante"
+                ))
+            suffix = f"  (p.{role_page+1})" if len(all_roles) > 24 else ""
+            s_role = discord.ui.Select(
+                placeholder=f"🛡️  Rôle staff{suffix}…",
+                options=opts, row=1
+            )
+            s_role.callback = self._set_role
+            self.add_item(s_role)
+
+        btn_search = discord.ui.Button(label="Chercher un rôle", style=discord.ButtonStyle.secondary,
+                                       emoji="🔍", row=2)
+        btn_search.callback = self._search_role
+        self.add_item(btn_search)
+
+    def _guard(self, inter):
+        if not is_staff(inter.user, self.guild.id):
+            return False, "🚫  Accès réservé au staff."
+        return True, ""
+
+    async def _set_channel(self, inter: discord.Interaction):
+        ok2, r = self._guard(inter)
+        if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
+        self.cfg["staff_channel_id"] = int(inter.data["values"][0])
+        await save_data()
+        ch = self.guild.get_channel(self.cfg["staff_channel_id"])
+        await inter.response.send_message(
+            embed=_e_ok("✅  Salon staff mis à jour", f"**#{ch.name if ch else '?'}**"), ephemeral=True)
+
+    async def _set_role(self, inter: discord.Interaction):
+        ok2, r = self._guard(inter)
+        if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
+        val = inter.data["values"][0]
+        if val == "__next__":
+            await inter.response.edit_message(view=ConfigStaffView(self.guild, self.cfg, self.role_page + 1))
+            return
+        self.cfg["staff_role_id"] = int(val)
+        await save_data()
+        role = self.guild.get_role(self.cfg["staff_role_id"])
+        await inter.response.send_message(
+            embed=_e_ok("✅  Rôle staff mis à jour", f"**{role.name if role else '?'}**"), ephemeral=True)
+
+    async def _search_role(self, inter: discord.Interaction):
+        ok2, r = self._guard(inter)
+        if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
+        await inter.response.send_modal(RoleSearchModal(self.guild, self.cfg))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ConfigTicketsView — sous-vue configuration tickets (éphémère)
+# ══════════════════════════════════════════════════════════════════
+class ConfigTicketsView(discord.ui.View):
+    """Sous-vue de configuration Tickets — éphémère."""
+
+    def __init__(self, guild: discord.Guild, cfg: dict):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.cfg   = cfg
+
+        cats = sorted(guild.categories, key=lambda c: c.position)
+
+        # Sélecteur catégorie tickets
+        if cats:
+            s_cat = discord.ui.Select(
+                placeholder="📁  Catégorie des tickets…",
+                options=[discord.SelectOption(
+                    label=cat.name[:50],
+                    description=f"{len(cat.channels)} salon(s)",
+                    value=str(cat.id),
+                    default=(cfg.get("category_id") == cat.id)
+                ) for cat in cats[:25]],
+                row=0
+            )
+            s_cat.callback = self._set_cat
+            self.add_item(s_cat)
+
+        btn_types = discord.ui.Button(label="Gérer les types", style=discord.ButtonStyle.primary,
+                                      emoji="📝", row=1)
+        btn_types.callback = self._open_types
+        self.add_item(btn_types)
+
+    def _guard(self, inter):
+        if not is_staff(inter.user, self.guild.id):
+            return False, "🚫  Accès réservé au staff."
+        return True, ""
+
+    async def _set_cat(self, inter: discord.Interaction):
+        ok2, r = self._guard(inter)
+        if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
+        self.cfg["category_id"] = int(inter.data["values"][0])
+        await save_data()
+        cat = self.guild.get_channel(self.cfg["category_id"])
+        await inter.response.send_message(
+            embed=_e_ok("✅  Catégorie mise à jour", f"**{cat.name if cat else '?'}**"), ephemeral=True)
+
+    async def _open_types(self, inter: discord.Interaction):
+        ok2, r = self._guard(inter)
+        if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
+        cfg = tconf(self.guild.id)
+        e = discord.Embed(
+            description=(
+                f"### 📝  Types de tickets\n"
+                f"`{len(cfg['types'])}` type(s) configuré(s)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=C_PURPLE
+        )
+        if cfg["types"]:
+            for key, t in cfg["types"].items():
+                qs    = t.get("questions", [])
+                q_txt = "\n".join("• " + q for q in qs[:4]) or "*Aucune question*"
+                if len(qs) > 4: q_txt += f"\n*…+{len(qs)-4} autres*"
+                e.add_field(name=f"{t['emoji']}  **{t['label']}**  `[{key}]`", value=q_txt[:256], inline=False)
+        else:
+            e.add_field(name="Aucun type", value="> *Crée ton premier type ci-dessous.*", inline=False)
+        await inter.response.send_message(embed=e, view=TypesManagerView(self.guild, cfg), ephemeral=True)
+
+
+
 class TicketListView(discord.ui.View):
     def __init__(self, guild, sessions, cfg):
         super().__init__(timeout=120)
@@ -2271,123 +2632,6 @@ class PendingLaunchView(discord.ui.View):
 
 
 # ── Vue : configuration complète ─────────────────────────────────
-class ConfigFullView(discord.ui.View):
-    def __init__(self, guild, cfg, role_page=0):
-        super().__init__(timeout=300)
-        self.guild     = guild
-        self.cfg       = cfg
-        self.role_page = role_page
-        cats  = sorted(guild.categories, key=lambda c: c.position)
-        chs   = sorted([c for c in guild.channels if isinstance(c, discord.TextChannel)], key=lambda c: c.name)
-        all_roles = [r for r in guild.roles if r.name != "@everyone"]
-
-        if cats:
-            s1 = discord.ui.Select(
-                placeholder="📁  Catégorie des tickets…",
-                options=[discord.SelectOption(
-                    label=cat.name[:50],
-                    description=str(len(cat.channels)) + " salon(s)",
-                    value=str(cat.id),
-                    default=(cfg.get("category_id") == cat.id)) for cat in cats[:25]],
-                row=0)
-            s1.callback = self.set_cat
-            self.add_item(s1)
-
-        if chs:
-            s2 = discord.ui.Select(
-                placeholder="📣  Salon des notifications staff…",
-                options=[discord.SelectOption(
-                    label=("#" + c.name)[:50],
-                    value=str(c.id),
-                    default=(cfg.get("staff_channel_id") == c.id)) for c in chs[:25]],
-                row=1)
-            s2.callback = self.set_sch
-            self.add_item(s2)
-
-        # Rôles paginés : page de 24 + option "page suivante" si besoin
-        if all_roles:
-            page_start = role_page * 24
-            page_roles = all_roles[page_start:page_start + 24]
-            has_next   = (page_start + 24) < len(all_roles)
-            opts_r = [discord.SelectOption(
-                label=r.name[:50],
-                description=str(len(r.members)) + " membre(s)",
-                value=str(r.id),
-                default=(cfg.get("staff_role_id") == r.id)) for r in page_roles]
-            if has_next:
-                opts_r.append(discord.SelectOption(
-                    label="➡️  Page suivante (" + str(len(all_roles) - page_start - 24) + " rôles restants)",
-                    value="__next_page__",
-                    description="Voir les rôles suivants"))
-            suffix = "  (p." + str(role_page + 1) + ")" if len(all_roles) > 24 else ""
-            s3 = discord.ui.Select(
-                placeholder="🛡  Rôle staff autorisé" + suffix + "…",
-                options=opts_r, row=2)
-            s3.callback = self.set_sro
-            self.add_item(s3)
-
-        # Bouton saisie manuelle du rôle (pour les très grands serveurs)
-        btn_role = discord.ui.Button(label="Saisir rôle (nom)", style=discord.ButtonStyle.secondary,
-                                     emoji="🔍", row=3)
-        btn_role.callback = self.manual_role
-        self.add_item(btn_role)
-
-        btn_show = discord.ui.Button(label="Config actuelle", style=discord.ButtonStyle.secondary,
-                                     emoji="📊", row=3)
-        btn_show.callback = self.show_cfg
-        self.add_item(btn_show)
-
-    async def set_cat(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        self.cfg["category_id"] = int(inter.data["values"][0])
-        await save_data()
-        cat = self.guild.get_channel(self.cfg["category_id"])
-        await inter.response.send_message(
-            embed=_e_ok("✅  Catégorie mise à jour", "**" + (cat.name if cat else "?") + "**"), ephemeral=True)
-
-    async def set_sch(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        self.cfg["staff_channel_id"] = int(inter.data["values"][0])
-        await save_data()
-        ch = self.guild.get_channel(self.cfg["staff_channel_id"])
-        await inter.response.send_message(
-            embed=_e_ok("✅  Salon staff mis à jour", "**#" + (ch.name if ch else "?") + "**"), ephemeral=True)
-
-    async def set_sro(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        val = inter.data["values"][0]
-        if val == "__next_page__":
-            new_view = ConfigFullView(self.guild, self.cfg, self.role_page + 1)
-            await inter.response.edit_message(view=new_view)
-            return
-        self.cfg["staff_role_id"] = int(val)
-        await save_data()
-        r = self.guild.get_role(self.cfg["staff_role_id"])
-        await inter.response.send_message(
-            embed=_e_ok("✅  Rôle staff mis à jour", "**" + (r.name if r else "?") + "**"), ephemeral=True)
-
-    async def manual_role(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        await inter.response.send_modal(RoleSearchModal(self.guild, self.cfg))
-
-    async def show_cfg(self, inter: discord.Interaction):
-        cat2 = self.guild.get_channel(self.cfg.get("category_id") or 0)
-        sch2 = self.guild.get_channel(self.cfg.get("staff_channel_id") or 0)
-        sro2 = self.guild.get_role(self.cfg.get("staff_role_id") or 0)
-        ok_cfg, msg_cfg = is_configured(self.guild.id)
-        e = discord.Embed(title="📊  Config — " + self.guild.name, color=C_BLUE)
-        e.add_field(name="📁 Catégorie",   value="`" + cat2.name + "`" if cat2 else "❌", inline=True)
-        e.add_field(name="📣 Salon staff", value=sch2.mention if sch2 else "❌",          inline=True)
-        e.add_field(name="🛡 Rôle staff",  value=sro2.mention if sro2 else "⚠️",         inline=True)
-        e.add_field(name="🔒 Menu Discord", value=("Verrouillé 🔒" if self.cfg.get("menu_locked") else "Libre 🔓") + "\n*Modifiable via console*", inline=True)
-        if not ok_cfg: e.add_field(name="⚠️ Manquant", value=msg_cfg, inline=False)
-        await inter.response.send_message(embed=e, ephemeral=True)
-
-
 class RoleSearchModal(discord.ui.Modal, title="🔍  Chercher un rôle par nom"):
     query = discord.ui.TextInput(label="Nom du rôle (partiel accepté)",
                                   placeholder="ex: Admin, Modérateur…",
