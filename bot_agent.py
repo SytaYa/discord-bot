@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.11 — hébergé sur Render
+  BOT AGENT v5.12 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -23,6 +23,8 @@
          yt-dlp non épinglé (toujours à jour), YTDL_STREAM retries=5
   v5.11: logger yt_dlp custom (erreurs visibles Render), retry vanilla,
          android player_client, music_locked+message console
+  v5.12: changelog manuel BDD (load/save), notification utilise changelog,
+         dispatch update_check/update_publish
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -62,7 +64,7 @@ DATA_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_d
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.11"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.12"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -692,16 +694,64 @@ async def _delete_active_menu(guild_id: int, channel=None):
                         break   # un seul menu à la fois
         except: pass
 
+# ── Changelog manuel (stocké en BDD, clé "changelog") ─────────────────
+# Structure JSON : {"version": "5.x", "description": "...", "updated_at": "..."}
+# Prioritaire sur le message de commit Git pour le message Discord public.
+
+_cached_changelog: dict | None = None   # chargé une fois au démarrage
+
+async def load_changelog() -> dict | None:
+    """Charge le changelog manuel depuis la BDD (clé kv 'changelog')."""
+    global _cached_changelog
+    if not _db_pool:
+        return None
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM kv WHERE key='changelog'")
+            if row:
+                _cached_changelog = json.loads(row["value"])
+                log("BOT", f"Changelog chargé : v{_cached_changelog.get('version','?')} — {_cached_changelog.get('description','')[:60]}")
+                return _cached_changelog
+    except Exception as e:
+        log("BOT", f"load_changelog erreur : {e}")
+    return None
+
+async def save_changelog(version: str, description: str) -> bool:
+    """Sauvegarde le changelog manuel en BDD (clé kv 'changelog')."""
+    global _cached_changelog
+    data = {
+        "version":     version,
+        "description": description,
+        "updated_at":  datetime.now(timezone.utc).isoformat(),
+        "source":      "dev",
+        "target":      "main",
+    }
+    _cached_changelog = data
+    if not _db_pool:
+        log("BOT", "save_changelog : pas de BDD disponible")
+        return False
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO kv VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2",
+                "changelog", json.dumps(data)
+            )
+        log("BOT", f"Changelog sauvegardé : v{version}")
+        return True
+    except Exception as e:
+        log("BOT", f"save_changelog erreur : {e}")
+        return False
+
 # ── Événements Discord ─────────────────────────────────────────────
 def get_last_commit_message() -> str:
-    """Lit le dernier message de commit Git via subprocess."""
+    """Lit le dernier message de commit Git (utilisé comme fallback si pas de changelog manuel)."""
     try:
         result = subprocess.run(
             ["git", "log", "-1", "--pretty=%B"],
             capture_output=True, text=True, timeout=5
         )
         msg = result.stdout.strip()
-        return msg if msg else "Mise à jour sans description de commit."
+        return msg if msg else "Mise à jour déployée."
     except Exception as e:
         log("BOT", f"get_last_commit_message erreur : {e}")
         return "Mise à jour déployée."
@@ -709,10 +759,18 @@ def get_last_commit_message() -> str:
 
 async def send_update_notifications():
     """Envoie un embed de mise à jour dans chaque salon staff configuré.
-    Appelé une seule fois par démarrage, après load_data().
+    Utilise le changelog manuel s'il existe, sinon le dernier commit Git.
     """
-    commit_msg = get_last_commit_message()
-    log("BOT", f"Notification mise à jour — commit : {commit_msg[:60]}")
+    # Priorité : changelog manuel > commit Git
+    cl = _cached_changelog
+    if cl:
+        version_str = cl.get("version") or BOT_VERSION
+        description = cl.get("description") or "Mise à jour déployée."
+        log("BOT", f"Notification mise à jour — changelog v{version_str} : {description[:60]}")
+    else:
+        version_str = BOT_VERSION
+        description = get_last_commit_message()
+        log("BOT", f"Notification mise à jour — commit : {description[:60]}")
 
     sent = 0
     for g in client.guilds:
@@ -723,18 +781,17 @@ async def send_update_notifications():
         if not ch:
             log("BOT", f"[{g.name}] salon staff introuvable (id={cfg['staff_channel_id']})")
             continue
-        # Vérifier la permission d'envoyer
         if not ch.permissions_for(g.me).send_messages:
             log("BOT", f"[{g.name}] permission refusée dans #{ch.name}")
             continue
         try:
             e = discord.Embed(
                 title="✅  Bot mis à jour",
-                description=commit_msg,
+                description=description,
                 color=C_GREEN,
                 timestamp=datetime.now(timezone.utc)
             )
-            e.add_field(name="🔖  Version", value=f"`{BOT_VERSION}`", inline=True)
+            e.add_field(name="🔖  Version", value=f"`{version_str}`", inline=True)
             e.add_field(name="🌐  Serveur", value=g.name, inline=True)
             e.set_footer(text=client.user.name)
             await ch.send(embed=e)
@@ -829,6 +886,8 @@ async def on_ready():
             total += 1
     if total: log("BOT", str(total) + " salon(s) existant(s) detecte(s)")
 
+    # Charger le changelog manuel (stocké en BDD) avant la notification
+    await load_changelog()
     # Notification de mise à jour dans les salons staff
     await send_update_notifications()
 
@@ -3686,6 +3745,39 @@ async def _dispatch_inner(action, p):
         vcs = [{"id": c.id, "name": c.name, "members": len(c.members)}
                for c in g.channels if isinstance(c, discord.VoiceChannel)]
         return {"voice_channels": vcs}
+
+    # ── Système de publication DEV → PROD ──────────────────────────────
+    elif action == "update_check":
+        # Comparer les commits de dev et main via git log
+        # Retourne: {ahead: N, behind: N, commits: [...], current_branch: "...", changelog: {...}}
+        def _git(cmd):
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd="/app")
+            return r.stdout.strip(), r.returncode
+        # Récupérer les infos sur les branches distantes
+        _git(["git", "fetch", "origin", "--quiet"])
+        current, _ = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        # Commits dans dev mais pas dans main (nouveautés)
+        ahead_log, _ = _git(["git", "log", "origin/main..origin/dev", "--oneline", "--no-merges"])
+        ahead_commits = [l.strip() for l in ahead_log.splitlines() if l.strip()]
+        # Vérifier si on est à jour
+        is_up_to_date = len(ahead_commits) == 0
+        return {
+            "ok":           True,
+            "is_up_to_date": is_up_to_date,
+            "ahead":         len(ahead_commits),
+            "commits":       ahead_commits[:20],
+            "current_branch": current,
+            "changelog":     _cached_changelog,
+        }
+
+    elif action == "update_publish":
+        # Enregistrer le changelog en BDD
+        version     = str(p.get("version", "")).strip()
+        description = str(p.get("description", "")).strip()
+        if not version or not description:
+            return {"error": "version et description requis"}
+        ok = await save_changelog(version, description)
+        return {"ok": ok, "version": version, "description": description}
 
     return {"error": "Unknown action: " + action}
 
