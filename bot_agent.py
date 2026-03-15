@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.14 — hébergé sur Render
+  BOT AGENT v5.15 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -27,6 +27,7 @@
          dispatch update_check/update_publish
   v5.13: FIX AUDIO — reconnect_streamed remis (cause du silence), quiet=True yt_dlp
   v5.14: cwd=BOT_DIR portable (fix /app), priorité changelog stricte
+  v5.15: /playtest diagnostic, timing after(), CMD FFmpeg loggée, PID FFmpeg
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -67,7 +68,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.14"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.15"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -1567,8 +1568,14 @@ async def _play_next(guild: discord.Guild):
     # Étape 4 : after callback (appelé depuis le thread FFmpeg — PAS l'event loop)
     track_title_for_after = track.get("title") or "?"
     _ffmpeg_proc = getattr(ffmpeg_source, "_process", None)
+    import time as _time_after
+    _after_ref_time = _time_after.time()
 
     def _after(error):
+        _dur = _time_after.time() - _after_ref_time
+        log("MUSIC", f"[{guild.name}] ── after() appelé — durée : {_dur:.1f}s", flush=True)
+        if _dur < 3.0:
+            log("MUSIC", f"[{guild.name}] ⚠ LECTURE < 3s — FFmpeg mort tôt (error={error})", flush=True)
         # Lire stderr FFmpeg
         stderr_output = ""
         if _ffmpeg_proc is not None and _ffmpeg_proc.stderr:
@@ -1628,23 +1635,51 @@ async def _play_next(guild: discord.Guild):
         except Exception as ex:
             log("MUSIC", f"[{guild.name}] after run_coroutine_threadsafe exception : {ex}", flush=True)
 
-    # Étape 5 : vc.play()
+    # Étape 5 : vc.play() — avec diagnostic complet
+    import shlex as _shlex, time as _time_mod
     log("MUSIC", f"[{guild.name}] ── Étape 5 : vc.play() ───────────────────────", flush=True)
     log("MUSIC", f"[{guild.name}] Opus chargé  : {discord.opus.is_loaded()}", flush=True)
     log("MUSIC", f"[{guild.name}] avant play   : connected={vc.is_connected()} playing={vc.is_playing()} paused={vc.is_paused()}", flush=True)
+    # Logger la commande FFmpeg EXACTE que discord.py va exécuter
+    _ffcmd = ([FFMPEG_EXECUTABLE]
+              + _shlex.split(FFMPEG_BEFORE_OPTIONS)
+              + ["-i", stream_url]
+              + _shlex.split(FFMPEG_OPTIONS))
+    log("MUSIC", f"[{guild.name}] CMD FFmpeg   : {' '.join(_ffcmd[:6])} -i <url> {' '.join(_ffcmd[-2:])}", flush=True)
+    log("MUSIC", f"[{guild.name}] stream_url   : {stream_url}", flush=True)
+    _play_start_time = _time_mod.time()
     try:
         if vc.is_playing():
             log("MUSIC", f"[{guild.name}] vc déjà en lecture → stop() avant play()", flush=True)
             vc.stop()
         vc.play(source, after=_after)
-        await asyncio.sleep(0.2)  # laisser FFmpeg démarrer (non-bloquant)
+        await asyncio.sleep(0.5)  # 500ms pour laisser FFmpeg vraiment démarrer
         playing_now = vc.is_playing()
-        log("MUSIC", f"[{guild.name}] après play : connected={vc.is_connected()} playing={playing_now} paused={vc.is_paused()}", flush=True)
+        # PID du process FFmpeg (via source.original si PCMVolumeTransformer)
+        _ffproc = getattr(getattr(source, 'original', source), '_process', None)
+        _ffpid  = _ffproc.pid if _ffproc else "N/A"
+        log("MUSIC", f"[{guild.name}] après play   : connected={vc.is_connected()} playing={playing_now} paused={vc.is_paused()}", flush=True)
+        log("MUSIC", f"[{guild.name}] FFmpeg PID   : {_ffpid}", flush=True)
         if playing_now:
             log("MUSIC", f"[{guild.name}] ✔ LECTURE AUDIO EN COURS — '{track.get('title') or '?'}'", flush=True)
+            # Vérifier encore 2s plus tard que FFmpeg n'est pas mort prématurément
+            await asyncio.sleep(2.0)
+            still_playing = vc.is_playing()
+            log("MUSIC", f"[{guild.name}] Vérif 2.5s   : is_playing()={still_playing}", flush=True)
+            if not still_playing:
+                log("MUSIC", f"[{guild.name}] ⚠ FFmpeg mort en < 2.5s — URL CDN expirée ou -reconnect_streamed manquant", flush=True)
         else:
-            log("MUSIC", f"[{guild.name}] ⚠ is_playing()=False après vc.play() — FFmpeg a probablement échoué", flush=True)
-            log("MUSIC", f"[{guild.name}]   → after() sera appelé avec l'erreur (voir logs MUSIC suivants)", flush=True)
+            log("MUSIC", f"[{guild.name}] ⚠ is_playing()=False 500ms après play() — FFmpeg a échoué au démarrage", flush=True)
+            if _ffproc:
+                try:
+                    _rc = _ffproc.poll()
+                    log("MUSIC", f"[{guild.name}] FFmpeg returncode : {_rc}", flush=True)
+                    _ff_err = (_ffproc.stderr.read(2000).decode('utf-8', errors='replace')
+                               if _ffproc.stderr else '')
+                    if _ff_err:
+                        log("MUSIC", f"[{guild.name}] FFmpeg stderr     : {_ff_err[:500]}", flush=True)
+                except Exception as _eproc:
+                    log("MUSIC", f"[{guild.name}] lecture proc stderr : {_eproc}", flush=True)
     except discord.errors.ClientException as e:
         log("MUSIC", f"[{guild.name}] vc.play ClientException : {e}", flush=True)
         if "already" in str(e).lower():
@@ -2027,6 +2062,115 @@ async def slash_play(inter: discord.Interaction, query: str):
             if inter.response.is_done(): await inter.followup.send(m, ephemeral=True)
             else: await inter.response.send_message(m, ephemeral=True)
         except Exception: pass
+
+
+@tree.command(name="playtest", description="[DEBUG] Tester l'audio avec une URL YouTube fixe")
+async def slash_playtest(inter: discord.Interaction):
+    """Diagnostic audio complet — URL fixe, bypass de toute la logique de recherche."""
+    import shlex as _shlex, time as _ttest
+    TEST_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # Me at the zoo (19s, toujours dispo)
+    await inter.response.defer(ephemeral=True)
+    if not inter.guild:
+        await inter.followup.send("❌ Serveur requis.", ephemeral=True); return
+    if not inter.user.voice or not inter.user.voice.channel:
+        await inter.followup.send("❌ Rejoins un vocal d'abord.", ephemeral=True); return
+    if not YT_DLP_OK:
+        await inter.followup.send("❌ yt_dlp manquant.", ephemeral=True); return
+
+    guild = inter.guild
+    log("TEST", "╔══ /playtest ═══════════════════════════════════════", flush=True)
+    log("TEST", f"║ URL      : {TEST_URL}", flush=True)
+    log("TEST", f"║ FFmpeg   : {FFMPEG_EXECUTABLE}", flush=True)
+    log("TEST", f"║ Opus     : {discord.opus.is_loaded()}", flush=True)
+
+    # Connexion vocale
+    vc = guild.voice_client
+    target = inter.user.voice.channel
+    try:
+        if vc and not vc.is_connected():
+            try: await vc.disconnect(force=True)
+            except Exception: pass
+            vc = None
+        if vc and vc.is_connected():
+            if vc.channel != target: await vc.move_to(target)
+        else:
+            vc = await target.connect()
+        log("TEST", f"║ Vocal    : {vc.channel.name} ✔", flush=True)
+    except Exception as e:
+        log("TEST", f"║ Vocal ERREUR : {e}", flush=True)
+        await inter.followup.send(f"❌ Vocal : {e}", ephemeral=True); return
+
+    # Résolution yt_dlp
+    log("TEST", "║ ── yt_dlp ──────────────────────────────────────────", flush=True)
+    t0 = _ttest.time()
+    si = await _get_stream_info(TEST_URL)
+    log("TEST", f"║ Durée    : {_ttest.time()-t0:.1f}s", flush=True)
+    if not si:
+        log("TEST", "║ ✘ yt_dlp a échoué → voir logs [YTDL] / [MUSIC]", flush=True)
+        await inter.followup.send("❌ yt_dlp échec. Voir logs [YTDL]/[MUSIC].", ephemeral=True); return
+    log("TEST", f"║ URL CDN  : {si['stream_url']}", flush=True)
+    log("TEST", f"║ Titre    : {si.get('title')}  dur={si.get('duration')}s", flush=True)
+
+    # FFmpegPCMAudio
+    log("TEST", "║ ── FFmpegPCMAudio ──────────────────────────────────", flush=True)
+    _cmd = ([FFMPEG_EXECUTABLE] + _shlex.split(FFMPEG_BEFORE_OPTIONS)
+            + ["-i", si["stream_url"]] + _shlex.split(FFMPEG_OPTIONS))
+    log("TEST", f"║ CMD      : {' '.join(_cmd[:6])} -i <url> {' '.join(_cmd[-2:])}", flush=True)
+    try:
+        ff_src = discord.FFmpegPCMAudio(si["stream_url"],
+                     executable=FFMPEG_EXECUTABLE,
+                     before_options=FFMPEG_BEFORE_OPTIONS,
+                     options=FFMPEG_OPTIONS, stderr=subprocess.PIPE)
+        vol_src = discord.PCMVolumeTransformer(ff_src, volume=0.5)
+        log("TEST", "║ ✔ Source créée", flush=True)
+    except Exception as e:
+        log("TEST", f"║ ✘ FFmpegPCMAudio ERREUR : {e}", flush=True)
+        await inter.followup.send(f"❌ FFmpegPCMAudio : {e}", ephemeral=True); return
+
+    # vc.play()
+    log("TEST", "║ ── vc.play() ───────────────────────────────────────", flush=True)
+    _pt = _ttest.time()
+    _ffp = getattr(ff_src, "_process", None)
+
+    def _after_test(error):
+        dur = _ttest.time() - _pt
+        log("TEST", f"║ after()  : dur={dur:.1f}s  error={error}", flush=True)
+        if error:
+            ferr = ""
+            if _ffp and _ffp.stderr:
+                try: ferr = _ffp.stderr.read(2000).decode('utf-8', errors='replace')
+                except Exception: pass
+            log("TEST", f"║ ✘ ERREUR : {error}", flush=True)
+            if ferr: log("TEST", f"║ stderr   : {ferr[:500]}", flush=True)
+        elif dur < 3.0:
+            log("TEST", f"║ ⚠ Trop court ({dur:.1f}s) — reconnect_streamed ? URL invalide ?", flush=True)
+        else:
+            log("TEST", f"║ ✔ Lecture normale ({dur:.1f}s)", flush=True)
+        log("TEST", "╚══ /playtest fin ═══════════════════════════════════", flush=True)
+
+    try:
+        if vc.is_playing(): vc.stop()
+        vc.play(vol_src, after=_after_test)
+        await asyncio.sleep(0.5)
+        playing = vc.is_playing()
+        pid = _ffp.pid if _ffp else "N/A"
+        log("TEST", f"║ playing  : {playing}  PID={pid}", flush=True)
+        if playing:
+            log("TEST", "║ ✔ vc.play() ACTIF", flush=True)
+            _tmsg = (
+                "✅ **Test en cours**\n"
+                f"URL CDN : `{si['stream_url'][:80]}`\n"
+                f"FFmpeg PID : `{pid}`\n"
+                "→ Si pas de son malgré is_playing=True → problème PyNaCl/Opus.\n"
+                "→ Résultat complet dans les logs Render [TEST]."
+            )
+            await inter.followup.send(_tmsg, ephemeral=True)
+        else:
+            log("TEST", "║ ✘ is_playing=False — FFmpeg crashé au démarrage", flush=True)
+            await inter.followup.send("❌ FFmpeg démarre puis s'arrête. Voir logs [TEST].", ephemeral=True)
+    except Exception as e:
+        log("TEST", f"║ ✘ vc.play() exception : {e}", flush=True)
+        await inter.followup.send(f"❌ vc.play() : {e}", ephemeral=True)
 
 
 @tree.command(name="stop", description="Arrêter la musique et déconnecter le bot du vocal")
