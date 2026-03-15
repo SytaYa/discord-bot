@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.19 — hébergé sur Render
+  BOT AGENT v5.20 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -32,6 +32,7 @@
   v5.17: REFONTE MUSIQUE — Spotify (UX) + Deezer (audio), suppression yt_dlp/YouTube
   v5.18: Commandes musique retirées (/play /stop /skip /pause /resume /queue /volume)
   v5.19: /menu refait — navigation séparée Staff/Tickets, embeds modernes
+  v5.20: fix maintenance /menu, commande /anon, toggle anon console+menu
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -69,7 +70,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.19"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.20"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -354,6 +355,7 @@ def tconf(gid):
             "music_volume":     50,     # volume par défaut (0–100)
             "music_locked":     False,  # True = musique verrouillée globalement
             "music_lock_msg":   "",     # message affiché quand la musique est verrouillée
+            "anon_enabled":     True,   # True = messages anonymes autorisés
         }
     if "menu_locked" not in ticket_config[gid]:
         ticket_config[gid]["menu_locked"] = False
@@ -364,6 +366,7 @@ def tconf(gid):
     if "music_volume"   not in cfg: cfg["music_volume"]   = 50
     if "music_locked"   not in cfg: cfg["music_locked"]   = False
     if "music_lock_msg" not in cfg: cfg["music_lock_msg"] = ""
+    if "anon_enabled"   not in cfg: cfg["anon_enabled"]   = True
     return ticket_config[gid]
 
 def is_configured(gid):
@@ -828,6 +831,14 @@ async def slash_menu(inter: discord.Interaction):
         if not inter.guild:
             await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True)
             return
+        if maintenance_mode:
+            await inter.response.send_message(
+                embed=discord.Embed(
+                    title="🔧  Bot en maintenance",
+                    description="Le bot est temporairement indisponible. Réessaie dans quelques instants.",
+                    color=0xE67E22),
+                ephemeral=True)
+            return
         if not is_staff(inter.user, inter.guild.id):
             await inter.response.send_message("🚫 Réservé au staff configuré.", ephemeral=True)
             return
@@ -838,6 +849,52 @@ async def slash_menu(inter: discord.Interaction):
             await inter.response.send_message("❌ Erreur.", ephemeral=True)
         except Exception:
             pass
+
+
+@tree.command(name="anon", description="Envoyer un message anonyme dans ce salon")
+@app_commands.describe(message="Ton message (tu restes anonyme)")
+async def slash_anon(inter: discord.Interaction, message: str):
+    try:
+        if not inter.guild:
+            await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True)
+            return
+        if maintenance_mode:
+            await inter.response.send_message(
+                embed=discord.Embed(title="🔧  Bot en maintenance", color=0xE67E22),
+                ephemeral=True); return
+        cfg = tconf(inter.guild.id)
+        if not cfg.get("anon_enabled", True):
+            await inter.response.send_message(
+                embed=discord.Embed(
+                    title="🔇  Messages anonymes désactivés",
+                    description="L'administration a bloqué les messages anonymes sur ce serveur.",
+                    color=0xED4245),
+                ephemeral=True)
+            return
+        if not message.strip():
+            await inter.response.send_message("❌ Le message ne peut pas être vide.", ephemeral=True)
+            return
+        # Envoyer le message anonyme dans le salon courant
+        e = discord.Embed(
+            description=message.strip(),
+            color=0x2B2D31,
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.set_author(name="💬  Message anonyme d'un membre du serveur")
+        e.set_footer(text=inter.guild.name, icon_url=inter.guild.icon.url if inter.guild.icon else None)
+        await inter.channel.send(embed=e)
+        # Confirmer à l'expéditeur (éphémère — lui seul le voit)
+        await inter.response.send_message(
+            embed=discord.Embed(
+                title="✅  Message envoyé",
+                description="Ton message a été transmis anonymement.",
+                color=0x57F287),
+            ephemeral=True)
+        log("ANON", f"[{inter.guild.name}] message anonyme envoyé dans #{inter.channel.name}", flush=True)
+    except Exception as e:
+        log("SLASH", f"/anon : {e}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
 
 
 @client.event
@@ -890,7 +947,7 @@ async def on_ready():
     try:
         # S'assurer que /menu est bien dans le tree local avant le sync
         existing = {c.name for c in tree.get_commands()}
-        for name, fn in {"menu": slash_menu}.items():
+        for name, fn in {"menu": slash_menu, "anon": slash_anon}.items():
             if name not in existing:
                 tree.add_command(fn)
                 log("SLASH", f"{name} ajouté au tree local")
@@ -1547,6 +1604,15 @@ async def send_staff_menu(channel, guild, invoker=None):
 
 async def send_staff_menu_inter(inter: discord.Interaction, guild):
     """Envoie le panel staff en réponse à une interaction slash /menu."""
+    if maintenance_mode:
+        e = discord.Embed(title="🔧  Bot en maintenance",
+                          description="Le panel est indisponible pendant la maintenance.",
+                          color=0xE67E22)
+        if inter.response.is_done():
+            await inter.followup.send(embed=e, ephemeral=True)
+        else:
+            await inter.response.send_message(embed=e, ephemeral=True)
+        return
     cfg = tconf(guild.id)
     if cfg.get("menu_locked"):
         await inter.response.send_message(embed=_e_warn(
@@ -1692,6 +1758,7 @@ def _build_section_embed(guild, section: str) -> discord.Embed:
 
     elif section == "config_staff":
         ok_cfg, msg_cfg = is_configured(guild.id)
+        anon_on = tconf(guild.id).get("anon_enabled", True)
         e = discord.Embed(
             description=(
                 f"### ⚙️  Configuration — Staff\n"
@@ -1719,6 +1786,11 @@ def _build_section_embed(guild, section: str) -> discord.Embed:
                 f"> {'✅  Rôle configuré'  if sro else '❌  Rôle manquant'}"
             ),
             inline=False
+        )
+        e.add_field(
+            name="💬  Messages anonymes",
+            value="> ✅  Activés" if anon_on else "> 🔇  Désactivés",
+            inline=True
         )
         if not ok_cfg:
             e.add_field(name="⚠️  Action requise", value=f"> {msg_cfg}", inline=False)
@@ -2128,6 +2200,16 @@ class ConfigStaffView(discord.ui.View):
         btn_search.callback = self._search_role
         self.add_item(btn_search)
 
+        anon_on  = cfg.get("anon_enabled", True)
+        btn_anon = discord.ui.Button(
+            label="Désactiver les messages anonymes" if anon_on else "Activer les messages anonymes",
+            style=discord.ButtonStyle.danger if anon_on else discord.ButtonStyle.success,
+            emoji="🔇" if anon_on else "💬",
+            row=3
+        )
+        btn_anon.callback = self._toggle_anon
+        self.add_item(btn_anon)
+
     def _guard(self, inter):
         if not is_staff(inter.user, self.guild.id):
             return False, "🚫  Accès réservé au staff."
@@ -2159,6 +2241,18 @@ class ConfigStaffView(discord.ui.View):
         ok2, r = self._guard(inter)
         if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
         await inter.response.send_modal(RoleSearchModal(self.guild, self.cfg))
+
+    async def _toggle_anon(self, inter: discord.Interaction):
+        ok2, r = self._guard(inter)
+        if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
+        self.cfg["anon_enabled"] = not self.cfg.get("anon_enabled", True)
+        await save_data()
+        state = self.cfg["anon_enabled"]
+        await inter.response.send_message(
+            embed=_e_ok(
+                "✅  Messages anonymes " + ("activés" if state else "désactivés"),
+                "Les membres " + ("peuvent" if state else "ne peuvent plus") + " envoyer des messages anonymes avec `/anon`."
+            ), ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -3335,21 +3429,54 @@ async def _dispatch_inner(action, p):
     # ── Système de publication DEV → PROD ──────────────────────────────
     elif action == "update_check":
         # Comparer les commits de dev et main via git log
-        # Retourne: {ahead: N, behind: N, commits: [...], current_branch: "...", changelog: {...}}
+        # IMPORTANT : Render clone en mode shallow (--depth=1) sur main uniquement.
+        # origin/dev n'existe pas dans ce clone sans fetch explicite.
+        # Solution : fetcher dev explicitement avant de comparer.
         def _git(cmd):
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=BOT_DIR)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15, cwd=BOT_DIR)
             return r.stdout.strip(), r.returncode
-        # Récupérer les infos sur les branches distantes
-        _git(["git", "fetch", "origin", "--quiet"])
+
         current, _ = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        # Commits dans dev mais pas dans main (nouveautés)
+
+        # Étape 1 : fetcher main ET dev explicitement
+        # (sur un clone shallow Render, seul main est tracké par défaut)
+        _git(["git", "fetch", "origin", "main", "--quiet"])
+        _, rc_dev = _git(["git", "fetch", "origin", "dev", "--quiet"])
+
+        if rc_dev != 0:
+            # La branche dev n'existe pas ou est inaccessible
+            return {
+                "ok":            True,
+                "is_up_to_date": False,
+                "ahead":         0,
+                "commits":       [],
+                "current_branch": current,
+                "changelog":     _cached_changelog,
+                "warning":       "Branche 'dev' introuvable sur origin — as-tu pushé sur dev ?",
+            }
+
+        # Étape 2 : comparer les SHAs
+        sha_main, _ = _git(["git", "rev-parse", "origin/main"])
+        sha_dev,  _ = _git(["git", "rev-parse", "origin/dev"])
+
+        if sha_main == sha_dev:
+            # Même commit → vraiment à jour
+            return {
+                "ok":            True,
+                "is_up_to_date": True,
+                "ahead":         0,
+                "commits":       [],
+                "current_branch": current,
+                "changelog":     _cached_changelog,
+            }
+
+        # Étape 3 : lister les commits de dev absents de main
         ahead_log, _ = _git(["git", "log", "origin/main..origin/dev", "--oneline", "--no-merges"])
         ahead_commits = [l.strip() for l in ahead_log.splitlines() if l.strip()]
-        # Vérifier si on est à jour
-        is_up_to_date = len(ahead_commits) == 0
+
         return {
-            "ok":           True,
-            "is_up_to_date": is_up_to_date,
+            "ok":            True,
+            "is_up_to_date": len(ahead_commits) == 0 and sha_main == sha_dev,
             "ahead":         len(ahead_commits),
             "commits":       ahead_commits[:20],
             "current_branch": current,
@@ -3364,6 +3491,15 @@ async def _dispatch_inner(action, p):
             return {"error": "version et description requis"}
         ok = await save_changelog(version, description)
         return {"ok": ok, "version": version, "description": description}
+
+    elif action == "anon_config":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        if "enabled" in p:
+            cfg["anon_enabled"] = bool(p["enabled"])
+            await save_data()
+        return {"ok": True, "anon_enabled": cfg.get("anon_enabled", True)}
 
     return {"error": "Unknown action: " + action}
 
