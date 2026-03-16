@@ -35,7 +35,9 @@
   v5.20: fix maintenance /menu, commande /anon, toggle anon console+menu
   v5.21: panel admin complet, suivi activité membres, /activite, rôles exemptés
   v5.22: pagination universelle — membres/bots/activité/rôles exemptés (boutons ◀ ▶)
-  v5.23: tous les rôles, bouton actualiser rapport, activity BDD, scan vocal boot
+  v5.23: rapport activité complet (tous les rôles, bouton actualiser temps réel),
+         persistance activité en BDD (survie aux redémarrages),
+         scan automatique des vocaux au boot, toggle exempté corrigé
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -1885,13 +1887,14 @@ def _member_activity_embed(member: discord.Member, gid: int) -> discord.Embed:
         if buf.strip(): parts.append(buf.strip())
         for i, part in enumerate(parts):
             e.add_field(
-                name=f"🏷️  Rôles{" (suite)" if i > 0 else ""} — {len(all_roles)} au total",
+                name=(f"🏷️  Rôles (suite) — {len(all_roles)} au total" if i > 0 else f"🏷️  Rôles — {len(all_roles)} au total"),
                 value=part,
                 inline=False
             )
 
     # Bouton Actualiser dans le footer (via timestamp qui change)
-    e.set_footer(text=f"🔄 Actualisé à {datetime.now(timezone.utc).strftime("%H:%M:%S")} UTC  •  {member.guild.name}")
+    _now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    e.set_footer(text=f"🔄 Actualisé à {_now_str} UTC  •  {member.guild.name}")
     return e
 
 
