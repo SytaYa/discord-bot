@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.22 — hébergé sur Render
+  BOT AGENT v5.23 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -35,6 +35,9 @@
   v5.20: fix maintenance /menu, commande /anon, toggle anon console+menu
   v5.21: panel admin complet, suivi activité membres, /activite, rôles exemptés
   v5.22: pagination universelle — membres/bots/activité/rôles exemptés (boutons ◀ ▶)
+  v5.23: rapport activité complet (tous les rôles, bouton actualiser temps réel),
+         persistance activité en BDD (survie aux redémarrages),
+         scan automatique des vocaux au boot, toggle exempté corrigé
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -72,7 +75,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.22"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.23"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -241,11 +244,29 @@ async def save_data():
                     cfg.get("counter", 0),
                     bool(cfg.get("menu_locked")),
                     json.dumps({
-                        "types":         cfg.get("types", {}),
-                        "music_enabled": cfg.get("music_enabled", True),
-                        "music_role_id": cfg.get("music_role_id"),
-                        "music_volume":  cfg.get("music_volume", 50),
+                        "types":                   cfg.get("types", {}),
+                        "music_enabled":           cfg.get("music_enabled", True),
+                        "music_role_id":           cfg.get("music_role_id"),
+                        "music_volume":            cfg.get("music_volume", 50),
+                        "anon_enabled":            cfg.get("anon_enabled", True),
+                        "activity_exempt_role_ids": cfg.get("activity_exempt_role_ids", []),
+                        "music_locked":            cfg.get("music_locked", False),
+                        "music_lock_msg":          cfg.get("music_lock_msg", ""),
                     }, ensure_ascii=False))
+                # Sauvegarder activity_data par serveur dans kv
+                for gid_a, gdata in activity_data.items():
+                    serializable = {}
+                    for mid, d in gdata.items():
+                        serializable[str(mid)] = {
+                            "msg_count":     d.get("msg_count", 0),
+                            "msg_last":      d["msg_last"].isoformat() if d.get("msg_last") else None,
+                            "voice_seconds": d.get("voice_seconds", 0),
+                            "last_seen":     d["last_seen"].isoformat() if d.get("last_seen") else None,
+                            # voice_joined non persisté (recalculé au boot)
+                        }
+                    await conn.execute(
+                        "INSERT INTO kv VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2",
+                        f"activity_{gid_a}", json.dumps(serializable))
                 await conn.execute("DELETE FROM ticket_session")
                 for ch_id, s in ticket_sessions.items():
                     await conn.execute(
@@ -288,19 +309,41 @@ async def load_data():
                     music_role_data    = None
                     music_volume_data  = 50
                 ticket_config[row["guild_id"]] = {
-                    "category_id":      row["category_id"],
-                    "staff_channel_id": row["staff_channel_id"],
-                    "staff_role_id":    row["staff_role_id"],
-                    "counter":          row["counter"],
-                    "menu_locked":      bool(row["menu_locked"]),
-                    "types":            types_data,
-                    "music_enabled":    music_enabled_data,
-                    "music_role_id":    music_role_data,
-                    "music_volume":     music_volume_data,
+                    "category_id":             row["category_id"],
+                    "staff_channel_id":        row["staff_channel_id"],
+                    "staff_role_id":           row["staff_role_id"],
+                    "counter":                 row["counter"],
+                    "menu_locked":             bool(row["menu_locked"]),
+                    "types":                   types_data,
+                    "music_enabled":           music_enabled_data,
+                    "music_role_id":           music_role_data,
+                    "music_volume":            music_volume_data,
+                    "anon_enabled":            raw_json.get("anon_enabled", True),
+                    "activity_exempt_role_ids": raw_json.get("activity_exempt_role_ids", []),
+                    "music_locked":            raw_json.get("music_locked", False),
+                    "music_lock_msg":          raw_json.get("music_lock_msg", ""),
                 }
             rows = await conn.fetch("SELECT * FROM ticket_session")
             for row in rows:
                 ticket_sessions[row["channel_id"]] = json.loads(row["data_json"])
+        # Charger activity_data
+        act_rows = await conn.fetch("SELECT key, value FROM kv WHERE key LIKE 'activity_%'")
+        for arow in act_rows:
+            gid_str = arow["key"].replace("activity_", "")
+            try:
+                gid_int = int(gid_str)
+                gdata   = json.loads(arow["value"])
+                activity_data[gid_int] = {}
+                for mid_str, d in gdata.items():
+                    activity_data[gid_int][int(mid_str)] = {
+                        "msg_count":     d.get("msg_count", 0),
+                        "msg_last":      datetime.fromisoformat(d["msg_last"]).replace(tzinfo=timezone.utc) if d.get("msg_last") else None,
+                        "voice_seconds": d.get("voice_seconds", 0),
+                        "voice_joined":  None,  # recalculé ci-dessous
+                        "last_seen":     datetime.fromisoformat(d["last_seen"]).replace(tzinfo=timezone.utc) if d.get("last_seen") else None,
+                    }
+            except Exception as _ea:
+                log("DB", f"Erreur chargement activity {gid_str}: {_ea}")
         log("DB", f"Charge : {len(ticket_config)} guild(s), {len(ticket_sessions)} ticket(s)"
             f" | maintenance={'ON' if maintenance_mode else 'OFF'}")
     except Exception as e:
@@ -1004,6 +1047,20 @@ async def on_ready():
             total += 1
     if total: log("BOT", str(total) + " salon(s) existant(s) detecte(s)")
 
+    # Scan des vocaux au démarrage — reprise de l'analyse pour membres déjà connectés
+    now_boot = datetime.now(timezone.utc)
+    vocal_count = 0
+    for guild in client.guilds:
+        for vc in guild.voice_channels:
+            for member in vc.members:
+                if member.bot: continue
+                d = _act(guild.id, member.id)
+                if not d.get("voice_joined"):  # pas déjà marqué
+                    d["voice_joined"] = now_boot
+                    d["last_seen"]    = now_boot
+                    vocal_count += 1
+    if vocal_count:
+        log("BOT", f"Scan vocal démarrage : {vocal_count} membre(s) déjà en vocal → analyse reprise")
     # Charger le changelog manuel (stocké en BDD) avant la notification
     await load_changelog()
     # Notification de mise à jour dans les salons staff
@@ -1816,16 +1873,28 @@ def _member_activity_embed(member: discord.Member, gid: int) -> discord.Embed:
         inline=True
     )
 
-    # Rôles (max 5)
-    roles = [r for r in member.roles if r.name != "@everyone"][:5]
-    if roles:
-        e.add_field(
-            name="🏷️  Rôles",
-            value=" ".join(r.mention for r in reversed(roles)),
-            inline=False
-        )
+    # Tous les rôles — paginés si besoin (limite embed 1024 chars)
+    all_roles = [r for r in reversed(member.roles) if r.name != "@everyone"]
+    if all_roles:
+        # Construire la chaîne de mentions en respectant la limite Discord
+        parts, buf = [], ""
+        for r in all_roles:
+            mention = r.mention
+            if len(buf) + len(mention) + 1 > 950:
+                parts.append(buf.rstrip())
+                buf = ""
+            buf += mention + " "
+        if buf.strip(): parts.append(buf.strip())
+        for i, part in enumerate(parts):
+            e.add_field(
+                name=(f"🏷️  Rôles (suite) — {len(all_roles)} au total" if i > 0 else f"🏷️  Rôles — {len(all_roles)} au total"),
+                value=part,
+                inline=False
+            )
 
-    e.set_footer(text=f"Données depuis le dernier démarrage du bot  •  {member.guild.name}")
+    # Bouton Actualiser dans le footer (via timestamp qui change)
+    _now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    e.set_footer(text=f"🔄 Actualisé à {_now_str} UTC  •  {member.guild.name}")
     return e
 
 
@@ -2560,6 +2629,30 @@ class ExemptRolesView(discord.ui.View):
                 color=0x5865F2),
             view=ExemptRolesView(self.guild, self.cfg, self.page + 1))
 
+
+class MemberActivityRefreshView(discord.ui.View):
+    """View avec bouton Actualiser pour le rapport d'activité individuel."""
+    def __init__(self, guild: discord.Guild, member_id: int):
+        super().__init__(timeout=300)
+        self.guild     = guild
+        self.member_id = member_id
+        btn = discord.ui.Button(
+            label="Actualiser",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔄",
+            row=0
+        )
+        btn.callback = self._refresh
+        self.add_item(btn)
+
+    async def _refresh(self, inter: discord.Interaction):
+        m = self.guild.get_member(self.member_id)
+        if not m:
+            await inter.response.send_message(embed=_e_err("❌", "Membre introuvable."), ephemeral=True); return
+        embed = _member_activity_embed(m, self.guild.id)
+        view  = MemberActivityRefreshView(self.guild, self.member_id)
+        await inter.response.edit_message(embed=embed, view=view)
+
 class ActivityView(discord.ui.View):
     """View paginée pour l'analyse d'activité — boutons ◀ ▶ + select rapport individuel."""
     def __init__(self, guild: discord.Guild, show_exempt: bool = False, page: int = 0):
@@ -2626,7 +2719,9 @@ class ActivityView(discord.ui.View):
         m   = self.guild.get_member(mid)
         if not m:
             await inter.response.send_message(embed=_e_err("❌", "Membre introuvable."), ephemeral=True); return
-        await inter.response.send_message(embed=_member_activity_embed(m, self.guild.id), ephemeral=True)
+        embed = _member_activity_embed(m, self.guild.id)
+        view  = MemberActivityRefreshView(self.guild, m.id)
+        await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def _prev(self, inter: discord.Interaction):
         new_view = ActivityView(self.guild, self.show_exempt, self.page - 1)
@@ -2642,7 +2737,11 @@ class ActivityView(discord.ui.View):
         new_exempt = not self.show_exempt
         new_view   = ActivityView(self.guild, new_exempt, 0)
         embed      = _build_embed_activity(self.guild, new_exempt, 0)
-        await inter.response.edit_message(embed=embed, view=new_view)
+        try:
+            await inter.response.edit_message(embed=embed, view=new_view)
+        except Exception:
+            # Si le message éphémère est expiré, envoyer un nouveau
+            await inter.response.send_message(embed=embed, view=new_view, ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════
