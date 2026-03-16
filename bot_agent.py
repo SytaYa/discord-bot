@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.21 — hébergé sur Render
+  BOT AGENT v5.22 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -34,6 +34,7 @@
   v5.19: /menu refait — navigation séparée Staff/Tickets, embeds modernes
   v5.20: fix maintenance /menu, commande /anon, toggle anon console+menu
   v5.21: panel admin complet, suivi activité membres, /activite, rôles exemptés
+  v5.22: pagination universelle — membres/bots/activité/rôles exemptés (boutons ◀ ▶)
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -71,7 +72,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.21"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.22"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -1737,6 +1738,29 @@ def _fmt_last_seen(dt: datetime | None) -> str:
     return f"Il y a {s//86400} jour(s)"
 
 
+# ══════════════════════════════════════════════════════════════════
+#  PAGINATION UNIVERSELLE
+#  PaginatedView : view réutilisable pour tout contenu long
+#  PAGE_SIZE = 10 lignes dans embed, 24 items max dans le Select
+# ══════════════════════════════════════════════════════════════════
+
+PAGE_ITEMS = 10   # items par page dans les embeds listés
+SEL_ITEMS  = 24   # max options dans un Select Discord (limite API)
+
+
+def _paginate(items: list, page: int, per_page: int = PAGE_ITEMS) -> tuple[list, int, bool, bool]:
+    """Retourne (slice, total_pages, has_prev, has_next)."""
+    total = max(1, (len(items) + per_page - 1) // per_page)
+    page  = max(0, min(page, total - 1))
+    start = page * per_page
+    return items[start:start + per_page], total, page > 0, start + per_page < len(items)
+
+
+def _page_footer(page: int, total: int, count: int, label: str = "élément(s)") -> str:
+    return f"Page {page+1}/{total}  •  {count} {label} au total"
+
+
+
 def _member_activity_embed(member: discord.Member, gid: int) -> discord.Embed:
     """Embed de rapport d'activité pour un membre spécifique."""
     d     = activity_data.get(gid, {}).get(member.id, {})
@@ -1994,11 +2018,13 @@ def _build_embed_server(guild: discord.Guild) -> discord.Embed:
     return e
 
 
-def _build_embed_members(guild: discord.Guild) -> discord.Embed:
-    humans = [m for m in guild.members if not m.bot]
-    online = [m for m in humans if m.status != discord.Status.offline]
-    si     = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
-               discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+def _build_embed_members(guild: discord.Guild, page: int = 0) -> discord.Embed:
+    humans  = sorted([m for m in guild.members if not m.bot],
+                     key=lambda m: (m.status == discord.Status.offline, m.display_name.lower()))
+    online  = [m for m in humans if m.status != discord.Status.offline]
+    si      = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
+                discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+    chunk, total_pages, has_prev, has_next = _paginate(humans, page, 15)
     e = discord.Embed(
         description=(
             f"### 👥  Membres du serveur\n"
@@ -2008,21 +2034,20 @@ def _build_embed_members(guild: discord.Guild) -> discord.Embed:
         color=0x57F287,
         timestamp=datetime.now(timezone.utc)
     )
-    chunk    = sorted(humans, key=lambda m: m.status != discord.Status.online)[:24]
     lines    = [f"{si.get(m.status,'⚫')} **{m.display_name}**" for m in chunk]
     col_size = max(1, (len(lines) + 2) // 3)
     for ci in range(3):
         col = lines[ci * col_size:(ci + 1) * col_size]
         if col: e.add_field(name="\u200b", value="\n".join(col), inline=True)
-    if len(humans) > 24:
-        e.set_footer(text=f"… et {len(humans)-24} autres membres")
+    e.set_footer(text=_page_footer(page, total_pages, len(humans), "membre(s)"))
     return e
 
 
-def _build_embed_bots(guild: discord.Guild) -> discord.Embed:
-    bots = [m for m in guild.members if m.bot]
-    si   = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
-             discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+def _build_embed_bots(guild: discord.Guild, page: int = 0) -> discord.Embed:
+    bots  = sorted([m for m in guild.members if m.bot], key=lambda m: m.display_name.lower())
+    si    = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
+              discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+    chunk, total_pages, has_prev, has_next = _paginate(bots, page, 12)
     e = discord.Embed(
         description=(
             f"### 🤖  Bots du serveur\n"
@@ -2032,12 +2057,13 @@ def _build_embed_bots(guild: discord.Guild) -> discord.Embed:
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc)
     )
-    for b in bots[:20]:
+    for b in chunk:
         e.add_field(
             name=f"{si.get(b.status,'⚫')} {b.display_name}",
             value=f"> 🆔 `{b.id}`",
             inline=True
         )
+    e.set_footer(text=_page_footer(page, total_pages, len(bots), "bot(s)"))
     return e
 
 
@@ -2065,8 +2091,28 @@ def _build_embed_activity(guild: discord.Guild, show_exempt: bool = False) -> di
         timestamp=datetime.now(timezone.utc)
     )
 
-    # Top 15 les plus inactifs
-    for score, m, exempt in rows[:15]:
+def _build_embed_activity(guild: discord.Guild, show_exempt: bool = False, page: int = 0) -> discord.Embed:
+    """Embed paginé d'activité — triés du plus inactif au plus actif."""
+    humans = [m for m in guild.members if not m.bot]
+    rows = []
+    for m in humans:
+        exempt = _is_exempt(m, guild.id)
+        if exempt and not show_exempt:
+            continue
+        score = _inactivity_score(guild.id, m.id)
+        rows.append((score, m, exempt))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    chunk, total_pages, has_prev, has_next = _paginate(rows, page, 10)
+    e = discord.Embed(
+        description=(
+            f"### 📊  Activité des membres\n"
+            f"`{len(rows)}` membre(s) analysés\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=0xF0A500,
+        timestamp=datetime.now(timezone.utc)
+    )
+    for score, m, exempt in chunk:
         emoji, label = _score_label(score)
         voice = _fmt_seconds(_total_voice(guild.id, m.id))
         msgs  = activity_data.get(guild.id, {}).get(m.id, {}).get("msg_count", 0)
@@ -2077,11 +2123,8 @@ def _build_embed_activity(guild: discord.Guild, show_exempt: bool = False) -> di
             value=f"> `{bar}` **{score}** — {label}\n> 💬 {msgs} msgs  🔊 {voice}",
             inline=False
         )
-
-    if len(rows) > 15:
-        e.set_footer(text=f"… et {len(rows)-15} autres membres  •  Utilise /activite @membre pour le détail")
-    else:
-        e.set_footer(text="Données depuis le dernier démarrage du bot")
+    e.set_footer(text=_page_footer(page, total_pages, len(rows), "membre(s)") +
+                 "  •  /activite @membre pour le détail")
     return e
 
 
@@ -2177,6 +2220,98 @@ def _build_embed_config_tickets(guild: discord.Guild) -> discord.Embed:
     e.set_footer(text="Utilise les menus ci-dessous pour modifier.")
     return e
 
+
+
+class MembersPageView(discord.ui.View):
+    """View paginée pour la section Membres — boutons ◀ ▶ + select profil."""
+    def __init__(self, guild: discord.Guild, page: int = 0):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.page  = page
+        si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
+               discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
+        humans = sorted([m for m in guild.members if not m.bot],
+                        key=lambda m: (m.status == discord.Status.offline, m.display_name.lower()))
+        _, total_pages, _, _ = _paginate(humans, page, SEL_ITEMS)
+        self._total = total_pages
+        start = page * SEL_ITEMS
+        chunk = humans[start:start + SEL_ITEMS]
+        if chunk:
+            opts = [discord.SelectOption(
+                label=f"{si.get(m.status,'⚫')} {m.display_name[:45]}",
+                description=f"ID: {m.id}",
+                value=str(m.id)
+            ) for m in chunk]
+            sel = discord.ui.Select(
+                placeholder=f"👤  Profil membre… (p.{page+1}/{total_pages})",
+                options=opts, row=0
+            )
+            sel.callback = self._on_select
+            self.add_item(sel)
+        btn_prev = discord.ui.Button(label="◀  Précédent", style=discord.ButtonStyle.secondary,
+                                     disabled=(page == 0), row=1)
+        btn_prev.callback = self._prev
+        self.add_item(btn_prev)
+        btn_next = discord.ui.Button(label="Suivant  ▶", style=discord.ButtonStyle.secondary,
+                                     disabled=(page >= total_pages - 1), row=1)
+        btn_next.callback = self._next
+        self.add_item(btn_next)
+
+    async def _on_select(self, inter: discord.Interaction):
+        mem = self.guild.get_member(int(inter.data["values"][0]))
+        if not mem:
+            await inter.response.send_message(embed=_e_err("❌", "Membre introuvable."), ephemeral=True); return
+        si  = {discord.Status.online: "🟢 En ligne", discord.Status.idle: "🟡 AFK",
+                discord.Status.dnd: "🔴 DND", discord.Status.offline: "⚫ Hors ligne"}
+        col = mem.top_role.color if mem.top_role and mem.top_role.color.value else discord.Color.default()
+        e   = discord.Embed(title=f"👤  {mem.display_name}",
+                            description=f"Membre depuis <t:{int(mem.joined_at.timestamp())}:D>", color=col)
+        if mem.display_avatar: e.set_thumbnail(url=mem.display_avatar.url)
+        e.add_field(name="📊  Statut",   value=si.get(mem.status, "⚫"), inline=True)
+        e.add_field(name="🏷  Top rôle", value=mem.top_role.mention if mem.top_role else "—", inline=True)
+        e.add_field(name="🆔  ID",       value=f"`{mem.id}`", inline=True)
+        # Activité
+        score = _inactivity_score(self.guild.id, mem.id)
+        emoji_a, label_a = _score_label(score)
+        e.add_field(name="📊  Activité",
+                    value=f"{emoji_a} Score {score}/100 — {label_a}", inline=True)
+        roles_txt = " ".join(r.mention for r in reversed(mem.roles) if r.name != "@everyone")[:512] or "*Aucun*"
+        e.add_field(name="📋  Rôles", value=roles_txt, inline=False)
+        await inter.response.send_message(embed=e, view=MemberModView(self.guild, mem), ephemeral=True)
+
+    async def _prev(self, inter: discord.Interaction):
+        embed = _build_embed_members(self.guild, self.page - 1)
+        await inter.response.edit_message(embed=embed, view=MembersPageView(self.guild, self.page - 1))
+
+    async def _next(self, inter: discord.Interaction):
+        embed = _build_embed_members(self.guild, self.page + 1)
+        await inter.response.edit_message(embed=embed, view=MembersPageView(self.guild, self.page + 1))
+
+
+class BotsPageView(discord.ui.View):
+    """View paginée pour la section Bots."""
+    def __init__(self, guild: discord.Guild, page: int = 0):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.page  = page
+        bots = sorted([m for m in guild.members if m.bot], key=lambda m: m.display_name.lower())
+        _, total_pages, _, _ = _paginate(bots, page, 12)
+        btn_prev = discord.ui.Button(label="◀  Précédent", style=discord.ButtonStyle.secondary,
+                                     disabled=(page == 0), row=0)
+        btn_prev.callback = self._prev
+        self.add_item(btn_prev)
+        btn_next = discord.ui.Button(label="Suivant  ▶", style=discord.ButtonStyle.secondary,
+                                     disabled=(page >= total_pages - 1), row=0)
+        btn_next.callback = self._next
+        self.add_item(btn_next)
+
+    async def _prev(self, inter: discord.Interaction):
+        embed = _build_embed_bots(self.guild, self.page - 1)
+        await inter.response.edit_message(embed=embed, view=BotsPageView(self.guild, self.page - 1))
+
+    async def _next(self, inter: discord.Interaction):
+        embed = _build_embed_bots(self.guild, self.page + 1)
+        await inter.response.edit_message(embed=embed, view=BotsPageView(self.guild, self.page + 1))
 
 # ══════════════════════════════════════════════════════════════════
 #  DashboardView — 3 menus déroulants + boutons
@@ -2299,16 +2434,18 @@ class DashboardView(discord.ui.View):
             return
 
         if val == "members":
-            await inter.response.send_message(embed=_build_embed_members(g), view=MemberActionView(g), ephemeral=True)
+            embed = _build_embed_members(g, 0)
+            await inter.response.send_message(embed=embed, view=MembersPageView(g, 0), ephemeral=True)
             return
 
         if val == "bots":
-            await inter.response.send_message(embed=_build_embed_bots(g), ephemeral=True)
+            embed = _build_embed_bots(g, 0)
+            await inter.response.send_message(embed=embed, view=BotsPageView(g, 0), ephemeral=True)
             return
 
         if val == "activity":
-            e = _build_embed_activity(g, show_exempt=False)
-            await inter.response.send_message(embed=e, view=ActivityView(g), ephemeral=True)
+            embed = _build_embed_activity(g, show_exempt=False, page=0)
+            await inter.response.send_message(embed=embed, view=ActivityView(g, show_exempt=False, page=0), ephemeral=True)
             return
 
         if val == "server":
@@ -2351,37 +2488,161 @@ class DashboardView(discord.ui.View):
 # ══════════════════════════════════════════════════════════════════
 #  ActivityView — sous-vue éphémère pour explorer l'activité
 # ══════════════════════════════════════════════════════════════════
-class ActivityView(discord.ui.View):
-    def __init__(self, guild: discord.Guild):
-        super().__init__(timeout=180)
-        self.guild = guild
-        humans = [m for m in guild.members if not m.bot
-                  if not _is_exempt(m, guild.id)]
 
-        if humans:
+class ExemptRolesView(discord.ui.View):
+    """View paginée pour sélectionner les rôles exemptés d'analyse publique."""
+    def __init__(self, guild: discord.Guild, cfg: dict, page: int = 0):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.cfg   = cfg
+        self.page  = page
+        all_roles  = [r for r in guild.roles if r.name != "@everyone"]
+        all_roles.sort(key=lambda r: r.position, reverse=True)
+        exempt_ids = cfg.get("activity_exempt_role_ids", [])
+        _, total_pages, _, _ = _paginate(all_roles, page, SEL_ITEMS)
+        self._total = total_pages
+        start = page * SEL_ITEMS
+        chunk = all_roles[start:start + SEL_ITEMS]
+        if chunk:
+            opts = [discord.SelectOption(
+                label=r.name[:50],
+                description=f"{len(r.members)} membre(s){'  ✅ exempté' if r.id in exempt_ids else ''}",
+                value=str(r.id),
+                default=(r.id in exempt_ids)
+            ) for r in chunk]
+            sel = discord.ui.Select(
+                placeholder=f"🙈  Sélectionner les rôles exemptés (p.{page+1}/{total_pages})…",
+                options=opts, min_values=0, max_values=len(opts), row=0
+            )
+            sel.callback = self._save
+            self.add_item(sel)
+        btn_prev = discord.ui.Button(label="◀  Précédent", style=discord.ButtonStyle.secondary,
+                                     disabled=(page == 0), row=1)
+        btn_prev.callback = self._prev
+        self.add_item(btn_prev)
+        btn_next = discord.ui.Button(label="Suivant  ▶", style=discord.ButtonStyle.secondary,
+                                     disabled=(page >= total_pages - 1), row=1)
+        btn_next.callback = self._next
+        self.add_item(btn_next)
+
+    async def _save(self, inter: discord.Interaction):
+        # Ajouter/retirer les rôles sélectionnés sur cette page
+        # Garder les exemptions des autres pages intactes
+        all_roles = [r for r in self.guild.roles if r.name != "@everyone"]
+        all_roles.sort(key=lambda r: r.position, reverse=True)
+        start = self.page * SEL_ITEMS
+        page_role_ids = {r.id for r in all_roles[start:start + SEL_ITEMS]}
+        # IDs exemptés sur les autres pages (à conserver)
+        current = set(self.cfg.get("activity_exempt_role_ids", []))
+        other_pages = current - page_role_ids
+        # IDs sélectionnés sur cette page
+        selected = {int(v) for v in inter.data["values"]}
+        self.cfg["activity_exempt_role_ids"] = list(other_pages | selected)
+        await save_data()
+        names = [self.guild.get_role(rid).name for rid in selected if self.guild.get_role(rid)]
+        await inter.response.send_message(
+            embed=_e_ok("✅  Rôles exemptés mis à jour",
+                         f"{len(selected)} rôle(s) exempté(s) sur cette page : "
+                         + (", ".join(names) if names else "aucun")),
+            ephemeral=True)
+
+    async def _prev(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=discord.Embed(title="🙈  Rôles exemptés",
+                description="Sélectionne les rôles dont les membres seront masqués publiquement.",
+                color=0x5865F2),
+            view=ExemptRolesView(self.guild, self.cfg, self.page - 1))
+
+    async def _next(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=discord.Embed(title="🙈  Rôles exemptés",
+                description="Sélectionne les rôles dont les membres seront masqués publiquement.",
+                color=0x5865F2),
+            view=ExemptRolesView(self.guild, self.cfg, self.page + 1))
+
+class ActivityView(discord.ui.View):
+    """View paginée pour l'analyse d'activité — boutons ◀ ▶ + select rapport individuel."""
+    def __init__(self, guild: discord.Guild, show_exempt: bool = False, page: int = 0):
+        super().__init__(timeout=300)
+        self.guild        = guild
+        self.show_exempt  = show_exempt
+        self.page         = page
+
+        # Construire la liste triée
+        humans = [m for m in guild.members if not m.bot]
+        rows = [(m, _inactivity_score(guild.id, m.id), _is_exempt(m, guild.id))
+                for m in humans
+                if show_exempt or not _is_exempt(m, guild.id)]
+        rows.sort(key=lambda x: x[1], reverse=True)
+        self._rows       = rows
+        self._total_pages = max(1, (len(rows) + SEL_ITEMS - 1) // SEL_ITEMS)
+        page              = max(0, min(page, self._total_pages - 1))
+        self.page         = page
+
+        # Select — membres de la page courante
+        start = page * SEL_ITEMS
+        chunk = rows[start:start + SEL_ITEMS]
+        if chunk:
             opts = []
-            rows_sorted = sorted(
-                [(m, _inactivity_score(guild.id, m.id)) for m in humans],
-                key=lambda x: x[1], reverse=True
-            )[:25]
-            for m, score in rows_sorted:
+            for m, score, exempt in chunk:
                 emoji, label = _score_label(score)
+                tag = " 🙈" if exempt else ""
                 opts.append(discord.SelectOption(
-                    label=f"{m.display_name[:40]}",
+                    label=f"{m.display_name[:38]}{tag}",
                     description=f"{emoji} Score : {score}/100 — {label}",
                     value=str(m.id)
                 ))
-            sel = discord.ui.Select(placeholder="🔍  Voir le rapport d'un membre…", options=opts)
+            sel = discord.ui.Select(
+                placeholder=f"🔍  Rapport individuel… (p.{page+1}/{self._total_pages})",
+                options=opts, row=0
+            )
             sel.callback = self._on_select
             self.add_item(sel)
+
+        # Boutons navigation
+        btn_prev = discord.ui.Button(
+            label="◀  Précédent", style=discord.ButtonStyle.secondary,
+            disabled=(page == 0), row=1
+        )
+        btn_prev.callback = self._prev
+        self.add_item(btn_prev)
+
+        btn_next = discord.ui.Button(
+            label="Suivant  ▶", style=discord.ButtonStyle.secondary,
+            disabled=(page >= self._total_pages - 1), row=1
+        )
+        btn_next.callback = self._next
+        self.add_item(btn_next)
+
+        btn_toggle = discord.ui.Button(
+            label="Voir exemptés" if not show_exempt else "Masquer exemptés",
+            style=discord.ButtonStyle.primary, emoji="🙈", row=1
+        )
+        btn_toggle.callback = self._toggle_exempt
+        self.add_item(btn_toggle)
 
     async def _on_select(self, inter: discord.Interaction):
         mid = int(inter.data["values"][0])
         m   = self.guild.get_member(mid)
         if not m:
-            await inter.response.send_message(embed=_e_err("❌", "Membre introuvable."), ephemeral=True)
-            return
+            await inter.response.send_message(embed=_e_err("❌", "Membre introuvable."), ephemeral=True); return
         await inter.response.send_message(embed=_member_activity_embed(m, self.guild.id), ephemeral=True)
+
+    async def _prev(self, inter: discord.Interaction):
+        new_view = ActivityView(self.guild, self.show_exempt, self.page - 1)
+        embed    = _build_embed_activity(self.guild, self.show_exempt, self.page - 1)
+        await inter.response.edit_message(embed=embed, view=new_view)
+
+    async def _next(self, inter: discord.Interaction):
+        new_view = ActivityView(self.guild, self.show_exempt, self.page + 1)
+        embed    = _build_embed_activity(self.guild, self.show_exempt, self.page + 1)
+        await inter.response.edit_message(embed=embed, view=new_view)
+
+    async def _toggle_exempt(self, inter: discord.Interaction):
+        new_exempt = not self.show_exempt
+        new_view   = ActivityView(self.guild, new_exempt, 0)
+        embed      = _build_embed_activity(self.guild, new_exempt, 0)
+        await inter.response.edit_message(embed=embed, view=new_view)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2477,31 +2738,17 @@ class ConfigStaffView(discord.ui.View):
     async def _set_exempt(self, inter: discord.Interaction):
         ok2, r = self._guard(inter)
         if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
-        all_roles = [r for r in self.guild.roles if r.name != "@everyone"][:25]
-        exempt_ids = self.cfg.get("activity_exempt_role_ids", [])
-        opts = [discord.SelectOption(
-            label=r.name[:50], value=str(r.id),
-            description=f"{len(r.members)} membre(s)",
-            default=(r.id in exempt_ids)) for r in all_roles]
-        sel = discord.ui.Select(placeholder="🙈  Rôles exemptés (multi-sélection)…",
-                                options=opts, min_values=0, max_values=min(len(opts), 25))
-        async def _save_exempt(i2):
-            self.cfg["activity_exempt_role_ids"] = [int(v) for v in i2.data["values"]]
-            await save_data()
-            names = [self.guild.get_role(int(v)) for v in i2.data["values"]]
-            names = [r.name for r in names if r]
-            await i2.response.send_message(
-                embed=_e_ok("✅  Rôles exemptés mis à jour",
-                             (", ".join(names) if names else "Aucun rôle exempté.")),
-                ephemeral=True)
-        sel.callback = _save_exempt
-        v2 = discord.ui.View(timeout=60)
-        v2.add_item(sel)
+        total_roles = len([r for r in self.guild.roles if r.name != "@everyone"])
         await inter.response.send_message(
-            embed=discord.Embed(title="🙈  Rôles exemptés d'analyse publique",
-                description="Les membres avec ces rôles ne seront visibles que sur la console distante.",
+            embed=discord.Embed(
+                title="🙈  Rôles exemptés d'analyse publique",
+                description=(
+                    f"Sélectionne les rôles dont les membres ne seront visibles **que sur la console**.\n"
+                    f"`{total_roles}` rôles disponibles — navigation par pages de {SEL_ITEMS}"
+                ),
                 color=0x5865F2),
-            view=v2, ephemeral=True)
+            view=ExemptRolesView(self.guild, self.cfg, 0),
+            ephemeral=True)
 
     async def _search_role(self, inter: discord.Interaction):
         ok2, r = self._guard(inter)
