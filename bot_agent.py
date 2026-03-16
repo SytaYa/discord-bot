@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.23 — hébergé sur Render
+  BOT AGENT v5.24 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -36,8 +36,8 @@
   v5.21: panel admin complet, suivi activité membres, /activite, rôles exemptés
   v5.22: pagination universelle — membres/bots/activité/rôles exemptés (boutons ◀ ▶)
   v5.23: rapport activité complet (tous les rôles, bouton actualiser temps réel),
-         persistance activité en BDD (survie aux redémarrages),
-         scan automatique des vocaux au boot, toggle exempté corrigé
+         persistance activité en BDD, scan vocal au boot, toggle exempté corrigé
+  v5.24: pagination universelle propre — ◀ p.X/Y ▶ sur tous les selects et embeds
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -75,7 +75,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.23"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.24"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -1047,24 +1047,41 @@ async def on_ready():
             total += 1
     if total: log("BOT", str(total) + " salon(s) existant(s) detecte(s)")
 
-    # Scan des vocaux au démarrage — reprise de l'analyse pour membres déjà connectés
-    now_boot = datetime.now(timezone.utc)
+    # ── Init TOUS les membres au démarrage ───────────────────────────────
+    # Crée une entrée activity_data pour chaque membre humain.
+    # Sans ça, les membres silencieux (0 message, jamais en vocal depuis boot)
+    # n'apparaissent pas dans les rapports → score affiché comme 95 manquant.
+    now_boot    = datetime.now(timezone.utc)
+    init_count  = 0
     vocal_count = 0
     for guild in client.guilds:
+        for member in guild.members:
+            if member.bot: continue
+            _act(guild.id, member.id)   # crée l'entrée si absente, intact sinon
+            init_count += 1
+        # Reprendre le tracking pour membres déjà en vocal
         for vc in guild.voice_channels:
             for member in vc.members:
                 if member.bot: continue
                 d = _act(guild.id, member.id)
-                if not d.get("voice_joined"):  # pas déjà marqué
+                if not d.get("voice_joined"):
                     d["voice_joined"] = now_boot
                     d["last_seen"]    = now_boot
                     vocal_count += 1
-    if vocal_count:
-        log("BOT", f"Scan vocal démarrage : {vocal_count} membre(s) déjà en vocal → analyse reprise")
+    log("BOT", f"Activité : {init_count} membre(s) initialisés"
+        + (f" — {vocal_count} en vocal repris" if vocal_count else ""))
     # Charger le changelog manuel (stocké en BDD) avant la notification
     await load_changelog()
     # Notification de mise à jour dans les salons staff
     await send_update_notifications()
+
+
+@client.event
+async def on_member_join(member: discord.Member):
+    """Initialise le tracking d'activité dès qu'un membre rejoint le serveur."""
+    if member.bot: return
+    _act(member.guild.id, member.id)
+    log("BOT", f"Nouveau membre : {member.display_name} — activité initialisée")
 
 @client.event
 async def on_guild_channel_create(channel):
@@ -1818,6 +1835,51 @@ def _page_footer(page: int, total: int, count: int, label: str = "élément(s)")
 
 
 
+def _add_nav_buttons(view, page: int, total: int, row: int, prev_cb, next_cb, extra_btns=None):
+    """Ajoute les boutons ◀  p.X/Y  ▶ sur une rangée. extra_btns = [(label, style, emoji, cb), ...]"""
+    btn_prev = discord.ui.Button(
+        label="◀  Préc.", style=discord.ButtonStyle.secondary,
+        disabled=(page == 0), row=row)
+    btn_prev.callback = prev_cb
+    view.add_item(btn_prev)
+
+    btn_page = discord.ui.Button(
+        label=f"p.{page+1}/{total}", style=discord.ButtonStyle.secondary,
+        disabled=True, row=row)
+    view.add_item(btn_page)
+
+    btn_next = discord.ui.Button(
+        label="Suiv.  ▶", style=discord.ButtonStyle.secondary,
+        disabled=(page >= total - 1), row=row)
+    btn_next.callback = next_cb
+    view.add_item(btn_next)
+
+    if extra_btns:
+        for label, style, emoji, cb in extra_btns:
+            btn = discord.ui.Button(label=label, style=style, emoji=emoji, row=row)
+            btn.callback = cb
+            view.add_item(btn)
+
+
+def _make_page_select(items, page: int, total: int, placeholder: str,
+                      label_fn, desc_fn, value_fn, row: int = 0):
+    """Crée un Select paginé avec les items de la page courante.
+    label_fn/desc_fn/value_fn = fonctions item→str."""
+    start = page * SEL_ITEMS
+    chunk = items[start:start + SEL_ITEMS]
+    if not chunk:
+        return None
+    opts = [discord.SelectOption(
+        label=label_fn(x)[:100],
+        description=desc_fn(x)[:100],
+        value=value_fn(x)
+    ) for x in chunk]
+    return discord.ui.Select(
+        placeholder=placeholder,
+        options=opts, row=row
+    )
+
+
 def _member_activity_embed(member: discord.Member, gid: int) -> discord.Embed:
     """Embed de rapport d'activité pour un membre spécifique."""
     d     = activity_data.get(gid, {}).get(member.id, {})
@@ -2292,39 +2354,36 @@ def _build_embed_config_tickets(guild: discord.Guild) -> discord.Embed:
 
 
 class MembersPageView(discord.ui.View):
-    """View paginée pour la section Membres — boutons ◀ ▶ + select profil."""
+    """Vue paginée Membres — Select profil + ◀ p.X/Y ▶."""
     def __init__(self, guild: discord.Guild, page: int = 0):
         super().__init__(timeout=300)
         self.guild = guild
-        self.page  = page
         si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
                discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
         humans = sorted([m for m in guild.members if not m.bot],
                         key=lambda m: (m.status == discord.Status.offline, m.display_name.lower()))
         _, total_pages, _, _ = _paginate(humans, page, SEL_ITEMS)
-        self._total = total_pages
-        start = page * SEL_ITEMS
-        chunk = humans[start:start + SEL_ITEMS]
-        if chunk:
-            opts = [discord.SelectOption(
-                label=f"{si.get(m.status,'⚫')} {m.display_name[:45]}",
-                description=f"ID: {m.id}",
-                value=str(m.id)
-            ) for m in chunk]
-            sel = discord.ui.Select(
-                placeholder=f"👤  Profil membre… (p.{page+1}/{total_pages})",
-                options=opts, row=0
-            )
+        page = max(0, min(page, total_pages - 1))
+        self.page        = page
+        self.total_pages = total_pages
+        self._humans     = humans
+
+        # Select membres de la page
+        sel = _make_page_select(
+            humans, page, total_pages,
+            placeholder=f"👤  Voir le profil d'un membre…",
+            label_fn=lambda m: f"{si.get(m.status,'⚫')} {m.display_name[:45]}",
+            desc_fn=lambda m: f"ID: {m.id}",
+            value_fn=lambda m: str(m.id),
+            row=0
+        )
+        if sel:
             sel.callback = self._on_select
             self.add_item(sel)
-        btn_prev = discord.ui.Button(label="◀  Précédent", style=discord.ButtonStyle.secondary,
-                                     disabled=(page == 0), row=1)
-        btn_prev.callback = self._prev
-        self.add_item(btn_prev)
-        btn_next = discord.ui.Button(label="Suivant  ▶", style=discord.ButtonStyle.secondary,
-                                     disabled=(page >= total_pages - 1), row=1)
-        btn_next.callback = self._next
-        self.add_item(btn_next)
+
+        # Boutons nav ◀ p.X/Y ▶
+        _add_nav_buttons(self, page, total_pages, row=1,
+                         prev_cb=self._prev, next_cb=self._next)
 
     async def _on_select(self, inter: discord.Interaction):
         mem = self.guild.get_member(int(inter.data["values"][0]))
@@ -2339,48 +2398,42 @@ class MembersPageView(discord.ui.View):
         e.add_field(name="📊  Statut",   value=si.get(mem.status, "⚫"), inline=True)
         e.add_field(name="🏷  Top rôle", value=mem.top_role.mention if mem.top_role else "—", inline=True)
         e.add_field(name="🆔  ID",       value=f"`{mem.id}`", inline=True)
-        # Activité
         score = _inactivity_score(self.guild.id, mem.id)
         emoji_a, label_a = _score_label(score)
-        e.add_field(name="📊  Activité",
-                    value=f"{emoji_a} Score {score}/100 — {label_a}", inline=True)
+        e.add_field(name="📊  Activité", value=f"{emoji_a} Score {score}/100 — {label_a}", inline=True)
         roles_txt = " ".join(r.mention for r in reversed(mem.roles) if r.name != "@everyone")[:512] or "*Aucun*"
         e.add_field(name="📋  Rôles", value=roles_txt, inline=False)
         await inter.response.send_message(embed=e, view=MemberModView(self.guild, mem), ephemeral=True)
 
     async def _prev(self, inter: discord.Interaction):
-        embed = _build_embed_members(self.guild, self.page - 1)
-        await inter.response.edit_message(embed=embed, view=MembersPageView(self.guild, self.page - 1))
+        p = self.page - 1
+        await inter.response.edit_message(embed=_build_embed_members(self.guild, p), view=MembersPageView(self.guild, p))
 
     async def _next(self, inter: discord.Interaction):
-        embed = _build_embed_members(self.guild, self.page + 1)
-        await inter.response.edit_message(embed=embed, view=MembersPageView(self.guild, self.page + 1))
+        p = self.page + 1
+        await inter.response.edit_message(embed=_build_embed_members(self.guild, p), view=MembersPageView(self.guild, p))
 
 
 class BotsPageView(discord.ui.View):
-    """View paginée pour la section Bots."""
+    """Vue paginée Bots — ◀ p.X/Y ▶."""
     def __init__(self, guild: discord.Guild, page: int = 0):
         super().__init__(timeout=300)
         self.guild = guild
-        self.page  = page
         bots = sorted([m for m in guild.members if m.bot], key=lambda m: m.display_name.lower())
         _, total_pages, _, _ = _paginate(bots, page, 12)
-        btn_prev = discord.ui.Button(label="◀  Précédent", style=discord.ButtonStyle.secondary,
-                                     disabled=(page == 0), row=0)
-        btn_prev.callback = self._prev
-        self.add_item(btn_prev)
-        btn_next = discord.ui.Button(label="Suivant  ▶", style=discord.ButtonStyle.secondary,
-                                     disabled=(page >= total_pages - 1), row=0)
-        btn_next.callback = self._next
-        self.add_item(btn_next)
+        page = max(0, min(page, total_pages - 1))
+        self.page        = page
+        self.total_pages = total_pages
+        _add_nav_buttons(self, page, total_pages, row=0,
+                         prev_cb=self._prev, next_cb=self._next)
 
     async def _prev(self, inter: discord.Interaction):
-        embed = _build_embed_bots(self.guild, self.page - 1)
-        await inter.response.edit_message(embed=embed, view=BotsPageView(self.guild, self.page - 1))
+        p = self.page - 1
+        await inter.response.edit_message(embed=_build_embed_bots(self.guild, p), view=BotsPageView(self.guild, p))
 
     async def _next(self, inter: discord.Interaction):
-        embed = _build_embed_bots(self.guild, self.page + 1)
-        await inter.response.edit_message(embed=embed, view=BotsPageView(self.guild, self.page + 1))
+        p = self.page + 1
+        await inter.response.edit_message(embed=_build_embed_bots(self.guild, p), view=BotsPageView(self.guild, p))
 
 # ══════════════════════════════════════════════════════════════════
 #  DashboardView — 3 menus déroulants + boutons
@@ -2585,14 +2638,8 @@ class ExemptRolesView(discord.ui.View):
             )
             sel.callback = self._save
             self.add_item(sel)
-        btn_prev = discord.ui.Button(label="◀  Précédent", style=discord.ButtonStyle.secondary,
-                                     disabled=(page == 0), row=1)
-        btn_prev.callback = self._prev
-        self.add_item(btn_prev)
-        btn_next = discord.ui.Button(label="Suivant  ▶", style=discord.ButtonStyle.secondary,
-                                     disabled=(page >= total_pages - 1), row=1)
-        btn_next.callback = self._next
-        self.add_item(btn_next)
+        _add_nav_buttons(self, page, total_pages, row=1,
+                         prev_cb=self._prev, next_cb=self._next)
 
     async def _save(self, inter: discord.Interaction):
         # Ajouter/retirer les rôles sélectionnés sur cette page
@@ -2672,47 +2719,25 @@ class ActivityView(discord.ui.View):
         page              = max(0, min(page, self._total_pages - 1))
         self.page         = page
 
-        # Select — membres de la page courante
-        start = page * SEL_ITEMS
-        chunk = rows[start:start + SEL_ITEMS]
-        if chunk:
-            opts = []
-            for m, score, exempt in chunk:
-                emoji, label = _score_label(score)
-                tag = " 🙈" if exempt else ""
-                opts.append(discord.SelectOption(
-                    label=f"{m.display_name[:38]}{tag}",
-                    description=f"{emoji} Score : {score}/100 — {label}",
-                    value=str(m.id)
-                ))
-            sel = discord.ui.Select(
-                placeholder=f"🔍  Rapport individuel… (p.{page+1}/{self._total_pages})",
-                options=opts, row=0
-            )
+        # Select membres de la page
+        si_e = {True: " 🙈", False: ""}
+        def _lbl(r): emoji, lbl = _score_label(r[1]); return f"{emoji} {r[0].display_name[:35]}{si_e[r[2]]}"
+        def _dsc(r): emoji, lbl = _score_label(r[1]); return f"Score {r[1]}/100 — {lbl}"
+        def _val(r): return str(r[0].id)
+        sel = _make_page_select(rows, page, self._total_pages,
+                                placeholder="🔍  Rapport individuel d'un membre…",
+                                label_fn=_lbl, desc_fn=_dsc, value_fn=_val, row=0)
+        if sel:
             sel.callback = self._on_select
             self.add_item(sel)
 
-        # Boutons navigation
-        btn_prev = discord.ui.Button(
-            label="◀  Précédent", style=discord.ButtonStyle.secondary,
-            disabled=(page == 0), row=1
-        )
-        btn_prev.callback = self._prev
-        self.add_item(btn_prev)
-
-        btn_next = discord.ui.Button(
-            label="Suivant  ▶", style=discord.ButtonStyle.secondary,
-            disabled=(page >= self._total_pages - 1), row=1
-        )
-        btn_next.callback = self._next
-        self.add_item(btn_next)
-
-        btn_toggle = discord.ui.Button(
-            label="Voir exemptés" if not show_exempt else "Masquer exemptés",
-            style=discord.ButtonStyle.primary, emoji="🙈", row=1
-        )
-        btn_toggle.callback = self._toggle_exempt
-        self.add_item(btn_toggle)
+        # ◀ p.X/Y ▶ + bouton Voir/Masquer exemptés
+        _add_nav_buttons(self, page, self._total_pages, row=1,
+                         prev_cb=self._prev, next_cb=self._next,
+                         extra_btns=[(
+                             "Voir exemptés" if not show_exempt else "Masquer exemptés",
+                             discord.ButtonStyle.primary, "🙈", self._toggle_exempt
+                         )])
 
     async def _on_select(self, inter: discord.Interaction):
         mid = int(inter.data["values"][0])
@@ -2765,20 +2790,20 @@ class ConfigStaffView(discord.ui.View):
             self.add_item(s_ch)
 
         if all_roles:
-            page_start = role_page * 23
-            page_roles = all_roles[page_start:page_start + 23]
-            has_next   = (page_start + 23) < len(all_roles)
+            page_start   = role_page * 23
+            page_roles   = all_roles[page_start:page_start + 23]
+            total_rpages = max(1, (len(all_roles) + 22) // 23)
             opts = [discord.SelectOption(
                 label=r.name[:50], description=f"{len(r.members)} membre(s)", value=str(r.id),
                 default=(cfg.get("staff_role_id") == r.id)) for r in page_roles]
-            if has_next:
-                opts.append(discord.SelectOption(label=f"➡️  Suite ({len(all_roles)-page_start-23} rôles)",
-                    value="__next__", description="Voir la page suivante"))
             s_role = discord.ui.Select(
-                placeholder=f"🛡️  Rôle staff{' (p.'+str(role_page+1)+')' if len(all_roles)>23 else ''}…",
+                placeholder=f"\U0001f6e1\ufe0f  Rôle staff — p.{role_page+1}/{total_rpages}…",
                 options=opts, row=1)
             s_role.callback = self._set_role
             self.add_item(s_role)
+            if len(all_roles) > 23:
+                _add_nav_buttons(self, role_page, total_rpages, row=2,
+                                 prev_cb=self._role_prev, next_cb=self._role_next)
 
         # Bouton toggle anon (dynamique selon état actuel)
         anon_on  = cfg.get("anon_enabled", True)
@@ -2815,12 +2840,20 @@ class ConfigStaffView(discord.ui.View):
         ok2, r = self._guard(inter)
         if not ok2: await inter.response.send_message(embed=_e_err("🚫", r), ephemeral=True); return
         val = inter.data["values"][0]
-        if val == "__next__":
-            await inter.response.edit_message(view=ConfigStaffView(self.guild, self.cfg, self.role_page+1)); return
         self.cfg["staff_role_id"] = int(val)
         await save_data()
         role = self.guild.get_role(self.cfg["staff_role_id"])
         await inter.response.send_message(embed=_e_ok("✅  Rôle staff mis à jour", f"**{role.name if role else '?'}**"), ephemeral=True)
+
+    async def _role_prev(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=_build_embed_config_staff(self.guild),
+            view=ConfigStaffView(self.guild, self.cfg, self.role_page - 1))
+
+    async def _role_next(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=_build_embed_config_staff(self.guild),
+            view=ConfigStaffView(self.guild, self.cfg, self.role_page + 1))
 
     async def _toggle_anon(self, inter: discord.Interaction):
         ok2, r = self._guard(inter)
@@ -3444,38 +3477,41 @@ class TypeEditModal(discord.ui.Modal, title="✏️  Modifier un type de ticket"
 
 # ── Vue : membres ────────────────────────────────────────────────
 class MemberActionView(discord.ui.View):
+    """Vue sélection membre — Select + ◀ p.X/Y ▶."""
     def __init__(self, guild, page=0):
         super().__init__(timeout=120)
         self.guild = guild
         self.page  = page
-        humans = [m for m in guild.members if not m.bot]
-        start  = page * 24
-        chunk  = humans[start:start + 24]
-        has_next = (start + 24) < len(humans)
         si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
               discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
-        opts = [discord.SelectOption(
-            label=(si.get(m.status, "⚫") + " " + m.display_name)[:50],
-            description="ID: " + str(m.id),
-            value=str(m.id)) for m in chunk]
-        if has_next:
-            opts.append(discord.SelectOption(
-                label="➡️  Page suivante (" + str(len(humans) - start - 24) + " membres restants)",
-                value="__next_page__",
-                description="Voir plus de membres"))
-        if opts:
-            suffix = "  (p." + str(page + 1) + ")" if len(humans) > 24 else ""
-            sel = discord.ui.Select(placeholder="👤  Choisir un membre" + suffix + "…", options=opts)
+        humans = [m for m in guild.members if not m.bot]
+        _, total_pages, _, _ = _paginate(humans, page, SEL_ITEMS)
+        page = max(0, min(page, total_pages - 1))
+        self.page        = page
+        self.total_pages = total_pages
+        sel = _make_page_select(
+            humans, page, total_pages,
+            placeholder="👤  Choisir un membre…",
+            label_fn=lambda m: (si.get(m.status,"⚫") + " " + m.display_name)[:50],
+            desc_fn=lambda m: "ID: " + str(m.id),
+            value_fn=lambda m: str(m.id), row=0)
+        if sel:
             sel.callback = self.on_select
             self.add_item(sel)
+        if len(humans) > SEL_ITEMS:
+            _add_nav_buttons(self, page, total_pages, row=1,
+                             prev_cb=self._prev, next_cb=self._next)
+
+    async def _prev(self, inter):
+        await inter.response.edit_message(view=MemberActionView(self.guild, self.page - 1))
+
+    async def _next(self, inter):
+        await inter.response.edit_message(view=MemberActionView(self.guild, self.page + 1))
 
     async def on_select(self, inter: discord.Interaction):
         if not is_staff(inter.user, self.guild.id):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         val = inter.data["values"][0]
-        if val == "__next_page__":
-            await inter.response.edit_message(view=MemberActionView(self.guild, self.page + 1))
-            return
         mem = self.guild.get_member(int(val))
         if not mem:
             await inter.response.send_message(embed=_e_err("❌  Membre introuvable"), ephemeral=True); return
