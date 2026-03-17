@@ -1836,7 +1836,7 @@ def _page_footer(page: int, total: int, count: int, label: str = "élément(s)")
 
 
 def _add_nav_buttons(view, page: int, total: int, row: int, prev_cb, next_cb, extra_btns=None):
-    """Ajoute les boutons ◀  p.X/Y  ▶ sur une rangée. extra_btns = [(label, style, emoji, cb), ...]"""
+    """Ajoute ◀  p.X/Y  ▶ sur la rangée 'row'. Utilisé pour naviguer dans l'EMBED."""
     btn_prev = discord.ui.Button(
         label="◀  Préc.", style=discord.ButtonStyle.secondary,
         disabled=(page == 0), row=row)
@@ -1861,10 +1861,29 @@ def _add_nav_buttons(view, page: int, total: int, row: int, prev_cb, next_cb, ex
             view.add_item(btn)
 
 
+def _add_sel_nav(view, sel_page: int, sel_total: int, row: int, prev_cb, next_cb):
+    """Ajoute ◀  p.X/Y  ▶ sur la rangée 'row'. Utilisé pour naviguer dans le SELECT."""
+    btn_prev = discord.ui.Button(
+        label="◀", style=discord.ButtonStyle.secondary,
+        disabled=(sel_page == 0), row=row)
+    btn_prev.callback = prev_cb
+    view.add_item(btn_prev)
+
+    btn_ind = discord.ui.Button(
+        label=f"Liste p.{sel_page+1}/{sel_total}", style=discord.ButtonStyle.secondary,
+        disabled=True, row=row)
+    view.add_item(btn_ind)
+
+    btn_next = discord.ui.Button(
+        label="▶", style=discord.ButtonStyle.secondary,
+        disabled=(sel_page >= sel_total - 1), row=row)
+    btn_next.callback = next_cb
+    view.add_item(btn_next)
+
+
 def _make_page_select(items, page: int, total: int, placeholder: str,
                       label_fn, desc_fn, value_fn, row: int = 0):
-    """Crée un Select paginé avec les items de la page courante.
-    label_fn/desc_fn/value_fn = fonctions item→str."""
+    """Crée un Select avec les items de la page sel courante (SEL_ITEMS par page)."""
     start = page * SEL_ITEMS
     chunk = items[start:start + SEL_ITEMS]
     if not chunk:
@@ -1874,10 +1893,7 @@ def _make_page_select(items, page: int, total: int, placeholder: str,
         description=desc_fn(x)[:100],
         value=value_fn(x)
     ) for x in chunk]
-    return discord.ui.Select(
-        placeholder=placeholder,
-        options=opts, row=row
-    )
+    return discord.ui.Select(placeholder=placeholder, options=opts, row=row)
 
 
 def _member_activity_embed(member: discord.Member, gid: int) -> discord.Embed:
@@ -2354,36 +2370,50 @@ def _build_embed_config_tickets(guild: discord.Guild) -> discord.Embed:
 
 
 class MembersPageView(discord.ui.View):
-    """Vue paginée Membres — Select profil + ◀ p.X/Y ▶."""
-    def __init__(self, guild: discord.Guild, page: int = 0):
+    """Vue paginée Membres.
+    embed_page : page de l'embed  (15 membres/page) → boutons row=2
+    sel_page   : page du select   (24 membres/page) → select row=0 + boutons row=1
+    """
+    def __init__(self, guild: discord.Guild, embed_page: int = 0, sel_page: int = 0):
         super().__init__(timeout=300)
-        self.guild = guild
+        self.guild      = guild
         si = {discord.Status.online: "🟢", discord.Status.idle: "🟡",
                discord.Status.dnd: "🔴", discord.Status.offline: "⚫"}
         humans = sorted([m for m in guild.members if not m.bot],
                         key=lambda m: (m.status == discord.Status.offline, m.display_name.lower()))
-        _, total_pages, _, _ = _paginate(humans, page, SEL_ITEMS)
-        page = max(0, min(page, total_pages - 1))
-        self.page        = page
-        self.total_pages = total_pages
+
+        # Pages embed
+        _, etotal, _, _ = _paginate(humans, embed_page, 15)
+        embed_page       = max(0, min(embed_page, etotal - 1))
+        self.embed_page  = embed_page
+        self.etotal      = etotal
+
+        # Pages select
+        _, stotal, _, _ = _paginate(humans, sel_page, SEL_ITEMS)
+        sel_page         = max(0, min(sel_page, stotal - 1))
+        self.sel_page    = sel_page
+        self.stotal      = stotal
         self._humans     = humans
 
-        # Select membres de la page
+        # ROW 0 — Select membres (page du select)
         sel = _make_page_select(
-            humans, page, total_pages,
-            placeholder=f"👤  Voir le profil d'un membre…",
+            humans, sel_page, stotal,
+            placeholder="👤  Profil d'un membre…",
             label_fn=lambda m: f"{si.get(m.status,'⚫')} {m.display_name[:45]}",
-            desc_fn=lambda m: f"ID: {m.id}",
-            value_fn=lambda m: str(m.id),
-            row=0
-        )
+            desc_fn=lambda m: "ID: " + str(m.id),
+            value_fn=lambda m: str(m.id), row=0)
         if sel:
             sel.callback = self._on_select
             self.add_item(sel)
 
-        # Boutons nav ◀ p.X/Y ▶
-        _add_nav_buttons(self, page, total_pages, row=1,
-                         prev_cb=self._prev, next_cb=self._next)
+        # ROW 1 — Navigation SELECT ◀ Liste p.X/Y ▶
+        if stotal > 1:
+            _add_sel_nav(self, sel_page, stotal, row=1,
+                         prev_cb=self._sel_prev, next_cb=self._sel_next)
+
+        # ROW 2 — Navigation EMBED ◀ p.X/Y ▶
+        _add_nav_buttons(self, embed_page, etotal, row=2,
+                         prev_cb=self._embed_prev, next_cb=self._embed_next)
 
     async def _on_select(self, inter: discord.Interaction):
         mem = self.guild.get_member(int(inter.data["values"][0]))
@@ -2405,34 +2435,49 @@ class MembersPageView(discord.ui.View):
         e.add_field(name="📋  Rôles", value=roles_txt, inline=False)
         await inter.response.send_message(embed=e, view=MemberModView(self.guild, mem), ephemeral=True)
 
-    async def _prev(self, inter: discord.Interaction):
-        p = self.page - 1
-        await inter.response.edit_message(embed=_build_embed_members(self.guild, p), view=MembersPageView(self.guild, p))
+    # Nav SELECT
+    async def _sel_prev(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=_build_embed_members(self.guild, self.embed_page),
+            view=MembersPageView(self.guild, self.embed_page, self.sel_page - 1))
 
-    async def _next(self, inter: discord.Interaction):
-        p = self.page + 1
-        await inter.response.edit_message(embed=_build_embed_members(self.guild, p), view=MembersPageView(self.guild, p))
+    async def _sel_next(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=_build_embed_members(self.guild, self.embed_page),
+            view=MembersPageView(self.guild, self.embed_page, self.sel_page + 1))
+
+    # Nav EMBED
+    async def _embed_prev(self, inter: discord.Interaction):
+        p = self.embed_page - 1
+        await inter.response.edit_message(
+            embed=_build_embed_members(self.guild, p),
+            view=MembersPageView(self.guild, p, self.sel_page))
+
+    async def _embed_next(self, inter: discord.Interaction):
+        p = self.embed_page + 1
+        await inter.response.edit_message(
+            embed=_build_embed_members(self.guild, p),
+            view=MembersPageView(self.guild, p, self.sel_page))
 
 
 class BotsPageView(discord.ui.View):
-    """Vue paginée Bots — ◀ p.X/Y ▶."""
-    def __init__(self, guild: discord.Guild, page: int = 0):
+    """Vue paginée Bots — embed ◀ p.X/Y ▶ row=0."""
+    def __init__(self, guild: discord.Guild, embed_page: int = 0):
         super().__init__(timeout=300)
         self.guild = guild
         bots = sorted([m for m in guild.members if m.bot], key=lambda m: m.display_name.lower())
-        _, total_pages, _, _ = _paginate(bots, page, 12)
-        page = max(0, min(page, total_pages - 1))
-        self.page        = page
-        self.total_pages = total_pages
-        _add_nav_buttons(self, page, total_pages, row=0,
-                         prev_cb=self._prev, next_cb=self._next)
+        _, etotal, _, _ = _paginate(bots, embed_page, 12)
+        embed_page       = max(0, min(embed_page, etotal - 1))
+        self.embed_page  = embed_page
+        _add_nav_buttons(self, embed_page, etotal, row=0,
+                         prev_cb=self._embed_prev, next_cb=self._embed_next)
 
-    async def _prev(self, inter: discord.Interaction):
-        p = self.page - 1
+    async def _embed_prev(self, inter: discord.Interaction):
+        p = self.embed_page - 1
         await inter.response.edit_message(embed=_build_embed_bots(self.guild, p), view=BotsPageView(self.guild, p))
 
-    async def _next(self, inter: discord.Interaction):
-        p = self.page + 1
+    async def _embed_next(self, inter: discord.Interaction):
+        p = self.embed_page + 1
         await inter.response.edit_message(embed=_build_embed_bots(self.guild, p), view=BotsPageView(self.guild, p))
 
 # ══════════════════════════════════════════════════════════════════
@@ -2557,7 +2602,7 @@ class DashboardView(discord.ui.View):
 
         if val == "members":
             embed = _build_embed_members(g, 0)
-            await inter.response.send_message(embed=embed, view=MembersPageView(g, 0), ephemeral=True)
+            await inter.response.send_message(embed=embed, view=MembersPageView(g, 0, 0), ephemeral=True)
             return
 
         if val == "bots":
@@ -2638,8 +2683,8 @@ class ExemptRolesView(discord.ui.View):
             )
             sel.callback = self._save
             self.add_item(sel)
-        _add_nav_buttons(self, page, total_pages, row=1,
-                         prev_cb=self._prev, next_cb=self._next)
+        _add_sel_nav(self, page, total_pages, row=1,
+                     prev_cb=self._prev, next_cb=self._next)
 
     async def _save(self, inter: discord.Interaction):
         # Ajouter/retirer les rôles sélectionnés sur cette page
@@ -2714,30 +2759,92 @@ class ActivityView(discord.ui.View):
                 for m in humans
                 if show_exempt or not _is_exempt(m, guild.id)]
         rows.sort(key=lambda x: x[1], reverse=True)
-        self._rows       = rows
-        self._total_pages = max(1, (len(rows) + SEL_ITEMS - 1) // SEL_ITEMS)
-        page              = max(0, min(page, self._total_pages - 1))
-        self.page         = page
+        self._rows = rows
 
-        # Select membres de la page
+        # Pages embed (10/page)
+        _, etotal, _, _ = _paginate(rows, page, PAGE_ITEMS)
+        page             = max(0, min(page, etotal - 1))
+        self.page        = page
+        self.etotal      = etotal
+
+        # Pages select (SEL_ITEMS/page) — indépendant de l'embed
+        sel_page          = page  # départ aligné sur l'embed page
+        _, stotal, _, _   = _paginate(rows, sel_page, SEL_ITEMS)
+        sel_page          = max(0, min(sel_page, stotal - 1))
+        self.sel_page     = sel_page
+        self.stotal       = stotal
+
+        # ROW 0 — Select
         si_e = {True: " 🙈", False: ""}
         def _lbl(r): emoji, lbl = _score_label(r[1]); return f"{emoji} {r[0].display_name[:35]}{si_e[r[2]]}"
         def _dsc(r): emoji, lbl = _score_label(r[1]); return f"Score {r[1]}/100 — {lbl}"
         def _val(r): return str(r[0].id)
-        sel = _make_page_select(rows, page, self._total_pages,
+        sel = _make_page_select(rows, sel_page, stotal,
                                 placeholder="🔍  Rapport individuel d'un membre…",
                                 label_fn=_lbl, desc_fn=_dsc, value_fn=_val, row=0)
         if sel:
             sel.callback = self._on_select
             self.add_item(sel)
 
-        # ◀ p.X/Y ▶ + bouton Voir/Masquer exemptés
-        _add_nav_buttons(self, page, self._total_pages, row=1,
-                         prev_cb=self._prev, next_cb=self._next,
+        # ROW 1 — Nav SELECT ◀ Liste p.X/Y ▶
+        if stotal > 1:
+            _add_sel_nav(self, sel_page, stotal, row=1,
+                         prev_cb=self._sel_prev, next_cb=self._sel_next)
+
+        # ROW 2 — Nav EMBED ◀ p.X/Y ▶ + bouton exempt
+        _add_nav_buttons(self, page, etotal, row=2,
+                         prev_cb=self._embed_prev, next_cb=self._embed_next,
                          extra_btns=[(
                              "Voir exemptés" if not show_exempt else "Masquer exemptés",
                              discord.ButtonStyle.primary, "🙈", self._toggle_exempt
                          )])
+
+    @staticmethod
+    def __new_with_sel__(guild, show_exempt, embed_page, sel_page):
+        """Crée une ActivityView avec sel_page spécifié."""
+        v = ActivityView(guild, show_exempt, embed_page)
+        # Reconstruire avec le bon sel_page (ActivityView.__init__ l'aligne sur embed_page)
+        # On reconstruit directement l'objet entier
+        return ActivityView._make(guild, show_exempt, embed_page, sel_page)
+
+    @classmethod
+    def _make(cls, guild, show_exempt, embed_page, sel_page):
+        obj = cls.__new__(cls)
+        discord.ui.View.__init__(obj, timeout=300)
+        obj.guild       = guild
+        obj.show_exempt = show_exempt
+        humans = [m for m in guild.members if not m.bot]
+        rows = [(m, _inactivity_score(guild.id, m.id), _is_exempt(m, guild.id))
+                for m in humans if show_exempt or not _is_exempt(m, guild.id)]
+        rows.sort(key=lambda x: x[1], reverse=True)
+        obj._rows  = rows
+        _, etotal, _, _ = _paginate(rows, embed_page, PAGE_ITEMS)
+        embed_page = max(0, min(embed_page, etotal - 1))
+        obj.page   = embed_page
+        obj.etotal = etotal
+        _, stotal, _, _ = _paginate(rows, sel_page, SEL_ITEMS)
+        sel_page    = max(0, min(sel_page, stotal - 1))
+        obj.sel_page = sel_page
+        obj.stotal   = stotal
+        si_e = {True: " 🙈", False: ""}
+        def _lbl(r): emoji, lbl = _score_label(r[1]); return f"{emoji} {r[0].display_name[:35]}{si_e[r[2]]}"
+        def _dsc(r): emoji, lbl = _score_label(r[1]); return f"Score {r[1]}/100 — {lbl}"
+        def _val(r): return str(r[0].id)
+        sel = _make_page_select(rows, sel_page, stotal,
+            placeholder="🔍  Rapport individuel d'un membre…",
+            label_fn=_lbl, desc_fn=_dsc, value_fn=_val, row=0)
+        if sel:
+            sel.callback = obj._on_select
+            obj.add_item(sel)
+        if stotal > 1:
+            _add_sel_nav(obj, sel_page, stotal, row=1,
+                         prev_cb=obj._sel_prev, next_cb=obj._sel_next)
+        _add_nav_buttons(obj, embed_page, etotal, row=2,
+                         prev_cb=obj._embed_prev, next_cb=obj._embed_next,
+                         extra_btns=[(
+                             "Voir exemptés" if not show_exempt else "Masquer exemptés",
+                             discord.ButtonStyle.primary, "🙈", obj._toggle_exempt)])
+        return obj
 
     async def _on_select(self, inter: discord.Interaction):
         mid = int(inter.data["values"][0])
@@ -2748,15 +2855,29 @@ class ActivityView(discord.ui.View):
         view  = MemberActivityRefreshView(self.guild, m.id)
         await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    async def _prev(self, inter: discord.Interaction):
-        new_view = ActivityView(self.guild, self.show_exempt, self.page - 1)
-        embed    = _build_embed_activity(self.guild, self.show_exempt, self.page - 1)
-        await inter.response.edit_message(embed=embed, view=new_view)
+    # Nav SELECT
+    async def _sel_prev(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=_build_embed_activity(self.guild, self.show_exempt, self.page),
+            view=ActivityView._make(self.guild, self.show_exempt, self.page, self.sel_page - 1))
 
-    async def _next(self, inter: discord.Interaction):
-        new_view = ActivityView(self.guild, self.show_exempt, self.page + 1)
-        embed    = _build_embed_activity(self.guild, self.show_exempt, self.page + 1)
-        await inter.response.edit_message(embed=embed, view=new_view)
+    async def _sel_next(self, inter: discord.Interaction):
+        await inter.response.edit_message(
+            embed=_build_embed_activity(self.guild, self.show_exempt, self.page),
+            view=ActivityView._make(self.guild, self.show_exempt, self.page, self.sel_page + 1))
+
+    # Nav EMBED
+    async def _embed_prev(self, inter: discord.Interaction):
+        p = self.page - 1
+        await inter.response.edit_message(
+            embed=_build_embed_activity(self.guild, self.show_exempt, p),
+            view=ActivityView(self.guild, self.show_exempt, p))
+
+    async def _embed_next(self, inter: discord.Interaction):
+        p = self.page + 1
+        await inter.response.edit_message(
+            embed=_build_embed_activity(self.guild, self.show_exempt, p),
+            view=ActivityView(self.guild, self.show_exempt, p))
 
     async def _toggle_exempt(self, inter: discord.Interaction):
         new_exempt = not self.show_exempt
@@ -2802,8 +2923,8 @@ class ConfigStaffView(discord.ui.View):
             s_role.callback = self._set_role
             self.add_item(s_role)
             if len(all_roles) > 23:
-                _add_nav_buttons(self, role_page, total_rpages, row=2,
-                                 prev_cb=self._role_prev, next_cb=self._role_next)
+                _add_sel_nav(self, role_page, total_rpages, row=2,
+                             prev_cb=self._role_prev, next_cb=self._role_next)
 
         # Bouton toggle anon (dynamique selon état actuel)
         anon_on  = cfg.get("anon_enabled", True)
@@ -3498,9 +3619,9 @@ class MemberActionView(discord.ui.View):
         if sel:
             sel.callback = self.on_select
             self.add_item(sel)
-        if len(humans) > SEL_ITEMS:
-            _add_nav_buttons(self, page, total_pages, row=1,
-                             prev_cb=self._prev, next_cb=self._next)
+        if total_pages > 1:
+            _add_sel_nav(self, page, total_pages, row=1,
+                         prev_cb=self._prev, next_cb=self._next)
 
     async def _prev(self, inter):
         await inter.response.edit_message(view=MemberActionView(self.guild, self.page - 1))
