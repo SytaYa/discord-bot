@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.27"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.28"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -2626,6 +2626,12 @@ class AnecdoteConfigView(discord.ui.View):
     def _guard(self, inter):
         return is_staff(inter.user, self.guild.id)
 
+    async def on_error(self, inter: discord.Interaction, error: Exception, item):
+        log("ANECDOTE", f"ERREUR AnecdoteConfigView [{item}] : {type(error).__name__} : {error}")
+        import traceback; log("ANECDOTE", traceback.format_exc()[:500])
+        try: await inter.response.send_message(embed=_e_err("❌", str(error)[:200]), ephemeral=True)
+        except Exception: pass
+
     async def _set_channel(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         self.cfg["anecdote_channel_id"] = int(inter.data["values"][0])
@@ -2662,7 +2668,12 @@ class AnecdoteConfigView(discord.ui.View):
 
     async def _open_schedule(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        await inter.response.send_modal(AnecdoteScheduleModal(self.guild, self.cfg))
+        try:
+            await inter.response.send_modal(AnecdoteScheduleModal(self.guild, self.cfg))
+        except Exception as _e_sched:
+            log("ANECDOTE", f"ERREUR _open_schedule : {type(_e_sched).__name__} : {_e_sched}")
+            try: await inter.response.send_message(embed=_e_err("❌  Erreur planification", str(_e_sched)[:200]), ephemeral=True)
+            except Exception: pass
 
     async def _open_list(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
