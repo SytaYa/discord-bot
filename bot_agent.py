@@ -281,6 +281,9 @@ async def save_data():
                         "anecdote_schedule":       cfg.get("anecdote_schedule", []),
                         "anecdote_guess_enabled":  cfg.get("anecdote_guess_enabled", True),
                     }, ensure_ascii=False))
+                    # Nettoyer les clés temporaires avant sauvegarde
+                    for _gid_tmp in ticket_config:
+                        ticket_config[_gid_tmp].pop("_sched_draft_days", None)
                 # Sauvegarder activity_data par serveur dans kv
                 for gid_a, gdata in activity_data.items():
                     serializable = {}
@@ -2465,143 +2468,42 @@ class AnecdotePendingView(discord.ui.View):
 # ── ScheduleBuilderView : planification par boutons ───────────────
 class ScheduleBuilderView(discord.ui.View):
     """
-    Interface de planification — SANS clear_items()/add_item() dynamique.
-    Chaque interaction crée une NOUVELLE instance avec l'état mis à jour.
-    C'est la seule façon fiable avec discord.py : les custom_ids auto ne changent pas.
+    Planification par boutons statiques (@discord.ui.button avec custom_id fixe).
+    custom_ids FIXES = jamais de "Échec de l'interaction".
+    État stocké dans cfg directement à chaque clic.
+    Modal pour saisir l'heure (TextInput, toujours fiable).
     """
 
-    def __init__(self, guild: discord.Guild, cfg: dict,
-                 sel_days: frozenset = frozenset(),
-                 sel_hour: int = 9,
-                 sel_min:  int = 0):
-        super().__init__(timeout=300)
-        self.guild    = guild
-        self.cfg      = cfg
-        self.sel_days = set(sel_days)
-        self.sel_hour = sel_hour
-        self.sel_min  = sel_min
+    # Jours sélectionnés TEMPORAIREMENT (en attente de validation avec l'heure)
+    # Stockés dans cfg["_sched_draft"] pour persister entre interactions
+    _DAY_LABELS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
 
-        day_labels = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+    def __init__(self, guild: discord.Guild, cfg: dict):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.cfg   = cfg
 
-        # Row 0 : 7 boutons jours — style dynamique selon sel_days
-        for i, label in enumerate(day_labels):
-            style = discord.ButtonStyle.success if i in self.sel_days else discord.ButtonStyle.secondary
-            btn   = discord.ui.Button(label=label, style=style, row=0)
-            btn.callback = self._make_day_cb(i)
-            self.add_item(btn)
+    def _draft(self) -> set:
+        return set(self.cfg.get("_sched_draft_days", []))
 
-        # Row 1 : select heure (00–23)
-        hours_opts = [discord.SelectOption(
-            label=f"{h:02d}h", value=str(h),
-            default=(h == self.sel_hour)) for h in range(24)]
-        sel_h = discord.ui.Select(placeholder=f"🕐  Heure : {self.sel_hour:02d}h…",
-                                  options=hours_opts, row=1)
-        sel_h.callback = self._set_hour
-        self.add_item(sel_h)
+    def _draft_set(self, days: set):
+        self.cfg["_sched_draft_days"] = sorted(days)
 
-        # Row 2 : select minutes (00, 05, ..., 55)
-        mins_opts = [discord.SelectOption(
-            label=f":{m:02d}", value=str(m),
-            default=(m == self.sel_min)) for m in range(0, 60, 5)]
-        sel_m = discord.ui.Select(placeholder=f"⏱  Minutes : :{self.sel_min:02d}…",
-                                  options=mins_opts, row=2)
-        sel_m.callback = self._set_min
-        self.add_item(sel_m)
-
-        # Row 3 : Ajouter + Effacer + Rafraîchir
-        btn_add = discord.ui.Button(label="➕  Ajouter ce créneau",
-                                    style=discord.ButtonStyle.primary, row=3)
-        btn_add.callback = self._add_slot
-        self.add_item(btn_add)
-
-        btn_clear = discord.ui.Button(label="🗑️  Tout effacer",
-                                      style=discord.ButtonStyle.danger, row=3)
-        btn_clear.callback = self._clear_all
-        self.add_item(btn_clear)
-
-        btn_back = discord.ui.Button(label="◀  Retour", style=discord.ButtonStyle.secondary, row=3)
-        btn_back.callback = self._back
-        self.add_item(btn_back)
-
-    # ── Helpers ───────────────────────────────────────────────────
-
-    def _new(self, days=None, hour=None, minute=None) -> "ScheduleBuilderView":
-        """Crée une nouvelle instance avec l'état mis à jour."""
-        return ScheduleBuilderView(
-            guild    = self.guild,
-            cfg      = self.cfg,
-            sel_days = frozenset(days    if days    is not None else self.sel_days),
-            sel_hour = hour   if hour   is not None else self.sel_hour,
-            sel_min  = minute if minute is not None else self.sel_min,
-        )
-
-    def _make_day_cb(self, day_idx: int):
-        async def _cb(inter: discord.Interaction):
-            new_days = set(self.sel_days)
-            if day_idx in new_days: new_days.discard(day_idx)
-            else: new_days.add(day_idx)
-            new_view = self._new(days=new_days)
-            await inter.response.edit_message(embed=new_view._embed(), view=new_view)
-        return _cb
-
-    async def _set_hour(self, inter: discord.Interaction):
-        new_view = self._new(hour=int(inter.data["values"][0]))
-        await inter.response.edit_message(embed=new_view._embed(), view=new_view)
-
-    async def _set_min(self, inter: discord.Interaction):
-        new_view = self._new(minute=int(inter.data["values"][0]))
-        await inter.response.edit_message(embed=new_view._embed(), view=new_view)
-
-    async def _add_slot(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        if not self.sel_days:
-            await inter.response.send_message(
-                embed=_e_warn("⚠️", "Sélectionne au moins un jour (boutons verts = sélectionnés)."),
-                ephemeral=True); return
-        schedule = self.cfg.get("anecdote_schedule", [])
-        schedule.append({
-            "days":   sorted(self.sel_days),
-            "hour":   self.sel_hour,
-            "minute": self.sel_min,
-        })
-        self.cfg["anecdote_schedule"] = schedule
-        await save_data()
-        day_n    = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"]
-        days_str = " ".join(day_n[d] for d in sorted(self.sel_days))
-        # Remettre la vue à zéro (jours désélectionnés)
-        new_view = self._new(days=set())
-        await inter.response.edit_message(embed=new_view._embed(), view=new_view)
-        await inter.followup.send(
-            embed=_e_ok("✅  Créneau ajouté",
-                         f"**{self.sel_hour:02d}:{self.sel_min:02d}** — {days_str}\n"
-                         f"`{len(schedule)}` créneau(x) total"),
-            ephemeral=True)
-
-    async def _clear_all(self, inter: discord.Interaction):
-        if not is_staff(inter.user, self.guild.id):
-            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
-        self.cfg["anecdote_schedule"] = []
-        await save_data()
-        new_view = self._new(days=set())
-        await inter.response.edit_message(embed=new_view._embed(), view=new_view)
-        await inter.followup.send(embed=_e_ok("🗑️  Planification effacée"), ephemeral=True)
-
-    async def _back(self, inter: discord.Interaction):
-        view = AnecdoteConfigView(self.guild, self.cfg)
-        await inter.response.edit_message(embed=_build_embed_anecdotes(self.guild), view=view)
+    def _day_style(self, day_idx: int) -> discord.ButtonStyle:
+        return discord.ButtonStyle.success if day_idx in self._draft() else discord.ButtonStyle.secondary
 
     def _embed(self) -> discord.Embed:
         sched  = self.cfg.get("anecdote_schedule", [])
-        day_n  = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"]
-        sel_s  = " ".join(day_n[d] for d in sorted(self.sel_days)) or "*Aucun jour sélectionné*"
+        draft  = self._draft()
+        day_n  = self._DAY_LABELS
+        sel_s  = " ".join(day_n[d] for d in sorted(draft)) or "*Aucun jour sélectionné*"
         e = discord.Embed(
             description=(
                 f"### 📅  Planification des envois\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"**Créneau en cours :**\n"
-                f"> 📅  Jours sélectionnés : **{sel_s}**\n"
-                f"> 🕐  Heure : **{self.sel_hour:02d}:{self.sel_min:02d}**\n\n"
+                f"**Jours sélectionnés :** {sel_s}\n"
+                f"*Clique sur un jour pour le sélectionner/désélectionner (🟢 = sélectionné)*\n"
+                f"*Puis clique **Définir l'heure** pour enregistrer le créneau.*\n\n"
             ),
             color=0x5865F2)
         if sched:
@@ -2610,9 +2512,137 @@ class ScheduleBuilderView(discord.ui.View):
                 d_str = " ".join(day_n[d] for d in sorted(slot["days"]))
                 e.description += f"> 🕐 **{slot['hour']:02d}:{slot['minute']:02d}** — {d_str}\n"
         else:
-            e.description += "*Aucun créneau configuré.*"
-        e.set_footer(text="🟢 = jour sélectionné  •  ⬜ = non sélectionné  •  ➕ pour enregistrer")
+            e.description += "*Aucun créneau enregistré.*"
+        e.set_footer(text="🟢 = sélectionné  •  Clique 'Définir l'heure' après avoir choisi les jours")
         return e
+
+    # ── 7 boutons jours — custom_id STATIQUE ─────────────────────
+    @discord.ui.button(label="Lun", style=discord.ButtonStyle.secondary, custom_id="sched_d0", row=0)
+    async def day_0(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._toggle(inter, 0)
+
+    @discord.ui.button(label="Mar", style=discord.ButtonStyle.secondary, custom_id="sched_d1", row=0)
+    async def day_1(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._toggle(inter, 1)
+
+    @discord.ui.button(label="Mer", style=discord.ButtonStyle.secondary, custom_id="sched_d2", row=0)
+    async def day_2(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._toggle(inter, 2)
+
+    @discord.ui.button(label="Jeu", style=discord.ButtonStyle.secondary, custom_id="sched_d3", row=0)
+    async def day_3(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._toggle(inter, 3)
+
+    @discord.ui.button(label="Ven", style=discord.ButtonStyle.secondary, custom_id="sched_d4", row=0)
+    async def day_4(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._toggle(inter, 4)
+
+    @discord.ui.button(label="Sam", style=discord.ButtonStyle.secondary, custom_id="sched_d5", row=0)
+    async def day_5(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._toggle(inter, 5)
+
+    @discord.ui.button(label="Dim", style=discord.ButtonStyle.secondary, custom_id="sched_d6", row=0)
+    async def day_6(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._toggle(inter, 6)
+
+    async def _toggle(self, inter: discord.Interaction, day_idx: int):
+        """Toggle un jour et met à jour les couleurs des boutons."""
+        draft = self._draft()
+        if day_idx in draft:
+            draft.discard(day_idx)
+        else:
+            draft.add(day_idx)
+        self._draft_set(draft)
+
+        # Mettre à jour les styles des boutons directement
+        day_attrs = ["day_0","day_1","day_2","day_3","day_4","day_5","day_6"]
+        for i, attr in enumerate(day_attrs):
+            btn = getattr(self, attr)
+            btn.style = discord.ButtonStyle.success if i in draft else discord.ButtonStyle.secondary
+
+        await inter.response.edit_message(embed=self._embed(), view=self)
+
+    # ── Row 1 : actions ───────────────────────────────────────────
+    @discord.ui.button(label="🕐  Définir l'heure", style=discord.ButtonStyle.primary,
+                       custom_id="sched_hour", row=1)
+    async def btn_hour(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not self._draft():
+            await inter.response.send_message(
+                embed=_e_warn("⚠️", "Sélectionne au moins un jour (boutons verts) avant de définir l'heure."),
+                ephemeral=True)
+            return
+        await inter.response.send_modal(ScheduleHourModal(self.guild, self.cfg))
+
+    @discord.ui.button(label="🗑️  Tout effacer", style=discord.ButtonStyle.danger,
+                       custom_id="sched_clear", row=1)
+    async def btn_clear(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["anecdote_schedule"] = []
+        self._draft_set(set())
+        await save_data()
+        # Reset styles
+        for attr in ["day_0","day_1","day_2","day_3","day_4","day_5","day_6"]:
+            getattr(self, attr).style = discord.ButtonStyle.secondary
+        await inter.response.edit_message(embed=self._embed(), view=self)
+        await inter.followup.send(embed=_e_ok("🗑️  Planification effacée"), ephemeral=True)
+
+    @discord.ui.button(label="◀  Retour", style=discord.ButtonStyle.secondary,
+                       custom_id="sched_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, btn: discord.ui.Button):
+        self.cfg.pop("_sched_draft_days", None)
+        view = AnecdoteConfigView(self.guild, self.cfg)
+        await inter.response.edit_message(embed=_build_embed_anecdotes(self.guild), view=view)
+
+
+class ScheduleHourModal(discord.ui.Modal, title="🕐  Heure d'envoi"):
+    """Modal pour saisir l'heure — toujours fiable (pas de problème d'interaction)."""
+    hour_input = discord.ui.TextInput(
+        label="Heure (format HH:MM)",
+        placeholder="Ex: 09:00  ou  18:30  ou  20:15",
+        min_length=4, max_length=5,
+        required=True)
+
+    def __init__(self, guild: discord.Guild, cfg: dict):
+        super().__init__()
+        self.guild = guild
+        self.cfg   = cfg
+
+    async def on_submit(self, inter: discord.Interaction):
+        raw = self.hour_input.value.strip()
+        try:
+            parts = raw.replace("h", ":").split(":")
+            hour   = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+            assert 0 <= hour <= 23 and 0 <= minute <= 59
+        except Exception:
+            await inter.response.send_message(
+                embed=_e_warn("⚠️  Format invalide",
+                               f"Saisis l'heure au format **HH:MM** (ex: `09:00`, `18:30`)."),
+                ephemeral=True)
+            return
+
+        draft = set(self.cfg.get("_sched_draft_days", []))
+        if not draft:
+            await inter.response.send_message(
+                embed=_e_warn("⚠️", "Aucun jour sélectionné — retourne en arrière et coche des jours."),
+                ephemeral=True)
+            return
+
+        schedule = self.cfg.get("anecdote_schedule", [])
+        day_n    = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"]
+        days_str = " ".join(day_n[d] for d in sorted(draft))
+        schedule.append({"days": sorted(draft), "hour": hour, "minute": minute})
+        self.cfg["anecdote_schedule"] = schedule
+        self.cfg["_sched_draft_days"] = []  # reset le brouillon
+        await save_data()
+
+        await inter.response.send_message(
+            embed=_e_ok("✅  Créneau enregistré !",
+                         f"**{hour:02d}:{minute:02d}** — {days_str}\n"
+                         f"`{len(schedule)}` créneau(x) au total"),
+            ephemeral=True)
+
 
 
 # ── AnecdoteConfigView ─────────────────────────────────────────────
@@ -2724,7 +2754,6 @@ class AnecdoteConfigView(discord.ui.View):
     async def _open_schedule(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         view = ScheduleBuilderView(self.guild, self.cfg)
-        # edit_message pour rester sur le même message éphémère (évite les échecs d'interaction)
         await inter.response.edit_message(embed=view._embed(), view=view)
 
     async def _open_list(self, inter: discord.Interaction):
