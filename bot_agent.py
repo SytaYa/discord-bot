@@ -2476,55 +2476,65 @@ class ScheduleBuilderView(discord.ui.View):
         self.sel_min  : int      = 0
         self._build()
 
+    def _make_day_cb(self, day_idx: int):
+        """Crée une closure pour le bouton du jour day_idx (évite les custom_id dupliqués)."""
+        async def _cb(inter: discord.Interaction):
+            if day_idx in self.sel_days:
+                self.sel_days.discard(day_idx)
+            else:
+                self.sel_days.add(day_idx)
+            self._build()
+            await inter.response.edit_message(embed=self._embed(), view=self)
+        return _cb
+
     def _build(self):
         self.clear_items()
-        day_labels = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"]
-        # Row 0 : 7 boutons jours (vert=sélectionné, gris=non)
+        day_labels = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+        # Row 0 : 7 boutons jours — closure pour chaque index (pas de custom_id fixe)
         for i, label in enumerate(day_labels):
             style = discord.ButtonStyle.success if i in self.sel_days else discord.ButtonStyle.secondary
-            btn = discord.ui.Button(label=label, style=style, custom_id=f"day_{i}", row=0)
-            btn.callback = self._toggle_day
+            btn = discord.ui.Button(label=label, style=style, row=0)
+            btn.callback = self._make_day_cb(i)
             self.add_item(btn)
 
         # Row 1 : select heure (00–23)
         hours_opts = [discord.SelectOption(
             label=f"{h:02d}h", value=str(h),
             default=(h == self.sel_hour)) for h in range(24)]
-        sel_h = discord.ui.Select(placeholder=f"Heure : {self.sel_hour:02d}h…",
-                                  options=hours_opts, row=1)
+        sel_h = discord.ui.Select(
+            placeholder=f"🕐  Heure : {self.sel_hour:02d}h…",
+            options=hours_opts, row=1)
         sel_h.callback = self._set_hour
         self.add_item(sel_h)
 
-        # Row 2 : select minutes (00,05,10,...,55)
+        # Row 2 : select minutes (00, 05, 10, ..., 55)
         mins_opts = [discord.SelectOption(
             label=f":{m:02d}", value=str(m),
             default=(m == self.sel_min)) for m in range(0, 60, 5)]
-        sel_m = discord.ui.Select(placeholder=f"Minutes : :{self.sel_min:02d}…",
-                                  options=mins_opts, row=2)
+        sel_m = discord.ui.Select(
+            placeholder=f"⏱  Minutes : :{self.sel_min:02d}…",
+            options=mins_opts, row=2)
         sel_m.callback = self._set_min
         self.add_item(sel_m)
 
-        # Row 3 : Ajouter créneau + Tout effacer + Fermer
-        btn_add = discord.ui.Button(label="➕  Ajouter ce créneau",
-                                    style=discord.ButtonStyle.primary, row=3)
+        # Row 3 : actions
+        btn_add = discord.ui.Button(
+            label="➕  Ajouter ce créneau",
+            style=discord.ButtonStyle.primary, row=3)
         btn_add.callback = self._add_slot
         self.add_item(btn_add)
 
-        btn_clear = discord.ui.Button(label="🗑️  Tout effacer",
-                                      style=discord.ButtonStyle.danger, row=3)
+        btn_clear = discord.ui.Button(
+            label="🗑️  Tout effacer",
+            style=discord.ButtonStyle.danger, row=3)
         btn_clear.callback = self._clear_all
         self.add_item(btn_clear)
 
-        btn_refresh = discord.ui.Button(label="🔄", style=discord.ButtonStyle.secondary, row=3)
+        btn_refresh = discord.ui.Button(
+            label="🔄", style=discord.ButtonStyle.secondary, row=3)
         btn_refresh.callback = self._refresh
         self.add_item(btn_refresh)
-
-    async def _toggle_day(self, inter: discord.Interaction):
-        day_idx = int(inter.data["custom_id"].split("_")[1])
-        if day_idx in self.sel_days: self.sel_days.discard(day_idx)
-        else: self.sel_days.add(day_idx)
-        self._build()
-        await inter.response.edit_message(embed=self._embed(), view=self)
 
     async def _set_hour(self, inter: discord.Interaction):
         self.sel_hour = int(inter.data["values"][0])
@@ -2694,7 +2704,10 @@ class AnecdoteConfigView(discord.ui.View):
         self.cfg["anecdote_guess_enabled"] = not self.cfg.get("anecdote_guess_enabled", True)
         await save_data()
         state = self.cfg["anecdote_guess_enabled"]
-        await inter.response.send_message(embed=_e_ok("✅  Devinette " + ("activée" if state else "désactivée")), ephemeral=True)
+        # Reconstruire la vue pour que le label du bouton change
+        await inter.response.edit_message(
+            embed=_build_embed_anecdotes(self.guild),
+            view=AnecdoteConfigView(self.guild, self.cfg))
 
     async def _open_schedule(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
