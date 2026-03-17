@@ -97,7 +97,8 @@ music_state = {}  # guild_id → dict
 maintenance_mode = False          # GLOBAL — touche tous les serveurs
 # menu_locked est maintenant LOCAL dans tconf(guild_id)["menu_locked"]
 activity_tracker = defaultdict(dict)  # ancien tracker (compat)
-activity_data: dict = {}  # nouveau système activité détaillé
+activity_data: dict = {}   # nouveau système activité détaillé
+_msg_since_save: dict = {}  # guild_id → nb msgs depuis dernier save
 ticket_config    = {}
 ticket_sessions  = {}
 pending_channels = {}
@@ -955,10 +956,10 @@ async def slash_activite(inter: discord.Interaction, membre: discord.Member = No
         if not is_staff(inter.user, inter.guild.id):
             await inter.response.send_message("🚫  Réservé au staff.", ephemeral=True); return
         if membre:
-            # Rapport individuel
-            exempt = _is_exempt(membre, inter.guild.id)
-            e = _member_activity_embed(membre, inter.guild.id)
-            await inter.response.send_message(embed=e, ephemeral=True)
+            # Rapport individuel — avec bouton Actualiser
+            e    = _member_activity_embed(membre, inter.guild.id)
+            view = MemberActivityRefreshView(inter.guild, membre.id)
+            await inter.response.send_message(embed=e, view=view, ephemeral=True)
         else:
             # Liste complète
             e = _build_embed_activity(inter.guild, show_exempt=True)
@@ -996,6 +997,8 @@ async def on_ready():
     except Exception as _e_opus:
         log("AUDIO", f"Opus : exception lors du chargement : {_e_opus}")
     await load_data()
+    # Démarrer la sauvegarde automatique de l'activité
+    asyncio.ensure_future(_auto_save_loop())
     # Restaurer les views persistantes pour les tickets en attente
     # On passe message_id= pour que discord.py rattache la view
     # au bon message (sinon les boutons après redémarrage ne fonctionnent pas)
@@ -1076,6 +1079,24 @@ async def on_ready():
     await send_update_notifications()
 
 
+
+@client.event
+async def on_ready_autosave():
+    pass  # déclenché manuellement ci-dessous
+
+
+async def _auto_save_loop():
+    """Sauvegarde périodique de l'activité en base toutes les 5 minutes."""
+    await client.wait_until_ready()
+    log("BOT", "Auto-save activité : démarré (intervalle 5 min)")
+    while not client.is_closed():
+        await asyncio.sleep(300)  # 5 minutes
+        try:
+            await save_data()
+            log("DB", "Auto-save activité ✔")
+        except Exception as _e_as:
+            log("DB", f"Auto-save erreur : {_e_as}")
+
 @client.event
 async def on_member_join(member: discord.Member):
     """Initialise le tracking d'activité dès qu'un membre rejoint le serveur."""
@@ -1122,6 +1143,11 @@ async def on_message(message):
         d["msg_count"] = d.get("msg_count", 0) + 1
         d["msg_last"]  = now
         d["last_seen"] = now
+        # Save automatique tous les 50 messages par serveur
+        _msg_since_save[message.guild.id] = _msg_since_save.get(message.guild.id, 0) + 1
+        if _msg_since_save[message.guild.id] >= 50:
+            _msg_since_save[message.guild.id] = 0
+            asyncio.ensure_future(save_data())
     await handle_cmds(message)
 
 @client.event
@@ -1138,6 +1164,8 @@ async def on_voice_state_update(member, before, after):
             d["voice_seconds"] = d.get("voice_seconds", 0) + max(0, elapsed)
             d["last_seen"]     = now
             d["voice_joined"]  = None
+            # Persister immédiatement quand un membre quitte le vocal
+            asyncio.ensure_future(save_data())
     # Rejoint un vocal
     if after.channel and (not before.channel or before.channel != after.channel):
         d["voice_joined"] = now
