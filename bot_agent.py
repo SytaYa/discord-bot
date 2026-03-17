@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.26 — hébergé sur Render
+  BOT AGENT v5.27 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.26"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.27"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -362,26 +362,26 @@ async def load_data():
             rows = await conn.fetch("SELECT * FROM ticket_session")
             for row in rows:
                 ticket_sessions[row["channel_id"]] = json.loads(row["data_json"])
-        # Charger activity_data
-        act_rows = await conn.fetch("SELECT key, value FROM kv WHERE key LIKE 'activity_%'")
-        for arow in act_rows:
-            gid_str = arow["key"].replace("activity_", "")
-            try:
-                gid_int = int(gid_str)
-                gdata   = json.loads(arow["value"])
-                activity_data[gid_int] = {}
-                for mid_str, d in gdata.items():
-                    activity_data[gid_int][int(mid_str)] = {
-                        "msg_count":     d.get("msg_count", 0),
-                        "msg_last":      datetime.fromisoformat(d["msg_last"]).replace(tzinfo=timezone.utc) if d.get("msg_last") else None,
-                        "voice_seconds": d.get("voice_seconds", 0),
-                        "voice_joined":  None,  # recalculé ci-dessous
-                        "last_seen":     datetime.fromisoformat(d["last_seen"]).replace(tzinfo=timezone.utc) if d.get("last_seen") else None,
-                    }
-            except Exception as _ea:
-                log("DB", f"Erreur chargement activity {gid_str}: {_ea}")
-        log("DB", f"Charge : {len(ticket_config)} guild(s), {len(ticket_sessions)} ticket(s)"
-            f" | maintenance={'ON' if maintenance_mode else 'OFF'}")
+            # Charger activity_data
+            act_rows = await conn.fetch("SELECT key, value FROM kv WHERE key LIKE 'activity_%'")
+            for arow in act_rows:
+                gid_str = arow["key"].replace("activity_", "")
+                try:
+                    gid_int = int(gid_str)
+                    gdata   = json.loads(arow["value"])
+                    activity_data[gid_int] = {}
+                    for mid_str, d in gdata.items():
+                        activity_data[gid_int][int(mid_str)] = {
+                            "msg_count":     d.get("msg_count", 0),
+                            "msg_last":      datetime.fromisoformat(d["msg_last"]).replace(tzinfo=timezone.utc) if d.get("msg_last") else None,
+                            "voice_seconds": d.get("voice_seconds", 0),
+                            "voice_joined":  None,  # recalculé ci-dessous
+                            "last_seen":     datetime.fromisoformat(d["last_seen"]).replace(tzinfo=timezone.utc) if d.get("last_seen") else None,
+                        }
+                except Exception as _ea:
+                    log("DB", f"Erreur chargement activity {gid_str}: {_ea}")
+            log("DB", f"Charge : {len(ticket_config)} guild(s), {len(ticket_sessions)} ticket(s)"
+                f" | maintenance={'ON' if maintenance_mode else 'OFF'}")
     except Exception as e:
         log("DB", f"Erreur load_data : {e} -> fallback JSON")
         _load_from_json()
