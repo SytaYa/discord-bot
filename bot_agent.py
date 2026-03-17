@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.28"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.29"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -2473,13 +2473,7 @@ class AnecdoteScheduleModal(discord.ui.Modal, title="📅  Planification des env
     schedule_input = discord.ui.TextInput(
         label="Créneaux d'envoi (un par ligne)",
         style=discord.TextStyle.paragraph,
-        placeholder=(
-            "Exemples :\n"
-            "lun mer ven 09:00\n"
-            "samedi dimanche 18:30\n"
-            "tous 20:00  (tous les jours à 20h)\n"
-            "\nJours : lun mar mer jeu ven sam dim (ou 'tous')"
-        ),
+        placeholder="Ex: lun mer 09:00 | ven 18:30 | tous 20:00",
         required=False,
         max_length=500
     )
