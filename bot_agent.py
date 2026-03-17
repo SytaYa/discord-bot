@@ -351,8 +351,8 @@ async def load_data():
                     "music_locked":            raw_json.get("music_locked", False),
                     "music_lock_msg":          raw_json.get("music_lock_msg", ""),
                     "anecdote_enabled":        raw_json.get("anecdote_enabled", False),
-                    "anecdote_channel_id":     raw_json.get("anecdote_channel_id"),
-                    "anecdote_role_id":        raw_json.get("anecdote_role_id"),
+                    "anecdote_channel_id":     raw_json.get("anecdote_channel_id") or None,
+                    "anecdote_role_id":        raw_json.get("anecdote_role_id") or None,
                     "anecdote_schedule":       raw_json.get("anecdote_schedule", []),
                     "anecdote_guess_enabled":  raw_json.get("anecdote_guess_enabled", True),
                 }
@@ -2466,12 +2466,11 @@ class AnecdotePendingView(discord.ui.View):
 class ScheduleBuilderView(discord.ui.View):
     """Interface de planification : jours en boutons colorés + select heure."""
 
-    # Slot en cours de construction : days + hour + minute
     def __init__(self, guild: discord.Guild, cfg: dict):
         super().__init__(timeout=300)
         self.guild    = guild
         self.cfg      = cfg
-        self.sel_days : set[int] = set()  # jours sélectionnés pour le créneau en cours
+        self.sel_days : set[int] = set()
         self.sel_hour : int      = 9
         self.sel_min  : int      = 0
         self._build()
@@ -2536,6 +2535,11 @@ class ScheduleBuilderView(discord.ui.View):
         btn_refresh.callback = self._refresh
         self.add_item(btn_refresh)
 
+        btn_back = discord.ui.Button(
+            label="◀  Retour à la config", style=discord.ButtonStyle.secondary, row=4)
+        btn_back.callback = self._back
+        self.add_item(btn_back)
+
     async def _set_hour(self, inter: discord.Interaction):
         self.sel_hour = int(inter.data["values"][0])
         self._build()
@@ -2580,6 +2584,11 @@ class ScheduleBuilderView(discord.ui.View):
     async def _refresh(self, inter: discord.Interaction):
         self._build()
         await inter.response.edit_message(embed=self._embed(), view=self)
+
+    async def _back(self, inter: discord.Interaction):
+        """Retour à la configuration des anecdotes."""
+        view = AnecdoteConfigView(self.guild, self.cfg)
+        await inter.response.edit_message(embed=_build_embed_anecdotes(self.guild), view=view)
 
     def _embed(self) -> discord.Embed:
         sched = self.cfg.get("anecdote_schedule", [])
@@ -2682,6 +2691,7 @@ class AnecdoteConfigView(discord.ui.View):
         self.cfg["anecdote_channel_id"] = int(inter.data["values"][0])
         await save_data()
         ch = self.guild.get_channel(self.cfg["anecdote_channel_id"])
+        log("ANECDOTE", f"[{self.guild.name}] Salon envoi configuré : #{ch.name if ch else '?'} → sauvegardé")
         await inter.response.send_message(embed=_e_ok("✅  Salon mis à jour", f"#{ch.name if ch else '?'}"), ephemeral=True)
 
     async def _set_role(self, inter: discord.Interaction):
@@ -2690,6 +2700,7 @@ class AnecdoteConfigView(discord.ui.View):
         self.cfg["anecdote_role_id"] = val if val != 0 else None
         await save_data()
         role = self.guild.get_role(val) if val else None
+        log("ANECDOTE", f"[{self.guild.name}] Rôle accès configuré : {role.name if role else 'tous'} → sauvegardé")
         msg = f"Rôle requis : {role.mention}" if role else "Tous les membres peuvent utiliser `/anecdote`."
         await inter.response.send_message(embed=_e_ok("✅  Accès mis à jour", msg), ephemeral=True)
 
@@ -2712,7 +2723,8 @@ class AnecdoteConfigView(discord.ui.View):
     async def _open_schedule(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         view = ScheduleBuilderView(self.guild, self.cfg)
-        await inter.response.send_message(embed=view._embed(), view=view, ephemeral=True)
+        # edit_message pour rester sur le même message éphémère (évite les échecs d'interaction)
+        await inter.response.edit_message(embed=view._embed(), view=view)
 
     async def _open_list(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
