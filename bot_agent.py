@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.29"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.30"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -2269,14 +2269,21 @@ async def _notify_pending_anecdote(guild: discord.Guild, anecdote_id: int, conte
 # ── Planificateur ─────────────────────────────────────────────────
 
 async def _anecdote_scheduler_loop():
-    """Vérifie toutes les 30s si une anecdote doit être envoyée selon les créneaux."""
+    """Vérifie toutes les 30s si une anecdote doit être envoyée (heure France)."""
     await client.wait_until_ready()
-    log("ANECDOTE", "Planificateur démarré")
+    # Utiliser le fuseau horaire Europe/Paris (UTC+1 hiver / UTC+2 été)
+    try:
+        from zoneinfo import ZoneInfo
+        _TZ_FRANCE = ZoneInfo("Europe/Paris")
+    except Exception:
+        _TZ_FRANCE = None  # fallback UTC si zoneinfo absent
+    log("ANECDOTE", f"Planificateur démarré — fuseau : {'Europe/Paris' if _TZ_FRANCE else 'UTC (fallback)'}")
     last_sent: dict = {}  # (guild_id, weekday, hour, minute) → (year, month, day)
 
     while not client.is_closed():
         await asyncio.sleep(30)
-        now     = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        now     = now_utc.astimezone(_TZ_FRANCE) if _TZ_FRANCE else now_utc
         weekday = now.weekday()
         hour    = now.hour
         minute  = now.minute
