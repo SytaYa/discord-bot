@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  BOT AGENT v5.24 — hébergé sur Render
+  BOT AGENT v5.25 — hébergé sur Render
   Variables : DISCORD_TOKEN  BOT_REMOTE_SECRET  BOT_REMOTE_ENABLED  PORT
 
   v5.0 : architecture initiale
@@ -38,6 +38,7 @@
   v5.23: rapport activité complet (tous les rôles, bouton actualiser temps réel),
          persistance activité en BDD, scan vocal au boot, toggle exempté corrigé
   v5.24: pagination universelle propre — ◀ p.X/Y ▶ sur tous les selects et embeds
+  v5.25: système anecdotes/blagues — planification, devinette, /anecdote, gestion admin
 """
 import discord, asyncio, aiohttp, json, os, sys, hmac, hashlib, subprocess
 import asyncpg
@@ -75,7 +76,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.24"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.25"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -174,6 +175,17 @@ async def init_db():
                     data_json   TEXT   NOT NULL
                 )
             """)
+            log("DB", "  -> CREATE TABLE anecdote")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS anecdote (
+                    id         SERIAL PRIMARY KEY,
+                    guild_id   BIGINT NOT NULL,
+                    content    TEXT   NOT NULL,
+                    author_id  BIGINT NOT NULL DEFAULT 0,
+                    archived   BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
         log("DB", "Tables OK")
     except Exception as e:
         log("DB", f"ECHEC creation tables : {e}")
@@ -253,6 +265,11 @@ async def save_data():
                         "activity_exempt_role_ids": cfg.get("activity_exempt_role_ids", []),
                         "music_locked":            cfg.get("music_locked", False),
                         "music_lock_msg":          cfg.get("music_lock_msg", ""),
+                        "anecdote_enabled":        cfg.get("anecdote_enabled", False),
+                        "anecdote_channel_id":     cfg.get("anecdote_channel_id"),
+                        "anecdote_role_id":        cfg.get("anecdote_role_id"),
+                        "anecdote_schedule":       cfg.get("anecdote_schedule", []),
+                        "anecdote_guess_enabled":  cfg.get("anecdote_guess_enabled", True),
                     }, ensure_ascii=False))
                 # Sauvegarder activity_data par serveur dans kv
                 for gid_a, gdata in activity_data.items():
@@ -323,6 +340,11 @@ async def load_data():
                     "activity_exempt_role_ids": raw_json.get("activity_exempt_role_ids", []),
                     "music_locked":            raw_json.get("music_locked", False),
                     "music_lock_msg":          raw_json.get("music_lock_msg", ""),
+                    "anecdote_enabled":        raw_json.get("anecdote_enabled", False),
+                    "anecdote_channel_id":     raw_json.get("anecdote_channel_id"),
+                    "anecdote_role_id":        raw_json.get("anecdote_role_id"),
+                    "anecdote_schedule":       raw_json.get("anecdote_schedule", []),
+                    "anecdote_guess_enabled":  raw_json.get("anecdote_guess_enabled", True),
                 }
             rows = await conn.fetch("SELECT * FROM ticket_session")
             for row in rows:
@@ -403,6 +425,12 @@ def tconf(gid):
             "music_locked":     False,  # True = musique verrouillée globalement
             "music_lock_msg":   "",     # message affiché quand la musique est verrouillée
             "anon_enabled":     True,   # True = messages anonymes autorisés
+            # Anecdotes
+            "anecdote_enabled":       False,
+            "anecdote_channel_id":    None,
+            "anecdote_role_id":       None,
+            "anecdote_schedule":      [],
+            "anecdote_guess_enabled": True,
         }
     if "menu_locked" not in ticket_config[gid]:
         ticket_config[gid]["menu_locked"] = False
@@ -415,6 +443,11 @@ def tconf(gid):
     if "music_lock_msg" not in cfg: cfg["music_lock_msg"] = ""
     if "anon_enabled"          not in cfg: cfg["anon_enabled"]          = True
     if "activity_exempt_role_ids" not in cfg: cfg["activity_exempt_role_ids"] = []
+    if "anecdote_enabled"       not in cfg: cfg["anecdote_enabled"]       = False
+    if "anecdote_channel_id"    not in cfg: cfg["anecdote_channel_id"]    = None
+    if "anecdote_role_id"       not in cfg: cfg["anecdote_role_id"]       = None
+    if "anecdote_schedule"      not in cfg: cfg["anecdote_schedule"]      = []
+    if "anecdote_guess_enabled" not in cfg: cfg["anecdote_guess_enabled"] = True
     return ticket_config[gid]
 
 def is_configured(gid):
@@ -999,6 +1032,7 @@ async def on_ready():
     await load_data()
     # Démarrer la sauvegarde automatique de l'activité
     asyncio.ensure_future(_auto_save_loop())
+    asyncio.ensure_future(_anecdote_scheduler_loop())
     # Restaurer les views persistantes pour les tickets en attente
     # On passe message_id= pour que discord.py rattache la view
     # au bon message (sinon les boutons après redémarrage ne fonctionnent pas)
@@ -1022,7 +1056,7 @@ async def on_ready():
     try:
         # S'assurer que /menu est bien dans le tree local avant le sync
         existing = {c.name for c in tree.get_commands()}
-        for name, fn in {"menu": slash_menu, "anon": slash_anon, "activite": slash_activite}.items():
+        for name, fn in {"menu": slash_menu, "anon": slash_anon, "activite": slash_activite, "anecdote": slash_anecdote}.items():
             if name not in existing:
                 tree.add_command(fn)
                 log("SLASH", f"{name} ajouté au tree local")
@@ -1148,6 +1182,7 @@ async def on_message(message):
         if _msg_since_save[message.guild.id] >= 50:
             _msg_since_save[message.guild.id] = 0
             asyncio.ensure_future(save_data())
+    await _handle_anecdote_guess(message)
     await handle_cmds(message)
 
 @client.event
@@ -2008,6 +2043,764 @@ def _member_activity_embed(member: discord.Member, gid: int) -> discord.Embed:
 #  MENU DISCORD — PANEL ADMIN COMPLET
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+#  SYSTÈME ANECDOTES / BLAGUES
+#  Table DB : anecdote
+#    id        SERIAL PRIMARY KEY
+#    guild_id  BIGINT
+#    content   TEXT          -- le texte de l'anecdote
+#    author_id BIGINT        -- membre qui l'a soumise (0 = staff via menu)
+#    archived  BOOLEAN       -- True = déjà dite, ne pas repiocher
+#    created_at TIMESTAMPTZ
+#
+#  Config dans tconf (types_json) :
+#    anecdote_enabled      : bool   -- système activé/désactivé
+#    anecdote_channel_id   : int    -- salon où envoyer
+#    anecdote_role_id      : int|None -- rôle requis pour /anecdote (None = tous)
+#    anecdote_schedule     : list[dict] -- [{days:[0..6], hour:int, minute:int}, ...]
+#    anecdote_guess_enabled: bool   -- mini-jeu "à qui est cette blague ?"
+# ══════════════════════════════════════════════════════════════════
+
+import asyncio as _asyncio
+
+# ── Helpers DB anecdotes ──────────────────────────────────────────
+
+async def _db_anecdote_create_table():
+    """Crée la table anecdote si elle n'existe pas."""
+    if not _db_pool: return
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS anecdote (
+                    id         SERIAL PRIMARY KEY,
+                    guild_id   BIGINT NOT NULL,
+                    content    TEXT   NOT NULL,
+                    author_id  BIGINT NOT NULL DEFAULT 0,
+                    archived   BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+    except Exception as e:
+        log("ANECDOTE", f"Erreur création table : {e}")
+
+
+async def _anecdote_add(guild_id: int, content: str, author_id: int = 0) -> int:
+    """Ajoute une anecdote. Retourne son id."""
+    if not _db_pool: return -1
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO anecdote (guild_id, content, author_id) VALUES ($1,$2,$3) RETURNING id",
+                guild_id, content.strip(), author_id)
+            return row["id"]
+    except Exception as e:
+        log("ANECDOTE", f"Erreur ajout : {e}"); return -1
+
+
+async def _anecdote_pick(guild_id: int) -> dict | None:
+    """Pioche une anecdote non archivée au hasard. Retourne None si aucune."""
+    if not _db_pool: return None
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, content, author_id FROM anecdote "
+                "WHERE guild_id=$1 AND archived=FALSE ORDER BY RANDOM() LIMIT 1",
+                guild_id)
+            return dict(row) if row else None
+    except Exception as e:
+        log("ANECDOTE", f"Erreur pioche : {e}"); return None
+
+
+async def _anecdote_archive(anecdote_id: int):
+    """Archive une anecdote (ne sera plus piochée)."""
+    if not _db_pool: return
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute("UPDATE anecdote SET archived=TRUE WHERE id=$1", anecdote_id)
+    except Exception as e:
+        log("ANECDOTE", f"Erreur archive : {e}")
+
+
+async def _anecdote_unarchive(guild_id: int, anecdote_id: int | None = None):
+    """Désarchive une ou toutes les anecdotes d'un serveur."""
+    if not _db_pool: return
+    try:
+        async with _db_pool.acquire() as conn:
+            if anecdote_id:
+                await conn.execute("UPDATE anecdote SET archived=FALSE WHERE id=$1 AND guild_id=$2",
+                                   anecdote_id, guild_id)
+            else:
+                await conn.execute("UPDATE anecdote SET archived=FALSE WHERE guild_id=$1", guild_id)
+    except Exception as e:
+        log("ANECDOTE", f"Erreur désarchive : {e}")
+
+
+async def _anecdote_list(guild_id: int, archived: bool = False) -> list[dict]:
+    """Liste les anecdotes d'un serveur."""
+    if not _db_pool: return []
+    try:
+        async with _db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, content, author_id, archived, created_at FROM anecdote "
+                "WHERE guild_id=$1 AND archived=$2 ORDER BY id DESC",
+                guild_id, archived)
+            return [dict(r) for r in rows]
+    except Exception as e:
+        log("ANECDOTE", f"Erreur liste : {e}"); return []
+
+
+async def _anecdote_delete(guild_id: int, anecdote_id: int):
+    """Supprime définitivement une anecdote."""
+    if not _db_pool: return
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM anecdote WHERE id=$1 AND guild_id=$2",
+                               anecdote_id, guild_id)
+    except Exception as e:
+        log("ANECDOTE", f"Erreur suppression : {e}")
+
+
+async def _anecdote_count(guild_id: int) -> dict:
+    """Retourne {active: N, archived: N, total: N}."""
+    if not _db_pool: return {"active": 0, "archived": 0, "total": 0}
+    try:
+        async with _db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT archived, COUNT(*) as n FROM anecdote WHERE guild_id=$1 GROUP BY archived",
+                guild_id)
+            d = {"active": 0, "archived": 0}
+            for r in rows:
+                d["archived" if r["archived"] else "active"] = r["n"]
+            d["total"] = d["active"] + d["archived"]
+            return d
+    except Exception as e:
+        log("ANECDOTE", f"Erreur count : {e}"); return {"active": 0, "archived": 0, "total": 0}
+
+
+# ── Envoi d'une anecdote ─────────────────────────────────────────
+
+# Stockage du message d'anecdote en cours par guild (pour le mini-jeu devinette)
+# guild_id → {"anecdote_id": int, "author_id": int, "msg_id": int, "channel_id": int}
+_active_guess: dict = {}
+
+
+async def _send_anecdote(guild: discord.Guild):
+    """Pioche et envoie une anecdote dans le salon configuré."""
+    cfg = tconf(guild.id)
+    if not cfg.get("anecdote_enabled", False): return
+
+    ch_id = cfg.get("anecdote_channel_id")
+    if not ch_id: return
+    channel = guild.get_channel(ch_id)
+    if not channel: return
+
+    item = await _anecdote_pick(guild.id)
+    if not item:
+        log("ANECDOTE", f"[{guild.name}] Aucune anecdote disponible")
+        e = discord.Embed(
+            description=(
+                "### 📭  Plus aucune anecdote disponible !\n"
+                "Toutes les anecdotes ont été dites.\n"
+                "Utilisez `/anecdote` pour en ajouter de nouvelles,\n"
+                "ou désarchivez les anciennes depuis le panel admin."
+            ),
+            color=0xE67E22
+        )
+        await channel.send(embed=e)
+        return
+
+    # Archiver immédiatement
+    await _anecdote_archive(item["id"])
+
+    guess_on = cfg.get("anecdote_guess_enabled", True)
+
+    e = discord.Embed(color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    e.set_author(name="💡  Le saviez-vous ?  •  " + guild.name,
+                 icon_url=guild.icon.url if guild.icon else None)
+    e.description = f">>> *{item['content']}*"
+
+    if guess_on and item["author_id"] and item["author_id"] != 0:
+        e.set_footer(text="🎮  À ton avis, qui a écrit ça ?  •  Réponds avec @LeBot C'est @Pseudo")
+    else:
+        e.set_footer(text="💡  Anecdote du jour  •  " + guild.name)
+
+    msg = await channel.send(embed=e)
+
+    if guess_on and item["author_id"] and item["author_id"] != 0:
+        _active_guess[guild.id] = {
+            "anecdote_id": item["id"],
+            "author_id":   item["author_id"],
+            "msg_id":      msg.id,
+            "channel_id":  channel.id,
+        }
+    else:
+        _active_guess.pop(guild.id, None)
+
+    log("ANECDOTE", f"[{guild.name}] Envoyée (id={item['id']})")
+
+
+# ── Planificateur ────────────────────────────────────────────────
+
+async def _anecdote_scheduler_loop():
+    """Boucle de planification — vérifie toutes les 30s si une anecdote doit être envoyée."""
+    await client.wait_until_ready()
+    log("ANECDOTE", "Planificateur démarré")
+    last_sent: dict = {}  # guild_id → dernière (jour, heure, minute) envoyée
+
+    while not client.is_closed():
+        await asyncio.sleep(30)
+        now = datetime.now(timezone.utc)
+        weekday = now.weekday()   # 0=lundi … 6=dimanche
+        hour    = now.hour
+        minute  = now.minute
+
+        for guild in client.guilds:
+            cfg = tconf(guild.id)
+            if not cfg.get("anecdote_enabled", False): continue
+            schedule = cfg.get("anecdote_schedule", [])
+
+            for slot in schedule:
+                days   = slot.get("days", list(range(7)))
+                s_hour = slot.get("hour", 9)
+                s_min  = slot.get("minute", 0)
+
+                if weekday not in days: continue
+                if hour != s_hour or minute != s_min: continue
+
+                key = (guild.id, weekday, s_hour, s_min)
+                if last_sent.get(key) == (now.year, now.month, now.day):
+                    continue  # déjà envoyée aujourd'hui à ce créneau
+
+                last_sent[key] = (now.year, now.month, now.day)
+                try:
+                    await _send_anecdote(guild)
+                except Exception as ex:
+                    log("ANECDOTE", f"Erreur envoi planifié [{guild.name}] : {ex}")
+
+
+# ── Gestion du mini-jeu devinette via on_message ─────────────────
+
+async def _handle_anecdote_guess(message: discord.Message):
+    """
+    Vérifie si le message est une réponse au mini-jeu.
+    Format attendu : @Bot C'est @Pseudo  ou  @Bot @Pseudo
+    """
+    if not message.guild: return
+    if message.author.bot: return
+
+    guess_data = _active_guess.get(message.guild.id)
+    if not guess_data: return
+
+    # Vérifier que le bot est mentionné
+    if client.user not in message.mentions: return
+
+    cfg = tconf(message.guild.id)
+    if not cfg.get("anecdote_guess_enabled", True): return
+
+    # Extraire les mentions membres (hors bot)
+    guessed_members = [m for m in message.mentions if not m.bot and m != client.user]
+    if not guessed_members: return
+
+    correct_id = guess_data["author_id"]
+    guessed_id = guessed_members[0].id
+    correct_member = message.guild.get_member(correct_id)
+
+    if guessed_id == correct_id:
+        e = discord.Embed(
+            description=(
+                f"### 🎉  Bravo {message.author.mention} !\n"
+                f"C'est bien **{correct_member.display_name if correct_member else '???'}** "
+                f"qui a écrit cette anecdote !"
+            ),
+            color=0x57F287,
+            timestamp=datetime.now(timezone.utc)
+        )
+    else:
+        e = discord.Embed(
+            description=(
+                f"### ❌  Raté, {message.author.mention} !\n"
+                f"Ce n'est pas {guessed_members[0].mention}…\n"
+                f"La réponse était **{correct_member.display_name if correct_member else '???'}** ! 🎭"
+            ),
+            color=0xED4245,
+            timestamp=datetime.now(timezone.utc)
+        )
+
+    await message.channel.send(embed=e)
+    # Effacer la devinette en cours pour ce serveur
+    _active_guess.pop(message.guild.id, None)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SLASH COMMAND /anecdote
+# ══════════════════════════════════════════════════════════════════
+
+@tree.command(name="anecdote", description="Soumettre une anecdote ou blague anonyme")
+@app_commands.describe(contenu="Ton anecdote ou blague (sera envoyée anonymement)")
+async def slash_anecdote(inter: discord.Interaction, contenu: str):
+    try:
+        if not inter.guild:
+            await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True); return
+        if maintenance_mode:
+            await inter.response.send_message(
+                embed=discord.Embed(title="🔧  Maintenance", color=0xE67E22), ephemeral=True); return
+
+        cfg = tconf(inter.guild.id)
+        if not cfg.get("anecdote_enabled", False):
+            await inter.response.send_message(
+                embed=discord.Embed(
+                    title="📭  Système désactivé",
+                    description="Les anecdotes sont actuellement désactivées sur ce serveur.",
+                    color=0xED4245),
+                ephemeral=True); return
+
+        # Vérifier le rôle requis
+        required_role_id = cfg.get("anecdote_role_id")
+        if required_role_id:
+            has_role = any(r.id == required_role_id for r in inter.user.roles)
+            if not has_role and not is_staff(inter.user, inter.guild.id):
+                role = inter.guild.get_role(required_role_id)
+                await inter.response.send_message(
+                    embed=discord.Embed(
+                        title="🔒  Accès restreint",
+                        description=f"Il faut le rôle {role.mention if role else '`requis`'} pour soumettre une anecdote.",
+                        color=0xED4245),
+                    ephemeral=True); return
+
+        if not contenu.strip():
+            await inter.response.send_message("❌ Le contenu ne peut pas être vide.", ephemeral=True); return
+
+        anecdote_id = await _anecdote_add(inter.guild.id, contenu.strip(), inter.user.id)
+        if anecdote_id < 0:
+            await inter.response.send_message("❌ Erreur lors de l'enregistrement.", ephemeral=True); return
+
+        e = discord.Embed(
+            title="✅  Anecdote soumise !",
+            description=(
+                f"Ton anecdote a été enregistrée anonymement.\n"
+                f"Elle sera envoyée lors du prochain envoi planifié.\n\n"
+                f"*ID #{anecdote_id} — seul le staff peut voir l'auteur*"
+            ),
+            color=0x57F287
+        )
+        await inter.response.send_message(embed=e, ephemeral=True)
+        log("ANECDOTE", f"[{inter.guild.name}] Nouvelle anecdote #{anecdote_id} soumise par {inter.user.display_name}")
+    except Exception as ex:
+        log("SLASH", f"/anecdote : {ex}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DISPATCH REMOTE — actions anecdotes
+# ══════════════════════════════════════════════════════════════════
+# Inséré dans le dispatch principal via le pattern elif action == ...
+# Actions :
+#   anecdote_config   : get/set config (enabled, channel, role, schedule, guess)
+#   anecdote_add      : ajouter une anecdote (staff)
+#   anecdote_list     : lister actives ou archivées
+#   anecdote_archive  : archiver une anecdote
+#   anecdote_unarchive: désarchiver une ou toutes
+#   anecdote_delete   : supprimer définitivement
+#   anecdote_send_now : envoyer immédiatement (test)
+#   anecdote_count    : stats
+
+
+# ══════════════════════════════════════════════════════════════════
+#  VUE DISCORD ANECDOTES — panel admin
+# ══════════════════════════════════════════════════════════════════
+
+def _build_embed_anecdotes(guild: discord.Guild) -> discord.Embed:
+    """Embed de config anecdotes pour le panel admin."""
+    cfg = tconf(guild.id)
+    ch  = guild.get_channel(cfg.get("anecdote_channel_id") or 0)
+    rr  = guild.get_role(cfg.get("anecdote_role_id") or 0)
+    ena = cfg.get("anecdote_enabled", False)
+    gue = cfg.get("anecdote_guess_enabled", True)
+
+    sched = cfg.get("anecdote_schedule", [])
+    day_names = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+    e = discord.Embed(
+        description=(
+            f"### 💡  Configuration — Anecdotes & Blagues\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=0x5865F2 if ena else 0x36393F,
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(
+        name="⚙️  Statut",
+        value="`✅ Activé`" if ena else "`⏸ Désactivé`",
+        inline=True
+    )
+    e.add_field(
+        name="📣  Salon d'envoi",
+        value=ch.mention if ch else "`Non configuré`",
+        inline=True
+    )
+    e.add_field(
+        name="🔒  Accès /anecdote",
+        value=rr.mention if rr else "`Tous les membres`",
+        inline=True
+    )
+    e.add_field(
+        name="🎮  Mini-jeu devinette",
+        value="`✅ Activé`" if gue else "`⏸ Désactivé`",
+        inline=True
+    )
+
+    if sched:
+        sched_str = ""
+        for slot in sched:
+            days_str = ", ".join(day_names[d] for d in sorted(slot.get("days", [])))
+            sched_str += f"> 🕐  **{slot.get('hour',9):02d}:{slot.get('minute',0):02d}** — {days_str}\n"
+        e.add_field(name="📅  Planification", value=sched_str.rstrip(), inline=False)
+    else:
+        e.add_field(name="📅  Planification", value="> *Aucun créneau configuré*", inline=False)
+
+    e.set_footer(text="Utilise les boutons ci-dessous pour modifier.")
+    return e
+
+
+class AnecdoteConfigView(discord.ui.View):
+    """Vue de configuration des anecdotes — éphémère."""
+
+    def __init__(self, guild: discord.Guild, cfg: dict):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.cfg   = cfg
+        ena = cfg.get("anecdote_enabled", False)
+        gue = cfg.get("anecdote_guess_enabled", True)
+
+        # Sélecteur salon
+        chs = sorted([c for c in guild.channels if isinstance(c, discord.TextChannel)], key=lambda c: c.name)
+        if chs:
+            s_ch = discord.ui.Select(
+                placeholder="📣  Salon d'envoi des anecdotes…",
+                options=[discord.SelectOption(
+                    label=f"#{c.name}"[:50], value=str(c.id),
+                    default=(cfg.get("anecdote_channel_id") == c.id)
+                ) for c in chs[:25]], row=0)
+            s_ch.callback = self._set_channel
+            self.add_item(s_ch)
+
+        # Sélecteur rôle accès /anecdote
+        all_roles = [r for r in guild.roles if r.name != "@everyone"]
+        if all_roles:
+            opts = [discord.SelectOption(label="Tous les membres", value="0",
+                                          default=(not cfg.get("anecdote_role_id")))]
+            opts += [discord.SelectOption(
+                label=r.name[:50], value=str(r.id),
+                default=(cfg.get("anecdote_role_id") == r.id)
+            ) for r in all_roles[:24]]
+            s_role = discord.ui.Select(
+                placeholder="🔒  Qui peut utiliser /anecdote…",
+                options=opts, row=1)
+            s_role.callback = self._set_role
+            self.add_item(s_role)
+
+        # Boutons
+        btn_toggle = discord.ui.Button(
+            label="Désactiver les anecdotes" if ena else "Activer les anecdotes",
+            style=discord.ButtonStyle.danger if ena else discord.ButtonStyle.success,
+            emoji="⏸" if ena else "✅", row=2)
+        btn_toggle.callback = self._toggle
+        self.add_item(btn_toggle)
+
+        btn_guess = discord.ui.Button(
+            label="Désactiver devinette" if gue else "Activer devinette",
+            style=discord.ButtonStyle.secondary,
+            emoji="🎮", row=2)
+        btn_guess.callback = self._toggle_guess
+        self.add_item(btn_guess)
+
+        btn_sched = discord.ui.Button(
+            label="Planification", style=discord.ButtonStyle.primary,
+            emoji="📅", row=2)
+        btn_sched.callback = self._open_schedule
+        self.add_item(btn_sched)
+
+        btn_list = discord.ui.Button(
+            label="Gérer les anecdotes", style=discord.ButtonStyle.secondary,
+            emoji="📋", row=3)
+        btn_list.callback = self._open_list
+        self.add_item(btn_list)
+
+        btn_now = discord.ui.Button(
+            label="Envoyer maintenant", style=discord.ButtonStyle.secondary,
+            emoji="🚀", row=3)
+        btn_now.callback = self._send_now
+        self.add_item(btn_now)
+
+    def _guard(self, inter):
+        if not is_staff(inter.user, self.guild.id): return False
+        return True
+
+    async def _set_channel(self, inter: discord.Interaction):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["anecdote_channel_id"] = int(inter.data["values"][0])
+        await save_data()
+        ch = self.guild.get_channel(self.cfg["anecdote_channel_id"])
+        await inter.response.send_message(
+            embed=_e_ok("✅  Salon mis à jour", f"**#{ch.name if ch else '?'}**"), ephemeral=True)
+
+    async def _set_role(self, inter: discord.Interaction):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        val = int(inter.data["values"][0])
+        self.cfg["anecdote_role_id"] = val if val != 0 else None
+        await save_data()
+        if val:
+            role = self.guild.get_role(val)
+            msg = f"Seuls les membres avec {role.mention if role else '?'} peuvent utiliser `/anecdote`."
+        else:
+            msg = "Tous les membres peuvent utiliser `/anecdote`."
+        await inter.response.send_message(embed=_e_ok("✅  Accès mis à jour", msg), ephemeral=True)
+
+    async def _toggle(self, inter: discord.Interaction):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["anecdote_enabled"] = not self.cfg.get("anecdote_enabled", False)
+        await save_data()
+        state = self.cfg["anecdote_enabled"]
+        await inter.response.edit_message(
+            embed=_build_embed_anecdotes(self.guild),
+            view=AnecdoteConfigView(self.guild, self.cfg))
+        await inter.followup.send(
+            embed=_e_ok("✅  Anecdotes " + ("activées" if state else "désactivées"),
+                         "/anecdote et l'envoi planifié sont " + ("actifs" if state else "suspendus") + "."),
+            ephemeral=True)
+
+    async def _toggle_guess(self, inter: discord.Interaction):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["anecdote_guess_enabled"] = not self.cfg.get("anecdote_guess_enabled", True)
+        await save_data()
+        state = self.cfg["anecdote_guess_enabled"]
+        await inter.response.send_message(
+            embed=_e_ok("✅  Devinette " + ("activée" if state else "désactivée"),
+                         "Le mini-jeu 'À qui est cette blague ?' est " + ("actif" if state else "suspendu") + "."),
+            ephemeral=True)
+
+    async def _open_schedule(self, inter: discord.Interaction):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(AnecdoteScheduleModal(self.guild, self.cfg))
+
+    async def _open_list(self, inter: discord.Interaction):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        items = await _anecdote_list(self.guild.id, archived=False)
+        archived = await _anecdote_list(self.guild.id, archived=True)
+        e = discord.Embed(
+            description=(
+                f"### 📋  Anecdotes — {self.guild.name}\n"
+                f"`{len(items)}` active(s)  •  `{len(archived)}` archivée(s)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=0x5865F2
+        )
+        for item in items[:8]:
+            preview = item["content"][:80] + ("…" if len(item["content"]) > 80 else "")
+            e.add_field(name=f"#{item['id']}", value=f"> {preview}", inline=False)
+        if len(items) > 8:
+            e.set_footer(text=f"… et {len(items)-8} autres anecdotes actives")
+        await inter.response.send_message(embed=e, view=AnecdoteListView(self.guild), ephemeral=True)
+
+    async def _send_now(self, inter: discord.Interaction):
+        if not self._guard(inter):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.defer(ephemeral=True)
+        await _send_anecdote(self.guild)
+        await inter.followup.send(embed=_e_ok("✅  Anecdote envoyée !"), ephemeral=True)
+
+
+class AnecdoteScheduleModal(discord.ui.Modal, title="📅  Planification des envois"):
+    """Modal pour configurer les créneaux d'envoi."""
+    schedule_input = discord.ui.TextInput(
+        label="Créneaux (un par ligne)",
+        placeholder="Ex:\nlundi mercredi 09:00\nvendredi 18:30\ntous 20:00",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=False
+    )
+
+    def __init__(self, guild: discord.Guild, cfg: dict):
+        super().__init__()
+        self.guild = guild
+        self.cfg   = cfg
+        # Pré-remplir avec les créneaux existants
+        sched = cfg.get("anecdote_schedule", [])
+        if sched:
+            day_names_fr = {0:"lundi",1:"mardi",2:"mercredi",3:"jeudi",4:"vendredi",5:"samedi",6:"dimanche"}
+            lines = []
+            for slot in sched:
+                days_str = " ".join(day_names_fr[d] for d in sorted(slot.get("days",[])))
+                lines.append(f"{days_str} {slot.get('hour',9):02d}:{slot.get('minute',0):02d}")
+            self.schedule_input.default = "\n".join(lines)
+
+    async def on_submit(self, inter: discord.Interaction):
+        raw = self.schedule_input.value.strip()
+        day_map = {
+            "lundi":0,"mardi":1,"mercredi":2,"jeudi":3,"vendredi":4,"samedi":5,"dimanche":6,
+            "lun":0,"mar":1,"mer":2,"jeu":3,"ven":4,"sam":5,"dim":6,
+            "tous":list(range(7)),"all":list(range(7)),"everyday":list(range(7)),
+            "monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6,
+        }
+        schedule = []
+        errors = []
+        for line in raw.splitlines():
+            line = line.strip().lower()
+            if not line: continue
+            # Extraire l'heure (dernier token HH:MM)
+            parts = line.split()
+            time_part = None
+            for p in reversed(parts):
+                if ":" in p:
+                    time_part = p; break
+            if not time_part:
+                errors.append(f"Pas d'heure trouvée : `{line}`"); continue
+            try:
+                hh, mm = time_part.split(":")
+                hour, minute = int(hh), int(mm)
+                assert 0 <= hour <= 23 and 0 <= minute <= 59
+            except:
+                errors.append(f"Heure invalide : `{time_part}`"); continue
+
+            day_parts = [p for p in parts if p != time_part]
+            days = []
+            for dp in day_parts:
+                if dp in day_map:
+                    d = day_map[dp]
+                    if isinstance(d, list): days.extend(d)
+                    else: days.append(d)
+            if not days:
+                errors.append(f"Jours non reconnus : `{' '.join(day_parts)}`"); continue
+
+            schedule.append({"days": sorted(set(days)), "hour": hour, "minute": minute})
+
+        self.cfg["anecdote_schedule"] = schedule
+        await save_data()
+
+        if errors:
+            msg = f"{len(schedule)} créneau(x) configuré(s)\n⚠️ Erreurs ignorées :\n" + "\n".join(errors[:3])
+        else:
+            msg = f"{len(schedule)} créneau(x) d'envoi configuré(s)."
+        await inter.response.send_message(embed=_e_ok("✅  Planification mise à jour", msg), ephemeral=True)
+
+
+class AnecdoteListView(discord.ui.View):
+    """Vue de gestion des anecdotes (liste, archiver, désarchiver, supprimer, ajouter)."""
+
+    def __init__(self, guild: discord.Guild, show_archived: bool = False, page: int = 0):
+        super().__init__(timeout=300)
+        self.guild         = guild
+        self.show_archived = show_archived
+        self.page          = page
+
+    @discord.ui.button(label="Ajouter une anecdote", style=discord.ButtonStyle.success, emoji="➕", row=0)
+    async def add_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(AnecdoteAddModal(self.guild))
+
+    @discord.ui.button(label="Voir archivées", style=discord.ButtonStyle.secondary, emoji="📦", row=0)
+    async def toggle_archived(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        new_show = not self.show_archived
+        items = await _anecdote_list(self.guild.id, archived=new_show)
+        label = "archivées" if new_show else "actives"
+        e = discord.Embed(
+            description=f"### 📋  Anecdotes {label} — {self.guild.name}\n`{len(items)}` {label}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            color=0x9B59B6 if new_show else 0x5865F2)
+        for item in items[:8]:
+            preview = item["content"][:80] + ("…" if len(item["content"]) > 80 else "")
+            e.add_field(name=f"#{item['id']}", value=f"> {preview}", inline=False)
+        view = AnecdoteListView(self.guild, new_show, 0)
+        if new_show and items:
+            sel = _make_anecdote_select(items[:25], "📦  Choisir pour désarchiver…")
+            if sel:
+                sel.callback = view._unarchive_one
+                view.add_item(sel)
+        elif not new_show and items:
+            sel = _make_anecdote_select(items[:25], "📋  Choisir pour archiver/supprimer…")
+            if sel:
+                sel.callback = view._action_one
+                view.add_item(sel)
+        await inter.response.send_message(embed=e, view=view, ephemeral=True)
+
+    @discord.ui.button(label="Désarchiver tout", style=discord.ButtonStyle.primary, emoji="♻️", row=1)
+    async def unarchive_all(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await _anecdote_unarchive(self.guild.id)
+        counts = await _anecdote_count(self.guild.id)
+        await inter.response.send_message(
+            embed=_e_ok("♻️  Tout désarchivé", f"`{counts['active']}` anecdote(s) remises en circulation."),
+            ephemeral=True)
+
+    async def _unarchive_one(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        anecdote_id = int(inter.data["values"][0])
+        await _anecdote_unarchive(self.guild.id, anecdote_id)
+        await inter.response.send_message(
+            embed=_e_ok("✅  Désarchivée", f"Anecdote #{anecdote_id} remise en circulation."), ephemeral=True)
+
+    async def _action_one(self, inter: discord.Interaction):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        anecdote_id = int(inter.data["values"][0])
+        # Afficher une vue d'action : archiver ou supprimer
+        e = discord.Embed(title=f"📋  Anecdote #{anecdote_id}", description="Que faire avec cette anecdote ?", color=0x5865F2)
+        v = discord.ui.View(timeout=60)
+        btn_arch = discord.ui.Button(label="Archiver", style=discord.ButtonStyle.secondary, emoji="📦")
+        btn_del  = discord.ui.Button(label="Supprimer définitivement", style=discord.ButtonStyle.danger, emoji="🗑️")
+        async def _arch(i2):
+            await _anecdote_archive(anecdote_id)
+            await i2.response.send_message(embed=_e_ok("✅  Archivée", f"#{anecdote_id} ne sera plus envoyée."), ephemeral=True)
+        async def _del(i2):
+            await _anecdote_delete(self.guild.id, anecdote_id)
+            await i2.response.send_message(embed=_e_ok("🗑️  Supprimée", f"#{anecdote_id} supprimée définitivement."), ephemeral=True)
+        btn_arch.callback = _arch
+        btn_del.callback  = _del
+        v.add_item(btn_arch); v.add_item(btn_del)
+        await inter.response.send_message(embed=e, view=v, ephemeral=True)
+
+
+def _make_anecdote_select(items: list, placeholder: str) -> discord.ui.Select | None:
+    if not items: return None
+    opts = [discord.SelectOption(
+        label=f"#{item['id']} — {item['content'][:60]}",
+        value=str(item["id"])
+    ) for item in items[:25]]
+    return discord.ui.Select(placeholder=placeholder, options=opts, row=2)
+
+
+class AnecdoteAddModal(discord.ui.Modal, title="➕  Ajouter une anecdote"):
+    content_input = discord.ui.TextInput(
+        label="Anecdote / blague",
+        placeholder="Écris ton anecdote ou blague ici…",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True
+    )
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__()
+        self.guild = guild
+
+    async def on_submit(self, inter: discord.Interaction):
+        aid = await _anecdote_add(self.guild.id, self.content_input.value.strip(), 0)
+        if aid < 0:
+            await inter.response.send_message(embed=_e_err("❌ Erreur d'enregistrement."), ephemeral=True); return
+        await inter.response.send_message(
+            embed=_e_ok("✅  Anecdote ajoutée", f"Anecdote #{aid} enregistrée et disponible pour le prochain envoi."),
+            ephemeral=True)
+
 async def send_staff_menu(channel, guild, invoker=None):
     if invoker and not is_staff(invoker, guild.id):
         await channel.send(embed=_e_err("🚫  Accès refusé", "Réservé au staff."))
@@ -2541,6 +3334,7 @@ class DashboardView(discord.ui.View):
         cfg_sel = discord.ui.Select(placeholder="⚙️  Configuration…", row=2, options=[
             discord.SelectOption(label="🛡️  Staff & Permissions",   value="cfg_staff",   description="Salon, rôle staff, anonymes",   default=active=="cfg_staff"),
             discord.SelectOption(label="🎫  Système de tickets",     value="cfg_tickets", description="Catégorie, compteur, types",     default=active=="cfg_tickets"),
+            discord.SelectOption(label="💡  Anecdotes & Blagues",    value="cfg_anecdotes", description="Planification, accès, devinette", default=active=="cfg_anecdotes"),
         ])
         cfg_sel.callback = self._nav
         self.add_item(cfg_sel)
@@ -2648,13 +3442,16 @@ class DashboardView(discord.ui.View):
             return
 
         # Sections config → édition en place du message principal
-        if val in ("cfg_staff", "cfg_tickets"):
+        if val in ("cfg_staff", "cfg_tickets", "cfg_anecdotes"):
             if val == "cfg_staff":
                 embed = _build_embed_config_staff(g)
                 sub_view = ConfigStaffView(g, cfg)
-            else:
+            elif val == "cfg_tickets":
                 embed = _build_embed_config_tickets(g)
                 sub_view = ConfigTicketsView(g, cfg)
+            else:
+                embed = _build_embed_anecdotes(g)
+                sub_view = AnecdoteConfigView(g, cfg)
             await inter.response.edit_message(embed=embed, view=DashboardView(g, val))
             await inter.followup.send(
                 embed=_e_ok("⚙️  Configuration", "Utilise les menus ci-dessous pour modifier."),
@@ -4301,6 +5098,89 @@ async def _dispatch_inner(action, p):
         cfg["activity_exempt_role_ids"] = [int(r) for r in role_ids]
         await save_data()
         return {"ok": True, "exempt_count": len(role_ids)}
+
+
+    elif action == "anecdote_config":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        changed = False
+        if "enabled" in p:
+            cfg["anecdote_enabled"] = bool(p["enabled"]); changed = True
+        if "channel_id" in p:
+            cfg["anecdote_channel_id"] = int(p["channel_id"]) if p["channel_id"] else None; changed = True
+        if "role_id" in p:
+            cfg["anecdote_role_id"] = int(p["role_id"]) if p["role_id"] else None; changed = True
+        if "schedule" in p:
+            cfg["anecdote_schedule"] = p["schedule"]; changed = True
+        if "guess_enabled" in p:
+            cfg["anecdote_guess_enabled"] = bool(p["guess_enabled"]); changed = True
+        if changed: await save_data()
+        ch  = g.get_channel(cfg.get("anecdote_channel_id") or 0)
+        rr  = g.get_role(cfg.get("anecdote_role_id") or 0)
+        cnt = await _anecdote_count(g.id)
+        return {
+            "ok": True,
+            "enabled":        cfg.get("anecdote_enabled", False),
+            "channel":        ch.name if ch else None,
+            "role":           rr.name if rr else None,
+            "schedule":       cfg.get("anecdote_schedule", []),
+            "guess_enabled":  cfg.get("anecdote_guess_enabled", True),
+            "count_active":   cnt["active"],
+            "count_archived": cnt["archived"],
+        }
+
+    elif action == "anecdote_add":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        content = str(p.get("content", "")).strip()
+        if not content: return {"error": "content requis"}
+        aid = await _anecdote_add(g.id, content, 0)
+        return {"ok": True, "id": aid}
+
+    elif action == "anecdote_list":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        archived = bool(p.get("archived", False))
+        items = await _anecdote_list(g.id, archived=archived)
+        return {"ok": True, "items": [
+            {"id": it["id"], "content": it["content"][:120],
+             "archived": it["archived"]}
+            for it in items]}
+
+    elif action == "anecdote_archive":
+        aid = int(p.get("id", 0))
+        if not aid: return {"error": "id requis"}
+        await _anecdote_archive(aid)
+        return {"ok": True}
+
+    elif action == "anecdote_unarchive":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        aid = p.get("id")
+        await _anecdote_unarchive(g.id, int(aid) if aid else None)
+        cnt = await _anecdote_count(g.id)
+        return {"ok": True, "active": cnt["active"]}
+
+    elif action == "anecdote_delete":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        aid = int(p.get("id", 0))
+        if not aid: return {"error": "id requis"}
+        await _anecdote_delete(g.id, aid)
+        return {"ok": True}
+
+    elif action == "anecdote_send_now":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        await _send_anecdote(g)
+        return {"ok": True}
+
+    elif action == "anecdote_count":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cnt = await _anecdote_count(g.id)
+        return {"ok": True, **cnt}
 
     return {"error": "Unknown action: " + action}
 
