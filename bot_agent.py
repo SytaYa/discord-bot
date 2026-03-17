@@ -2754,7 +2754,8 @@ class AnecdoteConfigView(discord.ui.View):
     async def _open_schedule(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
         view = ScheduleBuilderView(self.guild, self.cfg)
-        await inter.response.edit_message(embed=view._embed(), view=view)
+        # send_message crée un nouveau message éphémère → edit_message dans les callbacks fonctionne
+        await inter.response.send_message(embed=view._embed(), view=view, ephemeral=True)
 
     async def _open_list(self, inter: discord.Interaction):
         if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
