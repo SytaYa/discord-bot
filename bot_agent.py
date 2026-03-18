@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.30"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.31"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -1069,7 +1069,9 @@ async def on_ready():
     try:
         # S'assurer que /menu est bien dans le tree local avant le sync
         existing = {c.name for c in tree.get_commands()}
-        for name, fn in {"menu": slash_menu, "anon": slash_anon, "activite": slash_activite, "anecdote": slash_anecdote}.items():
+        for name, fn in {"menu": slash_menu, "anon": slash_anon, "activite": slash_activite,
+                          "anecdote": slash_anecdote, "profile": slash_profile,
+                          "adminprofile": slash_adminprofile}.items():
             if name not in existing:
                 tree.add_command(fn)
                 log("SLASH", f"{name} ajouté au tree local")
@@ -1137,7 +1139,7 @@ async def _auto_save_loop():
     await client.wait_until_ready()
     log("BOT", "Auto-save activité : démarré (intervalle 5 min)")
     while not client.is_closed():
-        await asyncio.sleep(300)  # 5 minutes
+        await asyncio.sleep(60)  # 1 minute
         try:
             await save_data()
             log("DB", "Auto-save activité ✔")
@@ -1190,11 +1192,8 @@ async def on_message(message):
         d["msg_count"] = d.get("msg_count", 0) + 1
         d["msg_last"]  = now
         d["last_seen"] = now
-        # Save automatique tous les 50 messages par serveur
-        _msg_since_save[message.guild.id] = _msg_since_save.get(message.guild.id, 0) + 1
-        if _msg_since_save[message.guild.id] >= 50:
-            _msg_since_save[message.guild.id] = 0
-            asyncio.ensure_future(save_data())
+        # Save à chaque message (activité critique — ne jamais perdre)
+        asyncio.ensure_future(save_data())
     await _handle_anecdote_guess(message)
     await handle_cmds(message)
 
@@ -3259,6 +3258,447 @@ def _build_embed_config_tickets(guild: discord.Guild) -> discord.Embed:
 
 
 
+# ══════════════════════════════════════════════════════════════════
+#  SYSTÈME /profile ET /adminprofile
+# ══════════════════════════════════════════════════════════════════
+
+def _build_profile_embed(member: discord.Member, guild: discord.Guild,
+                          is_staff_view: bool = False) -> discord.Embed:
+    """Embed de profil complet — partagé entre /profile et /adminprofile."""
+    gid   = guild.id
+    d     = activity_data.get(gid, {}).get(member.id, {})
+    score = _inactivity_score(gid, member.id)
+    emoji_act, label_act = _score_label(score)
+    msgs  = d.get("msg_count", 0)
+    voice = _total_voice(gid, member.id)
+    last  = d.get("last_seen")
+
+    col = member.top_role.color if member.top_role and member.top_role.color.value else discord.Color.blurple()
+    bar  = "█" * round(score / 10) + "░" * (10 - round(score / 10))
+
+    si_map = {
+        discord.Status.online:  ("🟢", "En ligne"),
+        discord.Status.idle:    ("🟡", "Inactif"),
+        discord.Status.dnd:     ("🔴", "Ne pas déranger"),
+        discord.Status.offline: ("⚫", "Hors ligne"),
+    }
+    s_emoji, s_label = si_map.get(member.status, ("⚫", "Hors ligne"))
+
+    joined_ts  = int(member.joined_at.timestamp()) if member.joined_at else 0
+    created_ts = int(member.created_at.timestamp())
+
+    e = discord.Embed(color=col, timestamp=datetime.now(timezone.utc))
+    e.set_author(name=f"{'👑 ' if is_staff_view else ''}Profil — {member.display_name}",
+                 icon_url=member.display_avatar.url if member.display_avatar else None)
+    if member.display_avatar:
+        e.set_thumbnail(url=member.display_avatar.url)
+
+    # Infos générales
+    e.add_field(name="📛  Pseudo serveur",   value=f"`{member.display_name}`",  inline=True)
+    e.add_field(name="🏷️  Tag",              value=f"`{member.name}`",           inline=True)
+    e.add_field(name=f"{s_emoji}  Statut",   value=s_label,                      inline=True)
+    e.add_field(name="📅  Membre depuis",    value=f"<t:{joined_ts}:D>" if joined_ts else "?", inline=True)
+    e.add_field(name="🎂  Compte créé",      value=f"<t:{created_ts}:D>",        inline=True)
+    e.add_field(name="🆔  ID",               value=f"`{member.id}`",             inline=True)
+
+    # Top rôle
+    top = member.top_role
+    e.add_field(name="👑  Top rôle",
+                value=top.mention if top and top.name != "@everyone" else "*Aucun*",
+                inline=True)
+
+    # Activité
+    e.add_field(name="📊  Activité",
+                value=f"{emoji_act} Score `{score}/100` — {label_act}\n`{bar}`",
+                inline=False)
+    e.add_field(name="💬  Messages",
+                value=f"**{msgs}** message(s)\n{_fmt_last_seen(d.get('msg_last'))}",
+                inline=True)
+    in_voice = bool(d.get("voice_joined"))
+    e.add_field(name="🔊  Temps vocal",
+                value=f"**{_fmt_seconds(voice)}**\n{'🟢 En vocal' if in_voice else 'Hors vocal'}",
+                inline=True)
+    e.add_field(name="👁️  Dernière activité",
+                value=_fmt_last_seen(last),
+                inline=True)
+
+    # Rôles (tous)
+    roles = [r for r in reversed(member.roles) if r.name != "@everyone"]
+    if roles:
+        roles_txt = " ".join(r.mention for r in roles)
+        # Tronquer si trop long
+        if len(roles_txt) > 950:
+            shown = []
+            total = 0
+            for r in roles:
+                m = r.mention
+                if total + len(m) + 1 > 900:
+                    shown.append(f"*+{len(roles)-len(shown)} autres…*")
+                    break
+                shown.append(m)
+                total += len(m) + 1
+            roles_txt = " ".join(shown)
+        e.add_field(name=f"📋  Rôles ({len(roles)})", value=roles_txt, inline=False)
+
+    e.set_footer(text=guild.name,
+                 icon_url=guild.icon.url if guild.icon else None)
+    return e
+
+
+# ── Vue /profile (membre) ─────────────────────────────────────────
+class ProfileView(discord.ui.View):
+    """Vue du profil membre — Ticket + Changer pseudo."""
+
+    def __init__(self, guild: discord.Guild, member: discord.Member):
+        super().__init__(timeout=120)
+        self.guild  = guild
+        self.member = member
+
+    @discord.ui.button(label="🎫  Ouvrir un ticket", style=discord.ButtonStyle.primary,
+                       custom_id="profile_ticket", row=0)
+    async def open_ticket_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        # Seul le membre lui-même peut ouvrir un ticket depuis son profil
+        if inter.user.id != self.member.id:
+            await inter.response.send_message(
+                embed=_e_err("🚫", "Ce profil n'est pas le tien."), ephemeral=True); return
+        cfg = tconf(self.guild.id)
+        if not cfg.get("types"):
+            await inter.response.send_message(
+                embed=_e_warn("⚠️", "Aucun type de ticket configuré."), ephemeral=True); return
+        if maintenance_mode:
+            await inter.response.send_message(
+                embed=_e_warn("🔧", "Bot en maintenance."), ephemeral=True); return
+
+        opts = [discord.SelectOption(
+            label=v["emoji"] + "  " + v["label"],
+            description=v.get("desc", "")[:50] if v.get("desc") else None,
+            value=k
+        ) for k, v in cfg["types"].items()]
+        sel = discord.ui.Select(placeholder="Choisir un type de ticket…", options=opts)
+
+        async def _pick(i2: discord.Interaction):
+            key = i2.data["values"][0]
+            ch, err = await open_ticket(self.guild, inter.user, key)
+            if err:
+                await i2.response.send_message(embed=_e_err("❌", err), ephemeral=True)
+            else:
+                await i2.response.send_message(
+                    embed=_e_ok("✅  Ticket créé !", f"Salon : {ch.mention}"), ephemeral=True)
+
+        sel.callback = _pick
+        v2 = discord.ui.View(timeout=30)
+        v2.add_item(sel)
+        await inter.response.send_message(
+            embed=discord.Embed(
+                description="### 🎫  Quel type de ticket veux-tu ouvrir ?",
+                color=0x5865F2),
+            view=v2, ephemeral=True)
+
+    @discord.ui.button(label="✏️  Changer de pseudo", style=discord.ButtonStyle.secondary,
+                       custom_id="profile_rename", row=0)
+    async def rename_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if inter.user.id != self.member.id:
+            await inter.response.send_message(
+                embed=_e_err("🚫", "Ce profil n'est pas le tien."), ephemeral=True); return
+        await inter.response.send_modal(NicknameRequestModal(self.guild, self.member))
+
+
+# ── Vue /adminprofile (staff) ──────────────────────────────────────
+class AdminProfileView(discord.ui.View):
+    """Vue du profil admin — Convoquer + Kick + Ban avec confirmation."""
+
+    def __init__(self, guild: discord.Guild, member: discord.Member):
+        super().__init__(timeout=120)
+        self.guild  = guild
+        self.member = member
+
+    @discord.ui.button(label="📨  Convoquer", style=discord.ButtonStyle.primary,
+                       custom_id="adm_convoke", row=0)
+    async def convoke_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        ok_cfg, msg_cfg = is_configured(self.guild.id)
+        if not ok_cfg:
+            await inter.response.send_message(embed=_e_warn("⚠️", msg_cfg), ephemeral=True); return
+        # Créer un salon de convocation dans la catégorie tickets
+        cfg = tconf(self.guild.id)
+        cat = self.guild.get_channel(cfg.get("category_id") or 0)
+        if not cat:
+            await inter.response.send_message(
+                embed=_e_warn("⚠️", "Catégorie tickets non configurée."), ephemeral=True); return
+        ow = {
+            self.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            self.member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            self.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        }
+        if cfg.get("staff_role_id"):
+            sr = self.guild.get_role(cfg["staff_role_id"])
+            if sr: ow[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True)
+        try:
+            ch = await self.guild.create_text_channel(
+                f"convocation-{self.member.display_name[:15].lower().replace(' ', '-')}",
+                category=cat, overwrites=ow,
+                topic=f"Convocation de {self.member.display_name} par le staff")
+            await ch.send(
+                content=self.member.mention,
+                embed=discord.Embed(
+                    description=(
+                        f"### 📨  Convocation\n"
+                        f"{self.member.mention}, le staff t'a convoqué dans ce salon.\n"
+                        f"Merci de prendre connaissance du message qui suit."
+                    ),
+                    color=0xF0A500))
+            await inter.response.send_message(
+                embed=_e_ok("✅  Salon de convocation créé", ch.mention), ephemeral=True)
+        except discord.Forbidden:
+            await inter.response.send_message(
+                embed=_e_err("❌", "Permission refusée pour créer le salon."), ephemeral=True)
+
+    @discord.ui.button(label="👢  Kick", style=discord.ButtonStyle.danger,
+                       custom_id="adm_kick", row=0)
+    async def kick_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        # Confirmation
+        e = discord.Embed(
+            description=f"### ⚠️  Confirmer le kick\nVeux-tu vraiment kick **{self.member.display_name}** ?",
+            color=0xED4245)
+        v = discord.ui.View(timeout=30)
+        btn_yes = discord.ui.Button(label="✅  Confirmer", style=discord.ButtonStyle.danger)
+        btn_no  = discord.ui.Button(label="❌  Annuler",   style=discord.ButtonStyle.secondary)
+        async def _confirm(i2):
+            await inter.response.send_modal(ModModal(self.guild, self.member, "kick"))
+        async def _cancel(i2):
+            await i2.response.edit_message(embed=_e_ok("✅  Annulé"), view=None)
+        btn_yes.callback = _confirm
+        btn_no.callback  = _cancel
+        v.add_item(btn_yes); v.add_item(btn_no)
+        await inter.response.send_message(embed=e, view=v, ephemeral=True)
+
+    @discord.ui.button(label="🔨  Ban", style=discord.ButtonStyle.danger,
+                       custom_id="adm_ban", row=0)
+    async def ban_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        e = discord.Embed(
+            description=f"### ⚠️  Confirmer le ban\nVeux-tu vraiment bannir **{self.member.display_name}** ?",
+            color=0xED4245)
+        v = discord.ui.View(timeout=30)
+        btn_yes = discord.ui.Button(label="✅  Confirmer", style=discord.ButtonStyle.danger)
+        btn_no  = discord.ui.Button(label="❌  Annuler",   style=discord.ButtonStyle.secondary)
+        async def _confirm(i2):
+            await inter.response.send_modal(ModModal(self.guild, self.member, "ban"))
+        async def _cancel(i2):
+            await i2.response.edit_message(embed=_e_ok("✅  Annulé"), view=None)
+        btn_yes.callback = _confirm
+        btn_no.callback  = _cancel
+        v.add_item(btn_yes); v.add_item(btn_no)
+        await inter.response.send_message(embed=e, view=v, ephemeral=True)
+
+
+# ── Modal changement de pseudo ─────────────────────────────────────
+class NicknameRequestModal(discord.ui.Modal, title="✏️  Demande de changement de pseudo"):
+    new_nick = discord.ui.TextInput(
+        label="Nouveau pseudo",
+        placeholder="Ton nouveau pseudo sur le serveur…",
+        min_length=1, max_length=32, required=True)
+
+    def __init__(self, guild: discord.Guild, member: discord.Member):
+        super().__init__()
+        self.guild  = guild
+        self.member = member
+
+    async def on_submit(self, inter: discord.Interaction):
+        nick = self.new_nick.value.strip()
+        cfg  = tconf(self.guild.id)
+        sch  = self.guild.get_channel(cfg.get("staff_channel_id") or 0)
+
+        e_req = discord.Embed(
+            description=(
+                f"### ✏️  Demande de changement de pseudo\n"
+                f"**Membre :** {self.member.mention} (`{self.member.display_name}`)\n"
+                f"**Nouveau pseudo demandé :** `{nick}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ),
+            color=0xF0A500,
+            timestamp=datetime.now(timezone.utc))
+        e_req.set_thumbnail(url=self.member.display_avatar.url if self.member.display_avatar else None)
+
+        if sch:
+            view_req = NicknameApprovalView(self.guild, self.member, nick)
+            await sch.send(embed=e_req, view=view_req)
+            await inter.response.send_message(
+                embed=_e_ok("✅  Demande envoyée !",
+                             "Le staff examinera ta demande et changera ton pseudo si acceptée."),
+                ephemeral=True)
+        else:
+            await inter.response.send_message(
+                embed=_e_warn("⚠️", "Aucun salon staff configuré — contacte un admin."),
+                ephemeral=True)
+
+
+class NicknameApprovalView(discord.ui.View):
+    """Boutons staff pour accepter/refuser un changement de pseudo."""
+
+    def __init__(self, guild: discord.Guild, member: discord.Member, new_nick: str):
+        super().__init__(timeout=None)  # persistant
+        self.guild    = guild
+        self.member   = member
+        self.new_nick = new_nick
+
+    @discord.ui.button(label="✅  Accepter", style=discord.ButtonStyle.success,
+                       custom_id="nick_approve")
+    async def approve(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+
+        # Vérification préalable de la hiérarchie
+        bot_member = self.guild.get_member(inter.client.user.id)
+        if bot_member and self.member.top_role >= bot_member.top_role:
+            await inter.response.send_message(
+                embed=_e_err(
+                    "❌  Hiérarchie insuffisante",
+                    f"Le rôle **{self.member.top_role.name}** de {self.member.mention} "
+                    f"est supérieur ou égal au rôle le plus haut du bot.\n"
+                    f"**Solution :** Monte le rôle du bot au-dessus de '{self.member.top_role.name}' "
+                    f"dans Paramètres serveur → Rôles."),
+                ephemeral=True); return
+
+        # Vérification permission MANAGE_NICKNAMES
+        if bot_member and not bot_member.guild_permissions.manage_nicknames:
+            await inter.response.send_message(
+                embed=_e_err(
+                    "❌  Permission manquante",
+                    "Le bot n'a pas la permission **Gérer les pseudonymes**.\n"
+                    "**Solution :** Active cette permission dans le rôle du bot."),
+                ephemeral=True); return
+
+        # Propriétaire du serveur → impossible
+        if self.member.id == self.guild.owner_id:
+            await inter.response.send_message(
+                embed=_e_err(
+                    "❌  Propriétaire du serveur",
+                    "Il est impossible de changer le pseudo du propriétaire du serveur.\n"
+                    "Le membre doit le changer lui-même."),
+                ephemeral=True); return
+
+        try:
+            old_nick = self.member.display_name
+            await self.member.edit(nick=self.new_nick,
+                                   reason=f"Demande acceptée par {inter.user.display_name}")
+            await inter.response.edit_message(
+                embed=discord.Embed(
+                    description=(
+                        f"### ✅  Pseudo changé\n"
+                        f"**{old_nick}** → **{self.new_nick}**\n"
+                        f"Accepté par {inter.user.mention}"
+                    ),
+                    color=0x57F287),
+                view=None)
+            try:
+                await self.member.send(
+                    embed=discord.Embed(
+                        description=(
+                            f"### ✅  Demande acceptée\n"
+                            f"Ton pseudo sur **{self.guild.name}** a été changé en `{self.new_nick}` !"
+                        ),
+                        color=0x57F287))
+            except Exception:
+                pass
+        except discord.Forbidden:
+            await inter.response.send_message(
+                embed=_e_err(
+                    "❌  Permission refusée",
+                    f"Discord a refusé le changement.\n"
+                    f"Vérifie que le rôle du bot est **au-dessus** du rôle de {self.member.mention} "
+                    f"dans la hiérarchie des rôles."),
+                ephemeral=True)
+
+    @discord.ui.button(label="❌  Refuser", style=discord.ButtonStyle.danger,
+                       custom_id="nick_reject")
+    async def reject(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not is_staff(inter.user, self.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        await inter.response.send_modal(NicknameRejectModal(self.guild, self.member, self.new_nick))
+
+
+class NicknameRejectModal(discord.ui.Modal, title="❌  Refuser la demande de pseudo"):
+    raison = discord.ui.TextInput(
+        label="Raison du refus (optionnel)",
+        placeholder="Ex: Pseudo non approprié…",
+        required=False, max_length=200)
+
+    def __init__(self, guild, member, new_nick):
+        super().__init__()
+        self.guild    = guild
+        self.member   = member
+        self.new_nick = new_nick
+
+    async def on_submit(self, inter: discord.Interaction):
+        raison = self.raison.value.strip() or "Aucune raison précisée."
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                description=(
+                    f"### ❌  Demande refusée\n"
+                    f"Pseudo `{self.new_nick}` refusé par {inter.user.mention}\n"
+                    f"Raison : {raison}"
+                ),
+                color=0xED4245),
+            view=None)
+        try:
+            await self.member.send(
+                embed=discord.Embed(
+                    description=(
+                        f"### ❌  Demande refusée\n"
+                        f"Ta demande de pseudo `{self.new_nick}` sur **{self.guild.name}** a été refusée.\n"
+                        f"Raison : {raison}"
+                    ),
+                    color=0xED4245))
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SLASH COMMANDS /profile et /adminprofile
+# ══════════════════════════════════════════════════════════════════
+
+@tree.command(name="profile", description="Voir ton profil sur ce serveur")
+async def slash_profile(inter: discord.Interaction):
+    try:
+        if not inter.guild:
+            await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True); return
+        if maintenance_mode:
+            await inter.response.send_message(embed=discord.Embed(title="🔧  Maintenance", color=0xE67E22), ephemeral=True); return
+        member = inter.guild.get_member(inter.user.id)
+        if not member:
+            await inter.response.send_message("Membre introuvable.", ephemeral=True); return
+        e = _build_profile_embed(member, inter.guild, is_staff_view=False)
+        await inter.response.send_message(embed=e, view=ProfileView(inter.guild, member), ephemeral=True)
+    except Exception as ex:
+        log("SLASH", f"/profile : {ex}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+@tree.command(name="adminprofile", description="Voir le profil complet d'un membre (staff)")
+@app_commands.describe(membre="Le membre dont tu veux voir le profil")
+async def slash_adminprofile(inter: discord.Interaction, membre: discord.Member):
+    try:
+        if not inter.guild:
+            await inter.response.send_message("Commande disponible sur un serveur uniquement.", ephemeral=True); return
+        if not is_staff(inter.user, inter.guild.id):
+            await inter.response.send_message(embed=_e_err("🚫", "Réservé au staff."), ephemeral=True); return
+        if maintenance_mode:
+            await inter.response.send_message(embed=discord.Embed(title="🔧  Maintenance", color=0xE67E22), ephemeral=True); return
+        e = _build_profile_embed(membre, inter.guild, is_staff_view=True)
+        await inter.response.send_message(embed=e, view=AdminProfileView(inter.guild, membre), ephemeral=True)
+    except Exception as ex:
+        log("SLASH", f"/adminprofile : {ex}")
+        try: await inter.response.send_message("❌ Erreur.", ephemeral=True)
+        except Exception: pass
+
+
+
 class MembersPageView(discord.ui.View):
     """Vue paginée Membres.
     embed_page : page de l'embed  (15 membres/page) → boutons row=2
@@ -3323,7 +3763,9 @@ class MembersPageView(discord.ui.View):
         e.add_field(name="📊  Activité", value=f"{emoji_a} Score {score}/100 — {label_a}", inline=True)
         roles_txt = " ".join(r.mention for r in reversed(mem.roles) if r.name != "@everyone")[:512] or "*Aucun*"
         e.add_field(name="📋  Rôles", value=roles_txt, inline=False)
-        await inter.response.send_message(embed=e, view=MemberModView(self.guild, mem), ephemeral=True)
+        # Afficher profil admin complet + boutons modération
+        embed_full = _build_profile_embed(mem, self.guild, is_staff_view=True)
+        await inter.response.send_message(embed=embed_full, view=AdminProfileView(self.guild, mem), ephemeral=True)
 
     # Nav SELECT
     async def _sel_prev(self, inter: discord.Interaction):
