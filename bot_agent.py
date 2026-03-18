@@ -3551,6 +3551,37 @@ class NicknameApprovalView(discord.ui.View):
     async def approve(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not is_staff(inter.user, self.guild.id):
             await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+
+        # Vérification préalable de la hiérarchie
+        bot_member = self.guild.get_member(inter.client.user.id)
+        if bot_member and self.member.top_role >= bot_member.top_role:
+            await inter.response.send_message(
+                embed=_e_err(
+                    "❌  Hiérarchie insuffisante",
+                    f"Le rôle **{self.member.top_role.name}** de {self.member.mention} "
+                    f"est supérieur ou égal au rôle le plus haut du bot.\n"
+                    f"**Solution :** Monte le rôle du bot au-dessus de '{self.member.top_role.name}' "
+                    f"dans Paramètres serveur → Rôles."),
+                ephemeral=True); return
+
+        # Vérification permission MANAGE_NICKNAMES
+        if bot_member and not bot_member.guild_permissions.manage_nicknames:
+            await inter.response.send_message(
+                embed=_e_err(
+                    "❌  Permission manquante",
+                    "Le bot n'a pas la permission **Gérer les pseudonymes**.\n"
+                    "**Solution :** Active cette permission dans le rôle du bot."),
+                ephemeral=True); return
+
+        # Propriétaire du serveur → impossible
+        if self.member.id == self.guild.owner_id:
+            await inter.response.send_message(
+                embed=_e_err(
+                    "❌  Propriétaire du serveur",
+                    "Il est impossible de changer le pseudo du propriétaire du serveur.\n"
+                    "Le membre doit le changer lui-même."),
+                ephemeral=True); return
+
         try:
             old_nick = self.member.display_name
             await self.member.edit(nick=self.new_nick,
@@ -3564,7 +3595,6 @@ class NicknameApprovalView(discord.ui.View):
                     ),
                     color=0x57F287),
                 view=None)
-            # Notifier le membre
             try:
                 await self.member.send(
                     embed=discord.Embed(
@@ -3577,7 +3607,11 @@ class NicknameApprovalView(discord.ui.View):
                 pass
         except discord.Forbidden:
             await inter.response.send_message(
-                embed=_e_err("❌", "Permission refusée — impossible de changer le pseudo."),
+                embed=_e_err(
+                    "❌  Permission refusée",
+                    f"Discord a refusé le changement.\n"
+                    f"Vérifie que le rôle du bot est **au-dessus** du rôle de {self.member.mention} "
+                    f"dans la hiérarchie des rôles."),
                 ephemeral=True)
 
     @discord.ui.button(label="❌  Refuser", style=discord.ButtonStyle.danger,
