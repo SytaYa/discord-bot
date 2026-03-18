@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.32"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.33"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -562,6 +562,85 @@ async def open_ticket(guild, member, type_key):
     await ch.send("👋 " + member.mention + " — Ticket **#" + str(n).zfill(4) + "** " + tt["emoji"] + " " + tt["label"] + "\n" + "━" * 40)
     await _notify_embed(guild, cfg, s, tt)
     return ch, None
+
+async def open_and_run_ticket(guild, member, type_key):
+    """
+    Ouvre un ticket ET lance immédiatement les questions — sans demander l'acceptation du staff.
+    Utilisé depuis /profile (le membre ouvre lui-même son ticket).
+    Retourne (channel, error_str).
+    """
+    if maintenance_mode:
+        return None, "Bot en maintenance."
+    ok_cfg, msg_cfg = is_configured(guild.id)
+    if not ok_cfg: return None, msg_cfg
+    cfg = tconf(guild.id)
+    if type_key not in cfg["types"]:
+        return None, "Type inconnu."
+    cat = guild.get_channel(cfg["category_id"])
+    if not cat: return None, "Catégorie tickets introuvable."
+    tt = cfg["types"][type_key]
+    cfg["counter"] += 1
+    n = cfg["counter"]
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    if cfg.get("staff_role_id"):
+        sr = guild.get_role(cfg["staff_role_id"])
+        if sr: ow[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, read_message_history=True)
+    try:
+        ch = await guild.create_text_channel(
+            "ticket-" + str(n).zfill(4) + "-" + member.display_name[:12].lower().replace(" ", "-"),
+            category=cat, overwrites=ow,
+            topic="Ticket #" + str(n) + " | " + type_key + " | " + member.display_name)
+    except discord.Forbidden:
+        cfg["counter"] -= 1
+        return None, "Permission refusée pour créer le salon."
+    # Session directement en "pending" (pas besoin d'acceptation)
+    s = {"guild_id": guild.id, "user_id": member.id, "type": type_key, "status": "pending",
+         "answers": {}, "opened_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+         "number": n, "channel_id": ch.id}
+    ticket_sessions[ch.id] = s
+    await save_data()
+    await ch.send("👋 " + member.mention + " — Ticket **#" + str(n).zfill(4) + "** " + tt["emoji"] + " " + tt["label"] + "\n" + "━" * 40)
+    # Lancer les questions directement (pas de _notify_embed)
+    asyncio.create_task(_run_questions_direct(guild, cfg, ch, member, type_key, s))
+    return ch, None
+
+
+async def _run_questions_direct(guild, cfg, channel, member, type_key, s):
+    """Lance les questions et notifie le staff avec les réponses une fois terminé."""
+    tt = cfg["types"].get(type_key, {})
+    qs = tt.get("questions", [])
+    if not qs:
+        # Pas de questions → notifier staff directement
+        await _notify_reactions(guild, cfg, s, tt)
+        return
+    try:
+        for q in qs:
+            await channel.send("❓ **" + q + "**")
+            r = await client.wait_for("message",
+                timeout=600,  # 10 minutes par question
+                check=lambda m, mb=member, ch=channel: m.author == mb and m.channel == ch)
+            s["answers"][q] = r.content
+        # Résumé dans le salon
+        lines = ["━" * 40, "🎫 **#" + str(s["number"]).zfill(4) + "** " + tt["emoji"] + " " + tt["label"],
+                 "👤 " + member.mention]
+        for q, a in s["answers"].items():
+            lines += ["❓ **" + q + "**", "💬 " + a]
+        lines.append("━" * 40)
+        await channel.send("\n".join(lines))
+        # Notifier le staff avec les réponses
+        await _notify_reactions(guild, cfg, s, tt)
+        await save_data()
+    except asyncio.TimeoutError:
+        await channel.send("⏰ Temps écoulé — aucune réponse reçue. Le ticket reste ouvert.")
+        s["status"] = "open"
+        await save_data()
+    except Exception as ex:
+        log("TICKET", f"Erreur questions directes : {ex}")
+
 
 async def run_questions(guild, cfg, channel, member, type_key, existing_session=None):
     """
@@ -3378,19 +3457,15 @@ class ProfileView(discord.ui.View):
 
         async def _pick(i2: discord.Interaction):
             key  = i2.data["values"][0]
-            ch, err = await open_ticket(self.guild, inter.user, key)
+            # Ouvre le ticket ET lance les questions directement (sans acceptation staff)
+            ch, err = await open_and_run_ticket(self.guild, inter.user, key)
             if err:
                 await i2.response.send_message(embed=_e_err("❌", err), ephemeral=True)
             else:
                 await i2.response.send_message(
-                    embed=_e_ok("✅  Ticket créé !", f"Salon : {ch.mention}"), ephemeral=True)
-                # Lancer les questions si le type en a
-                cfg2 = tconf(self.guild.id)
-                if cfg2["types"].get(key, {}).get("questions"):
-                    s = ticket_sessions.get(ch.id)
-                    if s:
-                        asyncio.create_task(
-                            run_questions(self.guild, cfg2, ch, inter.user, key, existing_session=s))
+                    embed=_e_ok("✅  Ticket ouvert !",
+                                f"Salon : {ch.mention}\nRends-toi dans le salon pour répondre aux questions."),
+                    ephemeral=True)
 
         sel.callback = _pick
         v2 = discord.ui.View(timeout=30)
