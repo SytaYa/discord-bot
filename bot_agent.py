@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.31"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.32"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -3377,13 +3377,20 @@ class ProfileView(discord.ui.View):
         sel = discord.ui.Select(placeholder="Choisir un type de ticket…", options=opts)
 
         async def _pick(i2: discord.Interaction):
-            key = i2.data["values"][0]
+            key  = i2.data["values"][0]
             ch, err = await open_ticket(self.guild, inter.user, key)
             if err:
                 await i2.response.send_message(embed=_e_err("❌", err), ephemeral=True)
             else:
                 await i2.response.send_message(
                     embed=_e_ok("✅  Ticket créé !", f"Salon : {ch.mention}"), ephemeral=True)
+                # Lancer les questions si le type en a
+                cfg2 = tconf(self.guild.id)
+                if cfg2["types"].get(key, {}).get("questions"):
+                    s = ticket_sessions.get(ch.id)
+                    if s:
+                        asyncio.create_task(
+                            run_questions(self.guild, cfg2, ch, inter.user, key, existing_session=s))
 
         sel.callback = _pick
         v2 = discord.ui.View(timeout=30)
@@ -5013,10 +5020,19 @@ class MemberModView(discord.ui.View):
         _m   = self.member
 
         async def _pick(i3):
-            key = i3.data["values"][0]
+            key  = i3.data["values"][0]
             ch, err = await open_ticket(_g, _m, key)
-            if err: await i3.response.send_message(embed=_e_err("❌  " + err), ephemeral=True)
-            else:   await i3.response.send_message(embed=_e_ok("✅  Ticket créé", ch.mention), ephemeral=True)
+            if err:
+                await i3.response.send_message(embed=_e_err("❌  " + err), ephemeral=True)
+            else:
+                await i3.response.send_message(embed=_e_ok("✅  Ticket créé", ch.mention), ephemeral=True)
+                # Lancer les questions si le type en a
+                _cfg2 = tconf(_g.id)
+                if _cfg2["types"].get(key, {}).get("questions"):
+                    _s = ticket_sessions.get(ch.id)
+                    if _s:
+                        asyncio.create_task(
+                            run_questions(_g, _cfg2, ch, _m, key, existing_session=_s))
 
         sel.callback = _pick
         v2 = discord.ui.View(timeout=30)
