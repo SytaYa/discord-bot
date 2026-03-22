@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.33"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.34"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -280,6 +280,10 @@ async def save_data():
                         "anecdote_role_id":        cfg.get("anecdote_role_id"),
                         "anecdote_schedule":       cfg.get("anecdote_schedule", []),
                         "anecdote_guess_enabled":  cfg.get("anecdote_guess_enabled", True),
+                        "profile_ticket_disabled": cfg.get("profile_ticket_disabled", False),
+                        "profile_rename_disabled": cfg.get("profile_rename_disabled", False),
+                        "profile_ticket_blocked":  cfg.get("profile_ticket_blocked", []),
+                        "profile_rename_blocked":  cfg.get("profile_rename_blocked", []),
                     }, ensure_ascii=False))
                     # Nettoyer les clés temporaires avant sauvegarde
                     for _gid_tmp in ticket_config:
@@ -358,6 +362,10 @@ async def load_data():
                     "anecdote_role_id":        raw_json.get("anecdote_role_id") or None,
                     "anecdote_schedule":       raw_json.get("anecdote_schedule", []),
                     "anecdote_guess_enabled":  raw_json.get("anecdote_guess_enabled", True),
+                    "profile_ticket_disabled": raw_json.get("profile_ticket_disabled", False),
+                    "profile_rename_disabled": raw_json.get("profile_rename_disabled", False),
+                    "profile_ticket_blocked":  raw_json.get("profile_ticket_blocked", []),
+                    "profile_rename_blocked":  raw_json.get("profile_rename_blocked", []),
                 }
             rows = await conn.fetch("SELECT * FROM ticket_session")
             for row in rows:
@@ -444,6 +452,11 @@ def tconf(gid):
             "anecdote_role_id":       None,
             "anecdote_schedule":      [],
             "anecdote_guess_enabled": True,
+            # Contrôle boutons /profile
+            "profile_ticket_disabled": False,
+            "profile_rename_disabled": False,
+            "profile_ticket_blocked":  [],
+            "profile_rename_blocked":  [],
         }
     if "menu_locked" not in ticket_config[gid]:
         ticket_config[gid]["menu_locked"] = False
@@ -460,7 +473,11 @@ def tconf(gid):
     if "anecdote_channel_id"    not in cfg: cfg["anecdote_channel_id"]    = None
     if "anecdote_role_id"       not in cfg: cfg["anecdote_role_id"]       = None
     if "anecdote_schedule"      not in cfg: cfg["anecdote_schedule"]      = []
-    if "anecdote_guess_enabled" not in cfg: cfg["anecdote_guess_enabled"] = True
+    if "anecdote_guess_enabled"    not in cfg: cfg["anecdote_guess_enabled"]    = True
+    if "profile_ticket_disabled"   not in cfg: cfg["profile_ticket_disabled"]   = False
+    if "profile_rename_disabled"   not in cfg: cfg["profile_rename_disabled"]   = False
+    if "profile_ticket_blocked"    not in cfg: cfg["profile_ticket_blocked"]    = []
+    if "profile_rename_blocked"    not in cfg: cfg["profile_rename_blocked"]    = []
     return ticket_config[gid]
 
 def is_configured(gid):
@@ -3436,11 +3453,16 @@ class ProfileView(discord.ui.View):
     @discord.ui.button(label="🎫  Ouvrir un ticket", style=discord.ButtonStyle.primary,
                        custom_id="profile_ticket", row=0)
     async def open_ticket_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
-        # Seul le membre lui-même peut ouvrir un ticket depuis son profil
         if inter.user.id != self.member.id:
             await inter.response.send_message(
                 embed=_e_err("🚫", "Ce profil n'est pas le tien."), ephemeral=True); return
         cfg = tconf(self.guild.id)
+        # Vérifier blocage global ou individuel
+        if cfg.get("profile_ticket_disabled") or inter.user.id in cfg.get("profile_ticket_blocked", []):
+            await inter.response.send_message(
+                embed=_e_err("🔒  Bouton désactivé",
+                             "Le staff a désactivé l'ouverture de ticket depuis le profil."),
+                ephemeral=True); return
         if not cfg.get("types"):
             await inter.response.send_message(
                 embed=_e_warn("⚠️", "Aucun type de ticket configuré."), ephemeral=True); return
@@ -3482,6 +3504,12 @@ class ProfileView(discord.ui.View):
         if inter.user.id != self.member.id:
             await inter.response.send_message(
                 embed=_e_err("🚫", "Ce profil n'est pas le tien."), ephemeral=True); return
+        cfg = tconf(self.guild.id)
+        if cfg.get("profile_rename_disabled") or inter.user.id in cfg.get("profile_rename_blocked", []):
+            await inter.response.send_message(
+                embed=_e_err("🔒  Bouton désactivé",
+                             "Le staff a désactivé la demande de pseudo depuis le profil."),
+                ephemeral=True); return
         await inter.response.send_modal(NicknameRequestModal(self.guild, self.member))
 
 
@@ -3894,6 +3922,159 @@ class BotsPageView(discord.ui.View):
         p = self.embed_page + 1
         await inter.response.edit_message(embed=_build_embed_bots(self.guild, p), view=BotsPageView(self.guild, p))
 
+def _build_embed_config_profile(guild: discord.Guild) -> discord.Embed:
+    """Embed de config profil pour le panel admin."""
+    cfg  = tconf(guild.id)
+    t_off = cfg.get("profile_ticket_disabled", False)
+    r_off = cfg.get("profile_rename_disabled", False)
+    t_blk = cfg.get("profile_ticket_blocked", [])
+    r_blk = cfg.get("profile_rename_blocked", [])
+
+    def _member_names(ids):
+        names = []
+        for uid in ids[:10]:
+            m = guild.get_member(uid)
+            names.append(m.mention if m else f"`{uid}`")
+        extra = f" *+{len(ids)-10} autres*" if len(ids) > 10 else ""
+        return (", ".join(names) + extra) if names else "*Aucun*"
+
+    e = discord.Embed(
+        description=(
+            "### 👤  Configuration — Boutons /profile\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc))
+    e.add_field(
+        name="🎫  Ouvrir un ticket (global)",
+        value="`🔒 Désactivé`" if t_off else "`✅ Activé`",
+        inline=True)
+    e.add_field(
+        name="✏️  Changer de pseudo (global)",
+        value="`🔒 Désactivé`" if r_off else "`✅ Activé`",
+        inline=True)
+    e.add_field(name="​", value="​", inline=True)
+    e.add_field(
+        name=f"🎫  Membres bloqués ticket ({len(t_blk)})",
+        value=_member_names(t_blk),
+        inline=False)
+    e.add_field(
+        name=f"✏️  Membres bloqués pseudo ({len(r_blk)})",
+        value=_member_names(r_blk),
+        inline=False)
+    e.set_footer(text="Les blocages individuels s'ajoutent aux blocages globaux")
+    return e
+
+
+class ProfileConfigView(discord.ui.View):
+    """Config des boutons /profile — toggles globaux + blocages individuels."""
+
+    def __init__(self, guild: discord.Guild, cfg: dict):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.cfg   = cfg
+        t_off = cfg.get("profile_ticket_disabled", False)
+        r_off = cfg.get("profile_rename_disabled", False)
+
+        # Row 0 : toggles globaux
+        btn_tkt = discord.ui.Button(
+            label="🔒 Désactiver ticket" if not t_off else "✅ Activer ticket",
+            style=discord.ButtonStyle.danger if not t_off else discord.ButtonStyle.success,
+            row=0)
+        btn_tkt.callback = self._toggle_ticket
+        self.add_item(btn_tkt)
+
+        btn_ren = discord.ui.Button(
+            label="🔒 Désactiver pseudo" if not r_off else "✅ Activer pseudo",
+            style=discord.ButtonStyle.danger if not r_off else discord.ButtonStyle.success,
+            row=0)
+        btn_ren.callback = self._toggle_rename
+        self.add_item(btn_ren)
+
+        btn_refresh = discord.ui.Button(label="🔄", style=discord.ButtonStyle.secondary, row=0)
+        btn_refresh.callback = self._refresh
+        self.add_item(btn_refresh)
+
+        # Row 1 : select membres à bloquer/débloquer pour ticket
+        humans = sorted([m for m in guild.members if not m.bot], key=lambda m: m.display_name.lower())
+        t_blk  = cfg.get("profile_ticket_blocked", [])
+        r_blk  = cfg.get("profile_rename_blocked", [])
+
+        if humans:
+            opts_t = [discord.SelectOption(
+                label=m.display_name[:50],
+                value=str(m.id),
+                description="✅ Autorisé" if m.id not in t_blk else "🔒 Bloqué",
+                default=(m.id in t_blk)
+            ) for m in humans[:25]]
+            sel_t = discord.ui.Select(
+                placeholder="🎫  Bloquer/débloquer ticket pour un membre…",
+                options=opts_t, row=1)
+            sel_t.callback = self._toggle_member_ticket
+            self.add_item(sel_t)
+
+            opts_r = [discord.SelectOption(
+                label=m.display_name[:50],
+                value=str(m.id),
+                description="✅ Autorisé" if m.id not in r_blk else "🔒 Bloqué",
+                default=(m.id in r_blk)
+            ) for m in humans[:25]]
+            sel_r = discord.ui.Select(
+                placeholder="✏️  Bloquer/débloquer pseudo pour un membre…",
+                options=opts_r, row=2)
+            sel_r.callback = self._toggle_member_rename
+            self.add_item(sel_r)
+
+    def _guard(self, inter): return is_staff(inter.user, self.guild.id)
+
+    async def _toggle_ticket(self, inter: discord.Interaction):
+        if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["profile_ticket_disabled"] = not self.cfg.get("profile_ticket_disabled", False)
+        await save_data()
+        await inter.response.edit_message(embed=_build_embed_config_profile(self.guild), view=ProfileConfigView(self.guild, self.cfg))
+
+    async def _toggle_rename(self, inter: discord.Interaction):
+        if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        self.cfg["profile_rename_disabled"] = not self.cfg.get("profile_rename_disabled", False)
+        await save_data()
+        await inter.response.edit_message(embed=_build_embed_config_profile(self.guild), view=ProfileConfigView(self.guild, self.cfg))
+
+    async def _toggle_member_ticket(self, inter: discord.Interaction):
+        if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        uid  = int(inter.data["values"][0])
+        blk  = self.cfg.get("profile_ticket_blocked", [])
+        if uid in blk:
+            blk.remove(uid)
+            action = "débloqué (ticket)"
+        else:
+            blk.append(uid)
+            action = "bloqué (ticket)"
+        self.cfg["profile_ticket_blocked"] = blk
+        await save_data()
+        m = self.guild.get_member(uid)
+        await inter.response.send_message(
+            embed=_e_ok("✅  Mis à jour", f"{m.mention if m else uid} **{action}**"), ephemeral=True)
+
+    async def _toggle_member_rename(self, inter: discord.Interaction):
+        if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        uid  = int(inter.data["values"][0])
+        blk  = self.cfg.get("profile_rename_blocked", [])
+        if uid in blk:
+            blk.remove(uid)
+            action = "débloqué (pseudo)"
+        else:
+            blk.append(uid)
+            action = "bloqué (pseudo)"
+        self.cfg["profile_rename_blocked"] = blk
+        await save_data()
+        m = self.guild.get_member(uid)
+        await inter.response.send_message(
+            embed=_e_ok("✅  Mis à jour", f"{m.mention if m else uid} **{action}**"), ephemeral=True)
+
+    async def _refresh(self, inter: discord.Interaction):
+        await inter.response.edit_message(embed=_build_embed_config_profile(self.guild), view=ProfileConfigView(self.guild, self.cfg))
+
+
 # ══════════════════════════════════════════════════════════════════
 #  DashboardView — 3 menus déroulants + boutons
 # ══════════════════════════════════════════════════════════════════
@@ -3927,7 +4108,8 @@ class DashboardView(discord.ui.View):
         cfg_sel = discord.ui.Select(placeholder="⚙️  Configuration…", row=2, options=[
             discord.SelectOption(label="🛡️  Staff & Permissions",   value="cfg_staff",   description="Salon, rôle staff, anonymes",   default=active=="cfg_staff"),
             discord.SelectOption(label="🎫  Système de tickets",     value="cfg_tickets", description="Catégorie, compteur, types",     default=active=="cfg_tickets"),
-            discord.SelectOption(label="💡  Anecdotes & Blagues",    value="cfg_anecdotes", description="Planification, accès, devinette", default=active=="cfg_anecdotes"),
+            discord.SelectOption(label="💡  Anecdotes & Blagues",    value="cfg_anecdotes",  description="Planification, accès, devinette", default=active=="cfg_anecdotes"),
+            discord.SelectOption(label="👤  Boutons /profile",        value="cfg_profile",   description="Bloquer ticket / pseudo par membre", default=active=="cfg_profile"),
         ])
         cfg_sel.callback = self._nav
         self.add_item(cfg_sel)
@@ -4035,16 +4217,19 @@ class DashboardView(discord.ui.View):
             return
 
         # Sections config → édition en place du message principal
-        if val in ("cfg_staff", "cfg_tickets", "cfg_anecdotes"):
+        if val in ("cfg_staff", "cfg_tickets", "cfg_anecdotes", "cfg_profile"):
             if val == "cfg_staff":
                 embed = _build_embed_config_staff(g)
                 sub_view = ConfigStaffView(g, cfg)
             elif val == "cfg_tickets":
                 embed = _build_embed_config_tickets(g)
                 sub_view = ConfigTicketsView(g, cfg)
-            else:
+            elif val == "cfg_anecdotes":
                 embed = _build_embed_anecdotes(g)
                 sub_view = AnecdoteConfigView(g, cfg)
+            else:
+                embed = _build_embed_config_profile(g)
+                sub_view = ProfileConfigView(g, cfg)
             await inter.response.edit_message(embed=embed, view=DashboardView(g, val))
             await inter.followup.send(
                 embed=_e_ok("⚙️  Configuration", "Utilise les menus ci-dessous pour modifier."),
@@ -5797,6 +5982,37 @@ async def _dispatch_inner(action, p):
         if not g: return {"error": "Guild not found"}
         cnt = await _anecdote_count(g.id)
         return {"ok": True, **cnt}
+
+
+    elif action == "profile_config":
+        g = _g(p)
+        if not g: return {"error": "Guild not found"}
+        cfg = tconf(g.id)
+        changed = False
+        if "ticket_disabled" in p:
+            cfg["profile_ticket_disabled"] = bool(p["ticket_disabled"]); changed = True
+        if "rename_disabled" in p:
+            cfg["profile_rename_disabled"] = bool(p["rename_disabled"]); changed = True
+        if "block_ticket_uid" in p:
+            uid = int(p["block_ticket_uid"])
+            blk = cfg.get("profile_ticket_blocked", [])
+            if uid in blk: blk.remove(uid)
+            else: blk.append(uid)
+            cfg["profile_ticket_blocked"] = blk; changed = True
+        if "block_rename_uid" in p:
+            uid = int(p["block_rename_uid"])
+            blk = cfg.get("profile_rename_blocked", [])
+            if uid in blk: blk.remove(uid)
+            else: blk.append(uid)
+            cfg["profile_rename_blocked"] = blk; changed = True
+        if changed: await save_data()
+        return {
+            "ok": True,
+            "ticket_disabled": cfg.get("profile_ticket_disabled", False),
+            "rename_disabled": cfg.get("profile_rename_disabled", False),
+            "ticket_blocked":  cfg.get("profile_ticket_blocked", []),
+            "rename_blocked":  cfg.get("profile_rename_blocked", []),
+        }
 
     return {"error": "Unknown action: " + action}
 
