@@ -77,7 +77,7 @@ BOT_DIR        = os.path.dirname(os.path.abspath(__file__))  # répertoire du bo
 DATABASE_URL   = os.getenv("DATABASE_URL", "")   # URL PostgreSQL Supabase
 _db_pool       = None   # pool de connexions asyncpg (initialisé au démarrage)
 
-BOT_VERSION    = "5.35"  # version affichée dans le message de mise à jour
+BOT_VERSION    = "5.36"  # version affichée dans le message de mise à jour
 
 # ── Spotify credentials (optionnel) ──────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -284,6 +284,8 @@ async def save_data():
                         "profile_rename_disabled": cfg.get("profile_rename_disabled", False),
                         "profile_ticket_blocked":  cfg.get("profile_ticket_blocked", []),
                         "profile_rename_blocked":  cfg.get("profile_rename_blocked", []),
+                        "media_blocked":           cfg.get("media_blocked", []),
+                        "links_blocked":           cfg.get("links_blocked", []),
                     }, ensure_ascii=False))
                     # Nettoyer les clés temporaires avant sauvegarde
                     for _gid_tmp in ticket_config:
@@ -366,6 +368,8 @@ async def load_data():
                     "profile_rename_disabled": raw_json.get("profile_rename_disabled", False),
                     "profile_ticket_blocked":  raw_json.get("profile_ticket_blocked", []),
                     "profile_rename_blocked":  raw_json.get("profile_rename_blocked", []),
+                    "media_blocked":           raw_json.get("media_blocked", []),
+                    "links_blocked":           raw_json.get("links_blocked", []),
                 }
             rows = await conn.fetch("SELECT * FROM ticket_session")
             for row in rows:
@@ -457,6 +461,9 @@ def tconf(gid):
             "profile_rename_disabled": False,
             "profile_ticket_blocked":  [],
             "profile_rename_blocked":  [],
+            # Modération messages
+            "media_blocked":           [],
+            "links_blocked":           [],
         }
     if "menu_locked" not in ticket_config[gid]:
         ticket_config[gid]["menu_locked"] = False
@@ -478,6 +485,8 @@ def tconf(gid):
     if "profile_rename_disabled"   not in cfg: cfg["profile_rename_disabled"]   = False
     if "profile_ticket_blocked"    not in cfg: cfg["profile_ticket_blocked"]    = []
     if "profile_rename_blocked"    not in cfg: cfg["profile_rename_blocked"]    = []
+    if "media_blocked"             not in cfg: cfg["media_blocked"]             = []
+    if "links_blocked"             not in cfg: cfg["links_blocked"]             = []
     return ticket_config[gid]
 
 def is_configured(gid):
@@ -1290,6 +1299,9 @@ async def on_message(message):
         d["last_seen"] = now
         # Save à chaque message (activité critique — ne jamais perdre)
         asyncio.ensure_future(save_data())
+    # Modération images et liens par membre
+    if message.guild and not message.author.bot:
+        await _check_media_link_block(message)
     await _handle_anecdote_guess(message)
     await handle_cmds(message)
 
@@ -2409,6 +2421,52 @@ async def _anecdote_scheduler_loop():
 
 # ── Devinette via on_message ──────────────────────────────────────
 
+async def _check_media_link_block(message: discord.Message):
+    """Supprime les images/fichiers ou liens si le membre est bloqué pour ça."""
+    if not message.guild: return
+    if is_staff(message.author, message.guild.id): return  # staff jamais bloqué
+    cfg = tconf(message.guild.id)
+    uid = message.author.id
+
+    deleted = False
+
+    # Vérifier images/fichiers
+    if uid in cfg.get("media_blocked", []):
+        has_media = bool(message.attachments)
+        if not has_media:
+            # Détecter aussi les embeds image (liens directs vers image)
+            for embed in message.embeds:
+                if embed.type in ("image", "gifv", "video"):
+                    has_media = True; break
+        if has_media:
+            try:
+                await message.delete()
+                deleted = True
+                warn_msg = await message.channel.send(
+                    f"{message.author.mention} ⛔ Tu n'es pas autorisé à envoyer des images/fichiers.",
+                    delete_after=5)
+            except discord.Forbidden:
+                pass
+            return  # si supprimé pour média, pas besoin de vérifier les liens
+
+    # Vérifier liens
+    if uid in cfg.get("links_blocked", []):
+        import re as _re
+        url_pattern = _re.compile(
+            r"https?://[^\s]+|discord\.gg/[^\s]+|www\.[^\s]+",
+            _re.IGNORECASE)
+        if url_pattern.search(message.content):
+            try:
+                await message.delete()
+                deleted = True
+                await message.channel.send(
+                    f"{message.author.mention} ⛔ Tu n'es pas autorisé à envoyer des liens.",
+                    delete_after=5)
+            except discord.Forbidden:
+                pass
+
+
+
 async def _handle_anecdote_guess(message: discord.Message):
     if not message.guild or message.author.bot: return
     guess_data = _active_guess.get(message.guild.id)
@@ -3436,6 +3494,18 @@ def _build_profile_embed(member: discord.Member, guild: discord.Guild,
             roles_txt = " ".join(shown)
         e.add_field(name=f"📋  Rôles ({len(roles)})", value=roles_txt, inline=False)
 
+    # Restrictions actives (visible uniquement en vue staff)
+    if is_staff_view:
+        restrictions = []
+        cfg_r = tconf(guild.id)
+        if member.id in cfg_r.get("media_blocked", []):    restrictions.append("🖼️ Images bloquées")
+        if member.id in cfg_r.get("links_blocked", []):    restrictions.append("🔗 Liens bloqués")
+        if member.id in cfg_r.get("profile_ticket_blocked", []): restrictions.append("🎫 Ticket bloqué")
+        if member.id in cfg_r.get("profile_rename_blocked", []): restrictions.append("✏️ Pseudo bloqué")
+        if restrictions:
+            e.add_field(name="⛔  Restrictions actives",
+                        value="  ".join(f"`{r}`" for r in restrictions), inline=False)
+
     e.set_footer(text=guild.name,
                  icon_url=guild.icon.url if guild.icon else None)
     return e
@@ -3558,6 +3628,26 @@ class AdminProfileView(discord.ui.View):
         btn_ren.callback = self._toggle_rename
         self.add_item(btn_ren)
 
+        # Row 2 : Bloquer/débloquer images + liens
+        m_blk = cfg.get("media_blocked", [])
+        l_blk = cfg.get("links_blocked", [])
+
+        m_blocked = member.id in m_blk
+        btn_media = discord.ui.Button(
+            label="✅ Autoriser images" if m_blocked else "🔒 Bloquer images",
+            style=discord.ButtonStyle.success if m_blocked else discord.ButtonStyle.secondary,
+            emoji="🖼️", row=2)
+        btn_media.callback = self._toggle_media
+        self.add_item(btn_media)
+
+        ln_blocked = member.id in l_blk
+        btn_links = discord.ui.Button(
+            label="✅ Autoriser liens" if ln_blocked else "🔒 Bloquer liens",
+            style=discord.ButtonStyle.success if ln_blocked else discord.ButtonStyle.secondary,
+            emoji="🔗", row=2)
+        btn_links.callback = self._toggle_links
+        self.add_item(btn_links)
+
     def _guard(self, inter): return is_staff(inter.user, self.guild.id)
 
     async def _convoke(self, inter: discord.Interaction):
@@ -3646,6 +3736,38 @@ class AdminProfileView(discord.ui.View):
         await inter.response.edit_message(embed=new_embed, view=new_view)
         await inter.followup.send(
             embed=_e_ok("✅  Mis à jour", f"{self.member.mention} **{action}**"), ephemeral=True)
+
+    async def _toggle_media(self, inter: discord.Interaction):
+        if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        cfg = tconf(self.guild.id)
+        blk = cfg.get("media_blocked", [])
+        if self.member.id in blk:
+            blk.remove(self.member.id); action = "✅ autorisé (images)"
+        else:
+            blk.append(self.member.id); action = "🔒 bloqué (images)"
+        cfg["media_blocked"] = blk
+        await save_data()
+        new_embed = _build_profile_embed(self.member, self.guild, is_staff_view=True)
+        new_view  = AdminProfileView(self.guild, self.member)
+        await inter.response.edit_message(embed=new_embed, view=new_view)
+        await inter.followup.send(
+            embed=_e_ok("✅  Mis à jour", f"{self.member.mention} {action}"), ephemeral=True)
+
+    async def _toggle_links(self, inter: discord.Interaction):
+        if not self._guard(inter): await inter.response.send_message(embed=_e_err("🚫"), ephemeral=True); return
+        cfg = tconf(self.guild.id)
+        blk = cfg.get("links_blocked", [])
+        if self.member.id in blk:
+            blk.remove(self.member.id); action = "✅ autorisé (liens)"
+        else:
+            blk.append(self.member.id); action = "🔒 bloqué (liens)"
+        cfg["links_blocked"] = blk
+        await save_data()
+        new_embed = _build_profile_embed(self.member, self.guild, is_staff_view=True)
+        new_view  = AdminProfileView(self.guild, self.member)
+        await inter.response.edit_message(embed=new_embed, view=new_view)
+        await inter.followup.send(
+            embed=_e_ok("✅  Mis à jour", f"{self.member.mention} {action}"), ephemeral=True)
 
 
 # ── Modal changement de pseudo ─────────────────────────────────────
@@ -5983,6 +6105,18 @@ async def _dispatch_inner(action, p):
             if uid in blk: blk.remove(uid)
             else: blk.append(uid)
             cfg["profile_rename_blocked"] = blk; changed = True
+        if "block_media_uid" in p:
+            uid = int(p["block_media_uid"])
+            blk = cfg.get("media_blocked", [])
+            if uid in blk: blk.remove(uid)
+            else: blk.append(uid)
+            cfg["media_blocked"] = blk; changed = True
+        if "block_links_uid" in p:
+            uid = int(p["block_links_uid"])
+            blk = cfg.get("links_blocked", [])
+            if uid in blk: blk.remove(uid)
+            else: blk.append(uid)
+            cfg["links_blocked"] = blk; changed = True
         if changed: await save_data()
         return {
             "ok": True,
@@ -5990,6 +6124,8 @@ async def _dispatch_inner(action, p):
             "rename_disabled": cfg.get("profile_rename_disabled", False),
             "ticket_blocked":  cfg.get("profile_ticket_blocked", []),
             "rename_blocked":  cfg.get("profile_rename_blocked", []),
+            "media_blocked":   cfg.get("media_blocked", []),
+            "links_blocked":   cfg.get("links_blocked", []),
         }
 
     return {"error": "Unknown action: " + action}
